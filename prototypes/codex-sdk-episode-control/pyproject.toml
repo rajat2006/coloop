@@ -1,0 +1,5 @@
+[project]
+name = "codex-sdk-episode-control-probe"
+version = "0.0.0"
+requires-python = ">=3.10"
+dependencies = ["openai-codex==0.147.0"]
