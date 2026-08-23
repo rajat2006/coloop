@@ -4,18 +4,19 @@ Exercise date: 2026-08-23
 
 ## Verdict
 
-**Inconclusive for v0 pending one live metered run.** The deterministic exercise
-supports the architecture at the control-flow level: ordinary Discord turns
-bypass the Agents SDK, both delegation patterns accept only a compact structured
-envelope, Agents-as-tools returns control through its manager, a true handoff
-changes `last_agent` to the specialist, approval pauses and resumes the same
-run, and provider failure returns control to Codex.
+**Sufficient for v0 behind the required guardrails.** A live OpenAI Agents SDK
+0.22.0 run with `gpt-5.6-luna` preserved the deterministic control seam:
+ordinary Discord turns bypassed the sidecar, Agents-as-tools paused and resumed
+after explicit approval while its manager retained control, a true handoff
+changed `last_agent` to the specialist, and both routes returned a structured
+`SpecialistResult` to Codex through the compact synthetic envelope.
 
-The workspace had no `OPENAI_API_KEY`. Subscription authentication used by the
-primary Codex process is not an Agents SDK Platform credential, so the exercise
-made zero API calls and cannot honestly establish live token counts, cost,
-trace export, model adherence, latency, or account-level failure behavior. The
-runnable live path is preserved for that final check.
+All ten acceptance checks passed. The two successful routes made five API model
+calls in total, used 1,919 input and 436 output tokens, cost an estimated
+$0.000907, and completed in 8.22 seconds and 3.22 seconds. Trace export was
+flushed with sensitive payloads disabled and every recorded ingest request was
+accepted with HTTP 204. The dashboard UI was not visually inspected; visibility
+is inferred from successful trace ingestion and the retained trace IDs.
 
 ## Observed results
 
@@ -27,10 +28,12 @@ runnable live path is preserved for that final check.
 | True handoff | The risk reviewer became `last_agent`, making the ownership switch concrete. |
 | Approval | The agent-as-tool call produced an interruption, was explicitly approved, and resumed from the same run state. |
 | Context | Only the synthetic envelope was supplied. No Discord history or repository content was transmitted. Exact fields, byte counts, hashes, and synthetic context are in `evidence.json`. |
-| Trace policy | The exercise config fixes `trace_include_sensitive_data=False`. Offline trace export was disabled; live mode enables export with the same redaction policy. |
+| Trace policy | `trace_include_sensitive_data=False`; four recorded trace-ingest requests returned HTTP 204 after an explicit flush. The dashboard UI was not visually inspected. |
 | Return semantics | Both paths require `SpecialistResult` and set `return_to="codex"`; manager ownership differs from specialist ownership as expected. |
-| Failure handling | Invalid envelopes fail before the sidecar. A simulated provider outage failed closed, did not retry automatically, and returned a structured failure for Codex to handle. |
-| Calls, tokens, cost | Offline SDK model-boundary requests were recorded, but API calls were zero. Token counts and cost remain unverified. |
+| Failure handling | A live request for an intentionally nonexistent model returned HTTP 400 in 0.52 seconds. The client allowed zero retries, the sidecar failed closed, and a structured failure returned to Codex. |
+| Calls, tokens, cost | Five model calls; 1,919 input tokens; 436 output tokens; estimated total cost $0.000907 at published `gpt-5.6-luna` rates. |
+| Latency | Agents-as-tools completed in 8.22 seconds including its approval pause and resume; true handoff completed in 3.22 seconds. |
+| Model adherence | Both routes returned the required schema. One Agents-as-tools result was overly cautious and claimed synthetic context was missing, reinforcing that every sidecar result remains advisory. |
 
 ## Guardrails required for v0
 
@@ -56,11 +59,14 @@ runnable live path is preserved for that final check.
 8. Treat every sidecar result as advisory structured input to Codex. Codex or the
    Owner decides whether to accept, retry, or continue without it.
 
-## Remaining live check
+## Validation boundary
 
-Run `probe.py live` with a funded Platform key and the existing synthetic input.
-The architecture becomes **sufficient** only if both patterns preserve the
-observed ownership and approval behavior while recorded model calls, tokens,
-estimated cost, trace visibility, and failure behavior stay within explicit v0
-budgets. A failure of the hot-path bypass, structured return, approval pause, or
-context boundary makes it **insufficient** rather than inconclusive.
+The live exercise used limits of five model calls, 5,000 input tokens, 1,000
+output tokens, $0.01 estimated cost, and 30 seconds per successful route. The
+observed run stayed within every limit. These are validation limits, not the
+production per-Episode budget policy required by guardrail 7.
+
+The sufficiency verdict covers only the compact orchestration sidecar. It does
+not authorize routing ordinary Collaboration Episode traffic through the
+Agents SDK, granting specialists tools, replacing the Owner's approval, or
+treating a handoff as a transfer of Singular Ownership.

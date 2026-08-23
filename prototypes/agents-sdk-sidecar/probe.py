@@ -6,19 +6,45 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any, Literal
 
-from agents import Agent, RunConfig, Runner, gen_trace_id, handoff
+from agents import Agent, RunConfig, Runner, flush_traces, gen_trace_id, handoff
 from agents.extensions import handoff_filters
+from agents.models.openai_responses import OpenAIResponsesModel
 from agents.testing import ModelStep, ScriptedModel, assistant_message, function_call
+from agents.tracing.processors import default_exporter
 from agents.usage import Usage
+from openai import AsyncOpenAI
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 
 MODEL = "gpt-5.6-luna"
+INVALID_MODEL = "coloop-intentional-missing-model"
 INPUT_USD_PER_MILLION = 0.20
 OUTPUT_USD_PER_MILLION = 1.20
+MAX_LIVE_MODEL_CALLS = 5
+MAX_LIVE_INPUT_TOKENS = 5_000
+MAX_LIVE_OUTPUT_TOKENS = 1_000
+MAX_LIVE_ESTIMATED_USD = 0.01
+MAX_ROUTE_LATENCY_MS = 30_000
+
+
+class RecordingTraceClient:
+    """Record only trace-ingest statuses; never retain headers or payloads."""
+
+    def __init__(self, delegate: Any):
+        self.delegate = delegate
+        self.status_codes: list[int] = []
+
+    def post(self, *args: Any, **kwargs: Any) -> Any:
+        response = self.delegate.post(*args, **kwargs)
+        self.status_codes.append(response.status_code)
+        return response
+
+    def close(self) -> None:
+        self.delegate.close()
 
 
 class RequestHandoff(BaseModel):
@@ -94,6 +120,10 @@ def compact_input(envelope: RequestHandoff) -> str:
     return envelope.model_dump_json(exclude_none=True)
 
 
+def elapsed_ms(started_at: float) -> float:
+    return round((time.perf_counter() - started_at) * 1_000, 2)
+
+
 def context_record(envelope: RequestHandoff) -> dict[str, Any]:
     encoded = compact_input(envelope).encode("utf-8")
     return {
@@ -150,13 +180,13 @@ def run_config(*, live: bool, trace_id: str) -> RunConfig:
     return RunConfig(
         workflow_name="Coloop bounded Agents SDK sidecar probe",
         trace_id=trace_id,
-        trace_metadata={"episode_kind": "synthetic", "ticket": "23"},
+        trace_metadata={"episode_kind": "synthetic", "ticket": "24"},
         tracing_disabled=not live,
         trace_include_sensitive_data=False,
     )
 
 
-def make_specialist(model: str | ScriptedModel) -> Agent[None]:
+def make_specialist(model: Any) -> Agent[None]:
     return Agent(
         name="Risk reviewer",
         handoff_description="Review one bounded synthetic risk question.",
@@ -170,7 +200,7 @@ def make_specialist(model: str | ScriptedModel) -> Agent[None]:
 
 
 async def run_agent_as_tool(
-    envelope: RequestHandoff, model: str | ScriptedModel, *, live: bool
+    envelope: RequestHandoff, model: Any, *, live: bool
 ) -> dict[str, Any]:
     specialist = make_specialist(model)
     specialist_tool = specialist.as_tool(
@@ -192,7 +222,10 @@ async def run_agent_as_tool(
     )
     trace_id = gen_trace_id()
     config = run_config(live=live, trace_id=trace_id)
+    total_started_at = time.perf_counter()
+    pause_started_at = time.perf_counter()
     first = await Runner.run(manager, compact_input(envelope), run_config=config, max_turns=3)
+    pause_latency_ms = elapsed_ms(pause_started_at)
     approval = {
         "required": True,
         "paused": bool(first.interruptions),
@@ -203,11 +236,16 @@ async def run_agent_as_tool(
     if not first.interruptions:
         raise RuntimeError("agent-as-tool call did not pause for approval")
 
+    approval_started_at = time.perf_counter()
     state = first.to_state()
     for interruption in first.interruptions:
         state.approve(interruption)
     approval["decision"] = "approved"
+    approval["decision_source"] = "explicit_probe_action"
+    approval["decision_latency_ms"] = elapsed_ms(approval_started_at)
+    resume_started_at = time.perf_counter()
     result = await Runner.run(manager, state, run_config=config, max_turns=3)
+    resume_latency_ms = elapsed_ms(resume_started_at)
     approval["resumed_same_run"] = True
     if not isinstance(result.final_output, SpecialistResult):
         raise RuntimeError("agent-as-tool route did not return SpecialistResult")
@@ -218,6 +256,11 @@ async def run_agent_as_tool(
             "manager_retained_control": result.last_agent.name == manager.name,
         },
         "approval": approval,
+        "latency_ms": {
+            "to_approval_pause": pause_latency_ms,
+            "after_approval_resume": resume_latency_ms,
+            "total": elapsed_ms(total_started_at),
+        },
         "result": result.final_output.model_dump(mode="json"),
         "usage": usage_record(result.context_wrapper.usage, api_backed=live),
         "trace": {
@@ -229,7 +272,11 @@ async def run_agent_as_tool(
 
 
 async def run_handoff(
-    envelope: RequestHandoff, model: str | ScriptedModel, *, live: bool
+    envelope: RequestHandoff,
+    model: Any,
+    *,
+    live: bool,
+    trace_id: str | None = None,
 ) -> dict[str, Any]:
     specialist = make_specialist(model)
     handed_off: list[dict[str, Any]] = []
@@ -252,7 +299,8 @@ async def run_handoff(
         model=model,
         handoffs=[handoff_target],
     )
-    trace_id = gen_trace_id()
+    trace_id = trace_id or gen_trace_id()
+    started_at = time.perf_counter()
     result = await Runner.run(
         router,
         compact_input(envelope),
@@ -272,6 +320,7 @@ async def run_handoff(
             "paused": bool(result.interruptions),
             "note": "The handoff changes ownership but has no side effect and was not approval-gated.",
         },
+        "latency_ms": {"total": elapsed_ms(started_at)},
         "handoff_metadata_received": handed_off,
         "result": result.final_output.model_dump(mode="json"),
         "usage": usage_record(result.context_wrapper.usage, api_backed=live),
@@ -411,8 +460,88 @@ async def live_evidence() -> dict[str, Any]:
     if not os.environ.get("OPENAI_API_KEY"):
         raise RuntimeError("OPENAI_API_KEY is required for the live metered exercise")
     ordinary = await ordinary_discord_turn("Collaborator: should the episode mention latency?")
+    exporter = default_exporter()
+    trace_client = RecordingTraceClient(exporter._client)
+    exporter._client = trace_client
     tool_envelope = request("agent_as_tool")
     handoff_envelope = request("handoff")
+    tool_result = await run_agent_as_tool(tool_envelope, MODEL, live=True)
+    handoff_result = await run_handoff(handoff_envelope, MODEL, live=True)
+
+    failure_envelope = request("handoff")
+    failure_trace_id = gen_trace_id()
+    failure_started_at = time.perf_counter()
+    failure_client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"], max_retries=0)
+    failure_model = OpenAIResponsesModel(model=INVALID_MODEL, openai_client=failure_client)
+    try:
+        await run_handoff(
+            failure_envelope,
+            failure_model,
+            live=True,
+            trace_id=failure_trace_id,
+        )
+    except Exception as error:
+        provider_failure = failed_result(failure_envelope, error).model_dump(mode="json")
+    else:
+        raise RuntimeError("intentional missing model did not produce a provider failure")
+    finally:
+        await failure_client.close()
+    failure_latency_ms = elapsed_ms(failure_started_at)
+
+    flush_started_at = time.perf_counter()
+    flush_traces()
+    trace_flush_latency_ms = elapsed_ms(flush_started_at)
+    trace_ingest_accepted = bool(trace_client.status_codes) and all(
+        status_code < 300 for status_code in trace_client.status_codes
+    )
+
+    total_model_calls = (
+        tool_result["usage"]["api_model_calls"] + handoff_result["usage"]["api_model_calls"]
+    )
+    total_input_tokens = (
+        tool_result["usage"]["input_tokens"] + handoff_result["usage"]["input_tokens"]
+    )
+    total_output_tokens = (
+        tool_result["usage"]["output_tokens"] + handoff_result["usage"]["output_tokens"]
+    )
+    total_estimated_usd = round(
+        tool_result["usage"]["estimated_usd"] + handoff_result["usage"]["estimated_usd"],
+        8,
+    )
+    acceptance_checks = {
+        "ordinary_turn_bypassed_sidecar": ordinary["agents_sdk_invoked"] is False,
+        "agent_as_tool_preserved_manager_ownership": tool_result["ownership"][
+            "manager_retained_control"
+        ],
+        "approval_paused_and_resumed_same_run": tool_result["approval"]["paused"]
+        and tool_result["approval"]["resumed_same_run"],
+        "handoff_transferred_to_specialist": handoff_result["ownership"][
+            "specialist_took_control"
+        ],
+        "both_routes_returned_structured_result_to_codex": tool_result["result"]["status"]
+        == "completed"
+        and tool_result["result"]["return_to"] == "codex"
+        and handoff_result["result"]["status"] == "completed"
+        and handoff_result["result"]["return_to"] == "codex",
+        "synthetic_context_boundary_preserved": all(
+            not record["full_discord_history_transmitted"] and not record["repository_transmitted"]
+            for record in (context_record(tool_envelope), context_record(handoff_envelope))
+        ),
+        "usage_within_validation_budget": total_model_calls <= MAX_LIVE_MODEL_CALLS
+        and total_input_tokens <= MAX_LIVE_INPUT_TOKENS
+        and total_output_tokens <= MAX_LIVE_OUTPUT_TOKENS
+        and total_estimated_usd <= MAX_LIVE_ESTIMATED_USD,
+        "latency_within_validation_budget": tool_result["latency_ms"]["total"]
+        <= MAX_ROUTE_LATENCY_MS
+        and handoff_result["latency_ms"]["total"] <= MAX_ROUTE_LATENCY_MS,
+        "trace_ingest_accepted_without_sensitive_payloads": trace_ingest_accepted
+        and not tool_result["trace"]["sensitive_payloads_included"]
+        and not handoff_result["trace"]["sensitive_payloads_included"],
+        "provider_failure_failed_closed_without_retry": provider_failure["status"] == "failed"
+        and provider_failure["return_to"] == "codex"
+        and provider_failure["error"] is not None,
+    }
+
     return {
         "environment": {
             "date": "2026-08-23",
@@ -422,11 +551,52 @@ async def live_evidence() -> dict[str, Any]:
             "model": MODEL,
         },
         "ordinary_discord_turn": ordinary,
-        "agent_as_tool": await run_agent_as_tool(tool_envelope, MODEL, live=True),
-        "handoff": await run_handoff(handoff_envelope, MODEL, live=True),
+        "agent_as_tool": tool_result,
+        "handoff": handoff_result,
         "context_transmitted": {
             "agent_as_tool": context_record(tool_envelope),
             "handoff": context_record(handoff_envelope),
+        },
+        "failure_handling": {
+            "test": "provider rejected an intentionally nonexistent model",
+            "model": INVALID_MODEL,
+            "provider_failure": provider_failure,
+            "fallback_owner": "codex",
+            "max_retries": 0,
+            "automatic_retry": False,
+            "latency_ms": failure_latency_ms,
+            "trace": {
+                "trace_id": failure_trace_id,
+                "export_enabled": True,
+                "sensitive_payloads_included": False,
+            },
+        },
+        "trace_export": {
+            "flush_completed": True,
+            "flush_latency_ms": trace_flush_latency_ms,
+            "ingest_status_codes": trace_client.status_codes,
+            "ingest_accepted": trace_ingest_accepted,
+            "dashboard_visibility_inferred_from_successful_ingest": trace_ingest_accepted,
+            "dashboard_ui_visually_checked": False,
+        },
+        "assessment": {
+            "validation_budgets": {
+                "max_api_model_calls": MAX_LIVE_MODEL_CALLS,
+                "max_input_tokens": MAX_LIVE_INPUT_TOKENS,
+                "max_output_tokens": MAX_LIVE_OUTPUT_TOKENS,
+                "max_estimated_usd": MAX_LIVE_ESTIMATED_USD,
+                "max_route_latency_ms": MAX_ROUTE_LATENCY_MS,
+            },
+            "observed_totals": {
+                "api_model_calls": total_model_calls,
+                "input_tokens": total_input_tokens,
+                "output_tokens": total_output_tokens,
+                "estimated_usd": total_estimated_usd,
+            },
+            "checks": acceptance_checks,
+            "sidecar_architecture_classification": (
+                "sufficient" if all(acceptance_checks.values()) else "insufficient"
+            ),
         },
     }
 

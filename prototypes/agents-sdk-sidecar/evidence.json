@@ -2,10 +2,17 @@
   "agent_as_tool": {
     "approval": {
       "decision": "approved",
+      "decision_latency_ms": 1.39,
+      "decision_source": "explicit_probe_action",
       "interruption_count": 1,
       "paused": true,
       "required": true,
       "resumed_same_run": true
+    },
+    "latency_ms": {
+      "after_approval_resume": 4193.97,
+      "to_approval_pause": 4029.04,
+      "total": 8224.43
     },
     "ownership": {
       "final_owner": "Sidecar manager",
@@ -15,24 +22,54 @@
     "result": {
       "episode_id": "episode-sidecar-agent_as_tool",
       "error": null,
-      "finding": "Validate the compact request_handoff envelope before any metered run.",
+      "finding": "Require explicit owner approval of the agent\u2019s exact action scope and outputs before execution; approval of only the question and synthetic constraints is insufficient.",
       "return_to": "codex",
       "specialist": "risk_reviewer",
       "status": "completed",
-      "unresolved_points": []
+      "unresolved_points": [
+        "The episode question and synthetic constraints were not supplied."
+      ]
     },
     "trace": {
-      "export_enabled": false,
+      "export_enabled": true,
       "sensitive_payloads_included": false,
-      "trace_id": "trace_7f0574b1384044889c4183a6767c52b3"
+      "trace_id": "trace_a9ae24578a024e588a6747e69d62fdd7"
     },
     "usage": {
-      "api_model_calls": 0,
-      "estimate_basis": "Not estimated: deterministic ScriptedModel made no API requests.",
-      "estimated_usd": null,
-      "input_tokens": null,
-      "output_tokens": null,
+      "api_model_calls": 3,
+      "estimate_basis": "gpt-5.6-luna: $0.2/M input and $1.2/M output; cache discounts omitted",
+      "estimated_usd": 0.0005876,
+      "input_tokens": 1354,
+      "output_tokens": 264,
       "sdk_requests": 3
+    }
+  },
+  "assessment": {
+    "checks": {
+      "agent_as_tool_preserved_manager_ownership": true,
+      "approval_paused_and_resumed_same_run": true,
+      "both_routes_returned_structured_result_to_codex": true,
+      "handoff_transferred_to_specialist": true,
+      "latency_within_validation_budget": true,
+      "ordinary_turn_bypassed_sidecar": true,
+      "provider_failure_failed_closed_without_retry": true,
+      "synthetic_context_boundary_preserved": true,
+      "trace_ingest_accepted_without_sensitive_payloads": true,
+      "usage_within_validation_budget": true
+    },
+    "observed_totals": {
+      "api_model_calls": 5,
+      "estimated_usd": 0.000907,
+      "input_tokens": 1919,
+      "output_tokens": 436
+    },
+    "sidecar_architecture_classification": "sufficient",
+    "validation_budgets": {
+      "max_api_model_calls": 5,
+      "max_estimated_usd": 0.01,
+      "max_input_tokens": 5000,
+      "max_output_tokens": 1000,
+      "max_route_latency_ms": 30000
     }
   },
   "context_transmitted": {
@@ -79,19 +116,20 @@
   },
   "environment": {
     "date": "2026-08-23",
-    "mode": "deterministic-offline",
-    "model_configured_for_live_run": "gpt-5.6-luna",
+    "mode": "live-api",
+    "model": "gpt-5.6-luna",
     "openai_agents": "0.22.0",
-    "openai_api_key_present": false,
     "python": "3.11.15"
   },
   "failure_handling": {
     "automatic_retry": false,
     "fallback_owner": "codex",
-    "invalid_envelope_rejected_before_sdk": true,
+    "latency_ms": 515.78,
+    "max_retries": 0,
+    "model": "coloop-intentional-missing-model",
     "provider_failure": {
       "episode_id": "episode-sidecar-handoff",
-      "error": "RuntimeError: simulated provider outage",
+      "error": "BadRequestError: Error code: 400 - {'error': {'message': \"The requested model 'coloop-intentional-missing-model' does not exist.\", 'type': 'invalid_request_error', 'param': 'model', 'code': 'model_not_found'}}",
       "finding": "The bounded specialist did not return a result.",
       "return_to": "codex",
       "specialist": "risk_reviewer",
@@ -99,6 +137,12 @@
       "unresolved_points": [
         "Codex must decide whether to retry or continue without the specialist."
       ]
+    },
+    "test": "provider rejected an intentionally nonexistent model",
+    "trace": {
+      "export_enabled": true,
+      "sensitive_payloads_included": false,
+      "trace_id": "trace_97b4208172c6475b8e014d786519c7a5"
     }
   },
   "handoff": {
@@ -122,6 +166,9 @@
         "type": "request_handoff"
       }
     ],
+    "latency_ms": {
+      "total": 3215.3
+    },
     "ownership": {
       "final_owner": "Risk reviewer",
       "specialist_took_control": true
@@ -130,33 +177,25 @@
     "result": {
       "episode_id": "episode-sidecar-handoff",
       "error": null,
-      "finding": "Validate the compact request_handoff envelope before any metered run.",
+      "finding": "Do not infer or introduce any facts, permissions, or context beyond the supplied envelope; base the review solely on the approved episode question and two synthetic constraints.",
       "return_to": "codex",
       "specialist": "risk_reviewer",
       "status": "completed",
       "unresolved_points": []
     },
     "trace": {
-      "export_enabled": false,
+      "export_enabled": true,
       "sensitive_payloads_included": false,
-      "trace_id": "trace_0f0954347859491dacd4f65e8b9b1298"
+      "trace_id": "trace_48c690e37672425aa64cf5077887cddc"
     },
     "usage": {
-      "api_model_calls": 0,
-      "estimate_basis": "Not estimated: deterministic ScriptedModel made no API requests.",
-      "estimated_usd": null,
-      "input_tokens": null,
-      "output_tokens": null,
+      "api_model_calls": 2,
+      "estimate_basis": "gpt-5.6-luna: $0.2/M input and $1.2/M output; cache discounts omitted",
+      "estimated_usd": 0.0003194,
+      "input_tokens": 565,
+      "output_tokens": 172,
       "sdk_requests": 2
     }
-  },
-  "live_evidence": {
-    "api_model_calls": 0,
-    "estimated_usd": null,
-    "input_tokens": null,
-    "output_tokens": null,
-    "reason": "OPENAI_API_KEY is absent; subscription Codex authentication is not an Agents SDK API credential.",
-    "status": "not_run"
   },
   "ordinary_discord_turn": {
     "agents_sdk_invoked": false,
@@ -164,56 +203,17 @@
     "message": "Collaborator: should the episode mention latency?",
     "route": "codex_direct"
   },
-  "sdk_model_boundary_calls": {
-    "agent_as_tool": [
-      {
-        "handoff_names": [],
-        "index": 1,
-        "input_bytes": 469,
-        "structured_output": true,
-        "tool_names": [
-          "bounded_risk_review"
-        ],
-        "trace_payloads_included": false
-      },
-      {
-        "handoff_names": [],
-        "index": 2,
-        "input_bytes": 485,
-        "structured_output": true,
-        "tool_names": [],
-        "trace_payloads_included": false
-      },
-      {
-        "handoff_names": [],
-        "index": 3,
-        "input_bytes": 1319,
-        "structured_output": true,
-        "tool_names": [
-          "bounded_risk_review"
-        ],
-        "trace_payloads_included": false
-      }
-    ],
-    "handoff": [
-      {
-        "handoff_names": [
-          "transfer_to_risk_reviewer"
-        ],
-        "index": 1,
-        "input_bytes": 458,
-        "structured_output": false,
-        "tool_names": [],
-        "trace_payloads_included": false
-      },
-      {
-        "handoff_names": [],
-        "index": 2,
-        "input_bytes": 458,
-        "structured_output": true,
-        "tool_names": [],
-        "trace_payloads_included": false
-      }
+  "trace_export": {
+    "dashboard_ui_visually_checked": false,
+    "dashboard_visibility_inferred_from_successful_ingest": true,
+    "flush_completed": true,
+    "flush_latency_ms": 2008.8,
+    "ingest_accepted": true,
+    "ingest_status_codes": [
+      204,
+      204,
+      204,
+      204
     ]
   }
 }

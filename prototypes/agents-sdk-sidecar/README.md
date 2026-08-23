@@ -20,7 +20,7 @@ Run the deterministic exercise, which makes no API request:
 ```bash
 PROBE_DIR="$(pwd)/prototypes/agents-sdk-sidecar"
 uv run --project "$PROBE_DIR" python "$PROBE_DIR/probe.py" offline \
-  --output "$PROBE_DIR/evidence.json"
+  --output /tmp/agents-sidecar-offline.json
 ```
 
 Run the same boundary against the OpenAI API only from an environment that has
@@ -28,14 +28,23 @@ a separately funded Platform key:
 
 ```bash
 PROBE_DIR="$(pwd)/prototypes/agents-sdk-sidecar"
-OPENAI_API_KEY="..." uv run --project "$PROBE_DIR" \
+uv run --env-file .env --project "$PROBE_DIR" \
   python "$PROBE_DIR/probe.py" live --output /tmp/agents-sidecar-live.json
 ```
 
 The live mode uses `gpt-5.6-luna`, disables sensitive trace payloads, exports
-the trace, records aggregated SDK usage, and estimates standard token cost.
-Never commit live evidence containing real Context Package material. Use only
-the synthetic envelope already defined in `probe.py`.
+and flushes the trace, records trace-ingest HTTP statuses, measures route
+latency, records aggregated SDK usage, and estimates standard token cost. It
+also requests an intentionally nonexistent model through a no-retry client to
+exercise a real provider rejection; the expected SDK error log is not a probe
+failure. Never commit live evidence containing real Context Package material.
+Use only the synthetic envelope already defined in `probe.py`.
+
+The probe classifies the sidecar against validation-only limits: at most five
+model calls, 5,000 input tokens, 1,000 output tokens, $0.01 estimated cost, and
+30 seconds for either successful route. These limits establish the disposable
+exercise's acceptance boundary; production per-Episode budgets remain an
+application decision.
 
 Official OpenAI documentation distinguishes the two ownership patterns and
 documents resumable approval interruptions, result state, traces, and usage:
