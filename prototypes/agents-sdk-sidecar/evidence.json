@@ -1,0 +1,219 @@
+{
+  "agent_as_tool": {
+    "approval": {
+      "decision": "approved",
+      "interruption_count": 1,
+      "paused": true,
+      "required": true,
+      "resumed_same_run": true
+    },
+    "ownership": {
+      "final_owner": "Sidecar manager",
+      "manager_retained_control": true
+    },
+    "pattern": "agent_as_tool",
+    "result": {
+      "episode_id": "episode-sidecar-agent_as_tool",
+      "error": null,
+      "finding": "Validate the compact request_handoff envelope before any metered run.",
+      "return_to": "codex",
+      "specialist": "risk_reviewer",
+      "status": "completed",
+      "unresolved_points": []
+    },
+    "trace": {
+      "export_enabled": false,
+      "sensitive_payloads_included": false,
+      "trace_id": "trace_7f0574b1384044889c4183a6767c52b3"
+    },
+    "usage": {
+      "api_model_calls": 0,
+      "estimate_basis": "Not estimated: deterministic ScriptedModel made no API requests.",
+      "estimated_usd": null,
+      "input_tokens": null,
+      "output_tokens": null,
+      "sdk_requests": 3
+    }
+  },
+  "context_transmitted": {
+    "agent_as_tool": {
+      "bytes": 404,
+      "context_items": [
+        "Owner approved only the episode question and two synthetic constraints.",
+        "The specialist must not call tools or access the workspace."
+      ],
+      "fields": [
+        "type",
+        "episode_id",
+        "requested_by",
+        "pattern",
+        "specialist",
+        "task",
+        "context",
+        "approval_required"
+      ],
+      "full_discord_history_transmitted": false,
+      "repository_transmitted": false,
+      "sha256": "99e49e40465c30e044b89123c881336abe95f6382686d34e43574c0e5c9a5871"
+    },
+    "handoff": {
+      "bytes": 393,
+      "context_items": [
+        "Owner approved only the episode question and two synthetic constraints.",
+        "The specialist must not call tools or access the workspace."
+      ],
+      "fields": [
+        "type",
+        "episode_id",
+        "requested_by",
+        "pattern",
+        "specialist",
+        "task",
+        "context",
+        "approval_required"
+      ],
+      "full_discord_history_transmitted": false,
+      "repository_transmitted": false,
+      "sha256": "bd6f6344df87bea85aeb087b6c8342cac0ef26eb028b47f91158979bf50bbae1"
+    }
+  },
+  "environment": {
+    "date": "2026-08-23",
+    "mode": "deterministic-offline",
+    "model_configured_for_live_run": "gpt-5.6-luna",
+    "openai_agents": "0.22.0",
+    "openai_api_key_present": false,
+    "python": "3.11.15"
+  },
+  "failure_handling": {
+    "automatic_retry": false,
+    "fallback_owner": "codex",
+    "invalid_envelope_rejected_before_sdk": true,
+    "provider_failure": {
+      "episode_id": "episode-sidecar-handoff",
+      "error": "RuntimeError: simulated provider outage",
+      "finding": "The bounded specialist did not return a result.",
+      "return_to": "codex",
+      "specialist": "risk_reviewer",
+      "status": "failed",
+      "unresolved_points": [
+        "Codex must decide whether to retry or continue without the specialist."
+      ]
+    }
+  },
+  "handoff": {
+    "approval": {
+      "note": "The handoff changes ownership but has no side effect and was not approval-gated.",
+      "paused": false,
+      "required": false
+    },
+    "handoff_metadata_received": [
+      {
+        "approval_required": false,
+        "context": [
+          "Owner approved only the episode question and two synthetic constraints.",
+          "The specialist must not call tools or access the workspace."
+        ],
+        "episode_id": "episode-sidecar-handoff",
+        "pattern": "handoff",
+        "requested_by": "codex",
+        "specialist": "risk_reviewer",
+        "task": "Identify the single most important guardrail for this synthetic episode.",
+        "type": "request_handoff"
+      }
+    ],
+    "ownership": {
+      "final_owner": "Risk reviewer",
+      "specialist_took_control": true
+    },
+    "pattern": "handoff",
+    "result": {
+      "episode_id": "episode-sidecar-handoff",
+      "error": null,
+      "finding": "Validate the compact request_handoff envelope before any metered run.",
+      "return_to": "codex",
+      "specialist": "risk_reviewer",
+      "status": "completed",
+      "unresolved_points": []
+    },
+    "trace": {
+      "export_enabled": false,
+      "sensitive_payloads_included": false,
+      "trace_id": "trace_0f0954347859491dacd4f65e8b9b1298"
+    },
+    "usage": {
+      "api_model_calls": 0,
+      "estimate_basis": "Not estimated: deterministic ScriptedModel made no API requests.",
+      "estimated_usd": null,
+      "input_tokens": null,
+      "output_tokens": null,
+      "sdk_requests": 2
+    }
+  },
+  "live_evidence": {
+    "api_model_calls": 0,
+    "estimated_usd": null,
+    "input_tokens": null,
+    "output_tokens": null,
+    "reason": "OPENAI_API_KEY is absent; subscription Codex authentication is not an Agents SDK API credential.",
+    "status": "not_run"
+  },
+  "ordinary_discord_turn": {
+    "agents_sdk_invoked": false,
+    "api_model_calls": 0,
+    "message": "Collaborator: should the episode mention latency?",
+    "route": "codex_direct"
+  },
+  "sdk_model_boundary_calls": {
+    "agent_as_tool": [
+      {
+        "handoff_names": [],
+        "index": 1,
+        "input_bytes": 469,
+        "structured_output": true,
+        "tool_names": [
+          "bounded_risk_review"
+        ],
+        "trace_payloads_included": false
+      },
+      {
+        "handoff_names": [],
+        "index": 2,
+        "input_bytes": 485,
+        "structured_output": true,
+        "tool_names": [],
+        "trace_payloads_included": false
+      },
+      {
+        "handoff_names": [],
+        "index": 3,
+        "input_bytes": 1319,
+        "structured_output": true,
+        "tool_names": [
+          "bounded_risk_review"
+        ],
+        "trace_payloads_included": false
+      }
+    ],
+    "handoff": [
+      {
+        "handoff_names": [
+          "transfer_to_risk_reviewer"
+        ],
+        "index": 1,
+        "input_bytes": 458,
+        "structured_output": false,
+        "tool_names": [],
+        "trace_payloads_included": false
+      },
+      {
+        "handoff_names": [],
+        "index": 2,
+        "input_bytes": 458,
+        "structured_output": true,
+        "tool_names": [],
+        "trace_payloads_included": false
+      }
+    ]
+  }
+}
