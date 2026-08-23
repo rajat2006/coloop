@@ -1,0 +1,519 @@
+name: Agent Implement PRD
+
+# The PRD variant of the core spine (spec #52 / #68). Applying `agent:implement`
+# to a PRD-shaped issue (a parent that owns native sub-issues) drives the PRD to
+# a reviewed draft PR — but INCREMENTALLY, one sub-issue per run, exactly as CVM
+# does. Each run implements the first still-open sub-issue on an ACCUMULATING
+# branch, closes it, then re-labels the PRD (via AGENT_PAT) so the next run picks
+# up the next sub-issue. Review is requested only once every sub-issue is closed.
+# The productive agent may publish its current branch, upsert its own draft PR,
+# and recover Product CI. The workflow retains every lifecycle mutation.
+#
+# This listens for the SAME `agent:implement` labeled event as
+# `agent-implement.yml`. The two disambiguate purely by issue shape: the normal
+# workflow proceeds only when the issue has NO sub-issues; this one only when it
+# HAS them. So exactly one of the two runs for any given issue.
+
+on:
+  issues:
+    types: [labeled]
+
+jobs:
+  implement-prd:
+    if: github.event.label.name == 'agent:implement'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    concurrency:
+      # Per-PRD serialisation. Its own group, distinct from `agent-implement.yml`'s
+      # — the shape-guard, not concurrency, is what guarantees exactly one of the
+      # two proceeds. This group instead serialises the PRD's OWN chain: run N
+      # re-labels the PRD to fire run N+1, and cancel-in-progress: false means a
+      # queued next-sub-issue run waits for the current one rather than killing it
+      # mid-commit.
+      group: agent-implement-prd-issue-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      actions: write
+      pull-requests: write
+      issues: write
+
+    env:
+      BASE_BRANCH: ${{ github.event.repository.default_branch }}
+      PRD_NUMBER: ${{ github.event.issue.number }}
+      PRD_TITLE: ${{ github.event.issue.title }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+
+    steps:
+      - name: Detect — sub-issue shape, next open sub-issue, and provider
+        id: shape
+        run: |
+          set -euo pipefail
+
+          # Full label set (AC: read the whole set, not just the trigger label) —
+          # both the defensive trigger re-check and the provider switch read it.
+          labels_json=$(gh issue view "$PRD_NUMBER" --json labels --jq '[.labels[].name]')
+          echo "labels_json=$labels_json" >> "$GITHUB_OUTPUT"
+
+          # The provider is NOT decided here: it depends on DEFAULT_PROVIDER,
+          # so it is resolved by the `Resolve provider` step below (after
+          # checkout + install) via .sandcastle/print-provider.ts — the same
+          # code the runner uses. Nothing before that step is provider-specific.
+
+          # Defensive re-check: the trigger label must still be present (it could
+          # have been removed between the event and this run).
+          if ! echo "$labels_json" | jq -e 'index("agent:implement")' >/dev/null; then
+            echo "agent:implement no longer on the PRD — skipping."
+            echo "mode=silent" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # THE SHAPE FETCH — fail CLOSED, never guess. An issue with no
+          # sub-issues returns `200 []` (exit 0); only a genuine API/auth/network
+          # failure exits non-zero. Retry a few times to ride out transient blips,
+          # then treat a persistent failure as an ERROR (block) — NOT as "no
+          # sub-issues", which would silently misroute a real PRD to the leaf
+          # workflow. The leaf workflow's detect fails closed the same way, so the
+          # two never both proceed (or both silently drop) on an unknown shape.
+          sub_issues_json=""
+          fetch_ok=false
+          for attempt in 1 2 3; do
+            if sub_issues_json=$(gh api "repos/${GH_REPO}/issues/${PRD_NUMBER}/sub_issues" 2>/dev/null); then
+              fetch_ok=true
+              break
+            fi
+            echo "sub_issues fetch attempt ${attempt} failed; retrying…"
+            sleep 3
+          done
+          if [ "$fetch_ok" != "true" ]; then
+            echo "Could not determine issue shape after retries — failing closed."
+            echo "mode=error" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          sub_count=$(echo "$sub_issues_json" | jq 'length')
+
+          # A leaf issue (no sub-issues) belongs to the normal `agent-implement.yml`,
+          # which fires on the SAME event — SILENTLY skip so we neither race it nor
+          # strip its trigger label. Do not comment or edit labels here.
+          if [ "$sub_count" = "0" ]; then
+            echo "No sub-issues (leaf) — silent skip; the normal implement flow handles it."
+            echo "mode=silent" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # A PRD that is itself a sub-issue of another issue: nested PRDs are not
+          # supported in v1. Refuse. This probe fails CLOSED like the primary
+          # fetch — a missing parent is exit 0 with empty output; only a genuine
+          # API failure exits non-zero, and after retries that blocks rather than
+          # being read as "no parent" (which would let a nested PRD through).
+          owner="${GH_REPO%/*}"
+          repo="${GH_REPO#*/}"
+          parent_number=""
+          parent_ok=false
+          for attempt in 1 2 3; do
+            if parent_number=$(gh api graphql \
+                 -f query='query($owner: String!, $repo: String!, $num: Int!) { repository(owner: $owner, name: $repo) { issue(number: $num) { parent { number } } } }' \
+                 -f owner="$owner" -f repo="$repo" -F num="$PRD_NUMBER" \
+                 --jq '.data.repository.issue.parent.number // empty' 2>/dev/null); then
+              parent_ok=true
+              break
+            fi
+            echo "parent-shape probe attempt ${attempt} failed; retrying…"
+            sleep 3
+          done
+          if [ "$parent_ok" != "true" ]; then
+            echo "Could not determine parent shape after retries — failing closed."
+            echo "mode=error" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -n "$parent_number" ]; then
+            echo "parent_number=$parent_number" >> "$GITHUB_OUTPUT"
+            echo "mode=refuse-nested-prd" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # A sub-issue that has its OWN sub-issues: v1 is flat-only. Refuse. Each
+          # child probe fails CLOSED the same way — an error after retries blocks
+          # rather than being read as "no nested children" (which would let a
+          # nested child through).
+          for child_num in $(echo "$sub_issues_json" | jq -r '.[].number'); do
+            child_sub_count=""
+            child_ok=false
+            for attempt in 1 2 3; do
+              if child_sub_count=$(gh api "repos/${GH_REPO}/issues/${child_num}/sub_issues" --jq 'length' 2>/dev/null); then
+                child_ok=true
+                break
+              fi
+              echo "nested-child probe for #${child_num} attempt ${attempt} failed; retrying…"
+              sleep 3
+            done
+            if [ "$child_ok" != "true" ]; then
+              echo "Could not determine nested-child shape for #${child_num} after retries — failing closed."
+              echo "mode=error" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [ "$child_sub_count" != "0" ]; then
+              echo "nested_child_number=$child_num" >> "$GITHUB_OUTPUT"
+              echo "mode=refuse-nested-child" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+
+          # First still-open sub-issue, in the order the sub-issues API returns.
+          next_open=$(echo "$sub_issues_json" | jq -r '[.[] | select(.state == "open")] | .[0] // empty')
+          if [ -z "$next_open" ]; then
+            echo "All sub-issues already closed — nothing to implement."
+            echo "mode=refuse-all-closed" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "next_open_number=$(echo "$next_open" | jq -r '.number')" >> "$GITHUB_OUTPUT"
+          # Title may contain special chars; write via heredoc.
+          {
+            echo "next_open_title<<SUBEOF"
+            echo "$next_open" | jq -r '.title'
+            echo "SUBEOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "mode=run" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse — could not determine issue shape
+        if: steps.shape.outputs.mode == 'error'
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          gh issue edit "$PRD_NUMBER" --remove-label "agent:implement" || true
+          gh issue edit "$PRD_NUMBER" --add-label "agent:blocked" || true
+          gh issue comment "$PRD_NUMBER" --body "Refused to run \`agent:implement\`: could not read this issue's sub-issue shape after retries (a transient GitHub API failure). Nothing was routed, to avoid misrouting a PRD to the single-issue path. Clear \`agent:blocked\` and re-add \`agent:implement\` to retry. Run: ${RUN_URL}"
+
+      - name: Refuse — nested PRD
+        if: steps.shape.outputs.mode == 'refuse-nested-prd'
+        env:
+          PARENT_NUMBER: ${{ steps.shape.outputs.parent_number }}
+        run: |
+          set -uo pipefail
+          gh issue edit "$PRD_NUMBER" --remove-label "agent:implement" || true
+          gh issue edit "$PRD_NUMBER" --add-label "agent:blocked" || true
+          gh issue comment "$PRD_NUMBER" --body "Refused to run: this issue has sub-issues but is itself a sub-issue of #${PARENT_NUMBER}. Nested PRDs are not supported in v1 — flatten the structure before retrying."
+
+      - name: Refuse — sub-issue has its own sub-issues
+        if: steps.shape.outputs.mode == 'refuse-nested-child'
+        env:
+          NESTED_CHILD: ${{ steps.shape.outputs.nested_child_number }}
+        run: |
+          set -uo pipefail
+          gh issue edit "$PRD_NUMBER" --remove-label "agent:implement" || true
+          gh issue edit "$PRD_NUMBER" --add-label "agent:blocked" || true
+          gh issue comment "$PRD_NUMBER" --body "Refused to run: sub-issue #${NESTED_CHILD} itself has sub-issues. Nested sub-issues are not supported in v1 — each sub-issue must be a leaf. Flatten the structure before retrying."
+
+      - name: Refuse — all sub-issues already closed
+        if: steps.shape.outputs.mode == 'refuse-all-closed'
+        run: |
+          set -uo pipefail
+          gh issue edit "$PRD_NUMBER" --remove-label "agent:implement" || true
+          gh issue edit "$PRD_NUMBER" --add-label "agent:blocked" || true
+          gh issue comment "$PRD_NUMBER" --body "Refused to run: all sub-issues are already closed; nothing to implement. Reopen or add a sub-issue first, then re-add \`agent:implement\`."
+
+      - name: Transition labels — remove implement/blocked, add in-progress
+        if: steps.shape.outputs.mode == 'run'
+        run: |
+          set -euo pipefail
+          gh issue edit "$PRD_NUMBER" --remove-label "agent:implement" || true
+          gh issue edit "$PRD_NUMBER" --remove-label "agent:blocked" || true
+          gh issue edit "$PRD_NUMBER" --add-label "agent:in-progress"
+
+      - name: Checkout default branch
+        if: steps.shape.outputs.mode == 'run'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BASE_BRANCH }}
+          fetch-depth: 0
+          # AGENT_PAT so a push may include changes under .github/workflows/
+          # (GITHUB_TOKEN lacks the `workflows` scope). Falls back to GITHUB_TOKEN
+          # when unset — workflow-file changes are then rejected on push, but
+          # ordinary code changes still land.
+          token: ${{ secrets.AGENT_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Compute branch name
+        if: steps.shape.outputs.mode == 'run'
+        id: branch
+        run: |
+          set -euo pipefail
+          # PRD branches are keyed on the PRD number and namespaced `agent/prd-` so
+          # every sub-issue run accumulates onto the SAME branch (distinct from the
+          # leaf `agent/issue-` namespace). Strip stray separators after truncation.
+          slug=$(echo "$PRD_TITLE" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed -E 's/[^a-z0-9]+/-/g' \
+            | cut -c1-50 \
+            | sed -E 's/^-+|-+$//g')
+          [ -z "$slug" ] && slug="untitled"
+          echo "name=agent/prd-${PRD_NUMBER}-${slug}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up git identity and resume/create the accumulating branch
+        if: steps.shape.outputs.mode == 'run'
+        env:
+          BRANCH: ${{ steps.branch.outputs.name }}
+        run: |
+          set -euo pipefail
+          git config user.name "coloop-agent[bot]"
+          git config user.email "coloop-agent[bot]@users.noreply.github.com"
+          # Resume the PRD branch if it already exists (earlier sub-issue runs),
+          # else cut it fresh from the default branch. Commits accumulate across
+          # runs — this is
+          # why the push below is NOT a force-push.
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            git fetch origin "$BRANCH"
+            git checkout -B "$BRANCH" "origin/$BRANCH"
+          else
+            git checkout -b "$BRANCH"
+          fi
+
+      - name: Setup pnpm
+        if: steps.shape.outputs.mode == 'run'
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js 24
+        if: steps.shape.outputs.mode == 'run'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+
+      - name: Install dependencies
+        if: steps.shape.outputs.mode == 'run'
+        run: pnpm install --frozen-lockfile
+
+      # THE provider decision for this run. Delegated to the resolver the runner
+      # itself uses, so the workflow's provider-specific setup can never drift
+      # from it — an explicit `agent:claude` / `agent:codex` label wins, and
+      # otherwise DEFAULT_PROVIDER in `.sandcastle/resolve-agent.ts` decides.
+      - name: Resolve provider
+        if: steps.shape.outputs.mode == 'run'
+        id: provider
+        env:
+          AGENT_LABELS: ${{ steps.shape.outputs.labels_json }}
+        run: pnpm --dir .sandcastle exec tsx print-provider.ts | tee -a "$GITHUB_OUTPUT"
+
+      - name: Install Claude Code
+        if: steps.shape.outputs.mode == 'run'
+        run: npm install -g @anthropic-ai/claude-code
+
+      # Codex CLI only when this run resolved to Codex — a Claude run never pays
+      # for it. Runner-side auth is materialised by
+      # `prepareCodexAuth` inside the run scripts.
+      - name: Install Codex CLI
+        if: steps.shape.outputs.mode == 'run' && steps.provider.outputs.is_codex == 'true'
+        run: npm install -g @openai/codex
+
+      - name: Run implement-prd (one sub-issue)
+        if: steps.shape.outputs.mode == 'run'
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Codex subscription seat — ignored when the run resolved to Claude; the run
+          # script's prepareCodexAuth writes $CODEX_HOME/auth.json only when Codex
+          # is resolved. OPENAI_KEY / OPENAI_API_KEY are deliberately NOT passed.
+          CODEX_HOME: ${{ runner.temp }}/.codex
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+          AGENT_LABELS: ${{ steps.shape.outputs.labels_json }}
+          PRD_NUMBER: ${{ env.PRD_NUMBER }}
+          PRD_TITLE: ${{ env.PRD_TITLE }}
+          SUB_ISSUE_NUMBER: ${{ steps.shape.outputs.next_open_number }}
+          SUB_ISSUE_TITLE: ${{ steps.shape.outputs.next_open_title }}
+          BRANCH: ${{ steps.branch.outputs.name }}
+          OUTPUT_DIR: ${{ runner.temp }}
+          GH_TOKEN: ${{ secrets.AGENT_PAT }}
+        run: pnpm --dir .sandcastle exec tsx implement-prd/implement-prd.ts
+
+      - name: Push branch
+        if: steps.shape.outputs.mode == 'run' && success()
+        env:
+          BRANCH: ${{ steps.branch.outputs.name }}
+        # NOT a force-push: the branch accumulates commits across sub-issue runs.
+        run: git push origin "$BRANCH"
+
+      - name: Find the agent-owned draft PR
+        if: steps.shape.outputs.mode == 'run' && success()
+        id: pr_lookup
+        env:
+          BRANCH: ${{ steps.branch.outputs.name }}
+        run: |
+          set -euo pipefail
+          matches=$(gh pr list --head "$BRANCH" --state open --json number,isDraft,isCrossRepository,baseRefName)
+          if [ "$(echo "$matches" | jq 'length')" != "1" ]; then
+            echo "Expected exactly one open draft PR for ${BRANCH}; the productive agent must publish it before returning."
+            exit 1
+          fi
+          existing_pr=$(echo "$matches" | jq -r --arg base "$BASE_BRANCH" '.[0] | select(.isDraft == true and .isCrossRepository == false and .baseRefName == $base) | .number // empty')
+          [ -n "$existing_pr" ] || { echo "The branch PR is ready, cross-repository, or targets the wrong base."; exit 1; }
+          echo "existing_pr=$existing_pr" >> "$GITHUB_OUTPUT"
+
+      - name: Write PR title and description
+        if: steps.shape.outputs.mode == 'run' && success()
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          CODEX_HOME: ${{ runner.temp }}/.codex
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+          AGENT_LABELS: ${{ steps.shape.outputs.labels_json }}
+          PRD_NUMBER: ${{ env.PRD_NUMBER }}
+          PRD_TITLE: ${{ env.PRD_TITLE }}
+          OUTPUT_DIR: ${{ runner.temp }}
+        run: pnpm --dir .sandcastle exec tsx write-prd-pr/write-prd-pr.ts
+
+      - name: Reconcile the agent-owned draft PR
+        if: steps.shape.outputs.mode == 'run' && success()
+        id: open_pr
+        env:
+          BRANCH: ${{ steps.branch.outputs.name }}
+          EXISTING_PR: ${{ steps.pr_lookup.outputs.existing_pr }}
+          # Overrides the job-level GITHUB_TOKEN. Creating a PR with GITHUB_TOKEN
+          # is gated by the repo's "Allow GitHub Actions to create and approve
+          # pull requests" setting — off by default, and it fails the run with
+          # "GitHub Actions is not permitted to create or approve pull requests".
+          # A PAT is not subject to that policy. It also means the resulting
+          # pull_request event can trigger downstream workflows, which a
+          # GITHUB_TOKEN-created PR never does.
+          GH_TOKEN: ${{ secrets.AGENT_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          pr_title=$(head -c 256 "${RUNNER_TEMP}/pr_title.txt")
+          gh pr edit "$EXISTING_PR" --title "$pr_title" --body-file "${RUNNER_TEMP}/pr_description.txt"
+          echo "pr_number=$EXISTING_PR" >> "$GITHUB_OUTPUT"
+
+      - name: Final Product CI gate — pin provider
+        if: steps.shape.outputs.mode == 'run' && success()
+        env:
+          PR_NUMBER: ${{ steps.open_pr.outputs.pr_number }}
+        run: pnpm --dir .sandcastle exec tsx product-ci-cli.ts final-gate --pr "$PR_NUMBER"
+
+      - name: Propagate the resolved provider label to the PR
+        if: steps.shape.outputs.mode == 'run' && success()
+        env:
+          PR_NUMBER: ${{ steps.open_pr.outputs.pr_number }}
+          PROVIDER_LABEL: ${{ steps.provider.outputs.provider_label }}
+        # Provider continuity (spec §C/#64): the review workflow resolves its
+        # provider from the PR's OWN label set, so the PR must carry the label for
+        # whichever provider implemented the PRD — pinned explicitly (agent:claude
+        # or agent:codex) so a later flip of DEFAULT_PROVIDER can't review the
+        # branch on the other provider. GITHUB_TOKEN is fine — neither provider
+        # label triggers a workflow.
+        run: gh pr edit "$PR_NUMBER" --add-label "$PROVIDER_LABEL"
+
+      - name: Final Product CI gate — close child
+        if: steps.shape.outputs.mode == 'run' && success()
+        env:
+          PR_NUMBER: ${{ steps.open_pr.outputs.pr_number }}
+        run: pnpm --dir .sandcastle exec tsx product-ci-cli.ts final-gate --pr "$PR_NUMBER"
+
+      - name: Close the completed sub-issue
+        if: steps.shape.outputs.mode == 'run' && success()
+        env:
+          SUB_ISSUE_NUMBER: ${{ steps.shape.outputs.next_open_number }}
+        run: |
+          set -euo pipefail
+          commit_sha=$(git rev-parse HEAD)
+          gh issue close "$SUB_ISSUE_NUMBER" --comment "Implemented in ${commit_sha}. Part of #${PRD_NUMBER}."
+
+      - name: Re-check remaining open sub-issues
+        if: steps.shape.outputs.mode == 'run' && success()
+        id: remaining
+        env:
+          SUB_ISSUE_NUMBER: ${{ steps.shape.outputs.next_open_number }}
+        run: |
+          set -uo pipefail
+          # Fail CLOSED — this decides review-vs-chain, so a bad read must NOT
+          # default to 0 (which would request review while sub-issues remain).
+          # Retry to ride out transient blips; on persistent failure, exit 1 so
+          # the run neither chains nor hands off — the completed sub-issue is
+          # already closed and pushed, so a human just re-adds `agent:implement`
+          # to continue (the branch resumes and the next open sub-issue is picked
+          # up, or review is requested if none remain).
+          remaining=""
+          for attempt in 1 2 3; do
+            if remaining=$(gh api "repos/${GH_REPO}/issues/${PRD_NUMBER}/sub_issues" \
+                 --jq '[.[] | select(.state == "open")] | length' 2>/dev/null); then
+              break
+            fi
+            echo "remaining-count fetch attempt ${attempt} failed; retrying…"
+            remaining=""
+            sleep 3
+          done
+          if [ -z "$remaining" ]; then
+            echo "Could not determine remaining open sub-issues after retries — failing closed."
+            printf '%s\n' "Sub-issue #${SUB_ISSUE_NUMBER} was implemented, closed, and pushed, but the count of remaining open sub-issues could not be read (transient API failure), so the run neither requested review nor chained the next sub-issue. Re-add \`agent:implement\` to continue." > "${RUNNER_TEMP}/failure_reason.txt"
+            exit 1
+          fi
+          echo "count=$remaining" >> "$GITHUB_OUTPUT"
+
+      - name: Final Product CI gate — advance PRD
+        if: steps.shape.outputs.mode == 'run' && success()
+        env:
+          PR_NUMBER: ${{ steps.open_pr.outputs.pr_number }}
+        run: pnpm --dir .sandcastle exec tsx product-ci-cli.ts final-gate --pr "$PR_NUMBER"
+
+      - name: Chain — re-label the PRD to pick up the next sub-issue
+        if: steps.shape.outputs.mode == 'run' && success() && steps.remaining.outputs.count != '0'
+        env:
+          # AGENT_PAT so the labeled event fires the next PRD run — a
+          # GITHUB_TOKEN-applied label never triggers a downstream workflow. Falls
+          # back to GITHUB_TOKEN, which stalls the chain until a human re-labels.
+          AGENT_PAT: ${{ secrets.AGENT_PAT }}
+        run: |
+          set -uo pipefail
+          if [ -n "${AGENT_PAT:-}" ]; then
+            if GH_TOKEN="$AGENT_PAT" gh issue edit "$PRD_NUMBER" --add-label "agent:implement"; then
+              exit 0
+            fi
+            echo "AGENT_PAT label add failed; falling back to GITHUB_TOKEN (chain will need a manual re-label)."
+          fi
+          gh issue edit "$PRD_NUMBER" --add-label "agent:implement"
+
+      - name: Hand off to review — all sub-issues complete
+        if: steps.shape.outputs.mode == 'run' && success() && steps.remaining.outputs.count == '0'
+        env:
+          PR_NUMBER: ${{ steps.open_pr.outputs.pr_number }}
+          # AGENT_PAT so the labeled event fires the review workflow. Falls back to
+          # GITHUB_TOKEN; a human then re-adds agent:review to fire it.
+          AGENT_PAT: ${{ secrets.AGENT_PAT }}
+        run: |
+          set -uo pipefail
+          if [ -n "${AGENT_PAT:-}" ]; then
+            if GH_TOKEN="$AGENT_PAT" gh pr edit "$PR_NUMBER" --add-label "agent:review"; then
+              exit 0
+            fi
+            echo "AGENT_PAT label add failed; falling back to GITHUB_TOKEN (review will need a manual re-label)."
+          fi
+          gh pr edit "$PR_NUMBER" --add-label "agent:review"
+
+      - name: Mark blocked on failure
+        # `failure()` covers crashes and the idle watchdog (a non-zero tsx exit).
+        # `cancelled()` covers the hard 120-min job `timeout-minutes` breach, which
+        # cancels rather than fails the job — without it, a timed-out run would
+        # never reach the blocked path.
+        if: steps.shape.outputs.mode == 'run' && (failure() || cancelled())
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SUB_ISSUE_NUMBER: ${{ steps.shape.outputs.next_open_number }}
+        run: |
+          set -uo pipefail
+          reason="(no reason file written — check the workflow logs)"
+          if [ -f "${RUNNER_TEMP}/failure_reason.txt" ]; then
+            reason=$(cat "${RUNNER_TEMP}/failure_reason.txt")
+          fi
+          gh issue edit "$PRD_NUMBER" --add-label "agent:blocked" || true
+          {
+            printf '%s\n\n' "\`agent:implement\` (PRD mode) run failed while implementing sub-issue #${SUB_ISSUE_NUMBER}."
+            printf '**Reason:** %s\n\n' "$reason"
+            printf '**Workflow run:** %s\n\n' "$RUN_URL"
+            printf '%s\n' 'Clear `agent:blocked` and re-add `agent:implement` to retry from this sub-issue.'
+          } > "${RUNNER_TEMP}/blocked_comment.md"
+          gh issue comment "$PRD_NUMBER" --body-file "${RUNNER_TEMP}/blocked_comment.md"
+          if [ -n "${SUB_ISSUE_NUMBER:-}" ]; then
+            gh issue comment "$SUB_ISSUE_NUMBER" --body "Implementation attempt failed. See PRD #${PRD_NUMBER} for status. Workflow run: ${RUN_URL}" || true
+          fi
+
+      - name: Always remove in-progress
+        if: always() && steps.shape.outputs.mode == 'run'
+        run: gh issue edit "$PRD_NUMBER" --remove-label "agent:in-progress" || true

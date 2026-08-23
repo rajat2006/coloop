@@ -1,0 +1,4 @@
+packages:
+  - ".sandcastle"
+allowBuilds:
+  esbuild: true

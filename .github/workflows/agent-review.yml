@@ -1,0 +1,270 @@
+name: Agent Review
+
+# The review leg of the chain (spec #52 / #65): applying `agent:review` to a PR
+# runs the repo's local `/code-review`, which reviews, fixes, publishes, recovers
+# Product CI, and regenerates findings when needed. The workflow owns review
+# publication, labels, and the ready transition.
+
+on:
+  pull_request_target:
+    types: [labeled]
+
+jobs:
+  review:
+    if: github.event.label.name == 'agent:review'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    concurrency:
+      # SHARED per-PR group across every PR-mutating capability (review /
+      # implement-pr / update-branch), keyed on the PR number, so they queue
+      # rather than double-mutate the same PR. Queues, never cancels — an
+      # in-flight run is not killed (spec §68). `queue: max` is required for a
+      # real queue: the default `queue: single` keeps only ONE pending run, so a
+      # third PR-mutating trigger would evict the second instead of waiting.
+      group: agent-pr-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: write
+      actions: write
+      pull-requests: write
+      issues: write
+
+    env:
+      BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+
+    steps:
+      - name: Gate — read the PR label set, provider, and originating issue
+        id: gate
+        run: |
+          set -euo pipefail
+          # Full PR label set (AC: resolve the provider from the whole set, not
+          # just the just-added trigger label).
+          labels_json=$(gh pr view "$PR_NUMBER" --json labels --jq '[.labels[].name]')
+          echo "labels_json=$labels_json" >> "$GITHUB_OUTPUT"
+
+          # The provider is NOT decided here: it depends on DEFAULT_PROVIDER,
+          # so it is resolved by the `Resolve provider` step below (after
+          # checkout + install) via .sandcastle/print-provider.ts — the same
+          # code the runner uses. Nothing before that step is provider-specific.
+
+          # Defensive re-check: the trigger label must still be present (it could
+          # have been removed between the event and this run).
+          if ! echo "$labels_json" | jq -e 'index("agent:review")' >/dev/null; then
+            echo "agent:review no longer on the PR — skipping."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            echo "refusal=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # SECURITY: this workflow runs under `pull_request_target`, so the base
+          # repo's secrets (CLAUDE_CODE_OAUTH_TOKEN / CODEX_AUTH_JSON / AGENT_PAT)
+          # are in scope. Refuse fork PRs so their (untrusted) head code is never
+          # checked out and executed with those secrets available. The
+          # implement → review chain only ever produces same-repo `agent/issue-*`
+          # branches, so this refuses nothing the automation creates.
+          is_cross=$(gh pr view "$PR_NUMBER" --json isCrossRepository --jq '.isCrossRepository')
+          if [ "$is_cross" = "true" ]; then
+            echo "PR is from a fork — refusing review under pull_request_target."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+            echo "refusal=fork" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # The PR head branch is what we check out and diff against the PR base.
+          head_ref=$(gh pr view "$PR_NUMBER" --json headRefName --jq '.headRefName')
+          echo "head_ref=$head_ref" >> "$GITHUB_OUTPUT"
+
+          # Resolve the originating issue from the PR body ("Closes #N") so the
+          # review prompt reads the right spec. Fall back to the PR itself when a
+          # PR opens no issue link — /code-review then leans on commit messages.
+          pr_body=$(gh pr view "$PR_NUMBER" --json body --jq '.body')
+          issue_number=$(printf '%s' "$pr_body" \
+            | grep -oiE '(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+#[0-9]+' \
+            | grep -oE '[0-9]+' | head -n1 || true)
+          if [ -n "$issue_number" ]; then
+            issue_title=$(gh issue view "$issue_number" --json title --jq '.title' 2>/dev/null || echo "")
+          else
+            issue_number="$PR_NUMBER"
+            issue_title=$(gh pr view "$PR_NUMBER" --json title --jq '.title')
+          fi
+          echo "issue_number=$issue_number" >> "$GITHUB_OUTPUT"
+          echo "issue_title=$issue_title" >> "$GITHUB_OUTPUT"
+
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+          echo "refusal=" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse — PR is from a fork
+        if: steps.gate.outputs.refusal == 'fork'
+        run: |
+          set -euo pipefail
+          gh pr edit "$PR_NUMBER" --remove-label "agent:review" || true
+          gh pr comment "$PR_NUMBER" --body "Refused to run \`agent:review\`: this PR is from a fork. The review workflow runs under \`pull_request_target\` with repository secrets in scope, so it deliberately does not check out or execute fork head code. A maintainer can review it manually. Cleared \`agent:review\`."
+
+      - name: Transition labels — remove review/blocked, add in-progress
+        if: steps.gate.outputs.proceed == 'true'
+        # Mirror agent-implement's lifecycle on the PR: swap the trigger for
+        # agent:in-progress on start, clear any stale blocked, so the PR's label
+        # reflects an active run and a failure lands it back in agent:blocked.
+        run: |
+          set -euo pipefail
+          gh pr edit "$PR_NUMBER" --remove-label "agent:review" || true
+          gh pr edit "$PR_NUMBER" --remove-label "agent:blocked" || true
+          gh pr edit "$PR_NUMBER" --add-label "agent:in-progress"
+
+      - name: Checkout the PR branch
+        if: steps.gate.outputs.proceed == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.gate.outputs.head_ref }}
+          fetch-depth: 0
+          # AGENT_PAT because the review commits + pushes fixes (a push touching
+          # .github/workflows/ needs the `workflows` scope GITHUB_TOKEN lacks).
+          # Falls back to GITHUB_TOKEN, which still pushes ordinary code changes.
+          token: ${{ secrets.AGENT_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Fetch the review base
+        if: steps.gate.outputs.proceed == 'true'
+        # Explicit dest refspec so the remote base resolves for three-dot diffs,
+        # whatever narrow refspec the checkout left behind.
+        run: git fetch --no-tags origin "$BASE_BRANCH:refs/remotes/origin/$BASE_BRANCH"
+
+      - name: Setup pnpm
+        if: steps.gate.outputs.proceed == 'true'
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js 24
+        if: steps.gate.outputs.proceed == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+
+      - name: Install dependencies
+        if: steps.gate.outputs.proceed == 'true'
+        run: pnpm install --frozen-lockfile
+
+      # THE provider decision for this run. Delegated to the resolver the runner
+      # itself uses, so the workflow's provider-specific setup can never drift
+      # from it — an explicit `agent:claude` / `agent:codex` label wins, and
+      # otherwise DEFAULT_PROVIDER in `.sandcastle/resolve-agent.ts` decides.
+      - name: Resolve provider
+        if: steps.gate.outputs.proceed == 'true'
+        id: provider
+        env:
+          AGENT_LABELS: ${{ steps.gate.outputs.labels_json }}
+        run: pnpm --dir .sandcastle exec tsx print-provider.ts | tee -a "$GITHUB_OUTPUT"
+
+      - name: Install Claude Code
+        if: steps.gate.outputs.proceed == 'true'
+        run: npm install -g @anthropic-ai/claude-code
+
+      # Codex CLI only when this run resolved to Codex; a Claude run never pays
+      # for it. Runner-side auth is materialised by prepareCodexAuth.
+      - name: Install Codex CLI
+        if: steps.gate.outputs.proceed == 'true' && steps.provider.outputs.is_codex == 'true'
+        run: npm install -g @openai/codex
+
+      - name: Configure git identity
+        if: steps.gate.outputs.proceed == 'true'
+        # The review agent commits its fixes; git needs an author identity. Same
+        # bot identity implement uses.
+        run: |
+          set -euo pipefail
+          git config user.name "coloop-agent[bot]"
+          git config user.email "coloop-agent[bot]@users.noreply.github.com"
+
+      - name: Run review
+        if: steps.gate.outputs.proceed == 'true'
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Codex subscription seat — ignored when the run resolved to Claude; prepareCodexAuth
+          # writes $CODEX_HOME/auth.json only when Codex is resolved. OPENAI_KEY /
+          # OPENAI_API_KEY are deliberately NOT passed (spec #64).
+          CODEX_HOME: ${{ runner.temp }}/.codex
+          CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
+          AGENT_LABELS: ${{ steps.gate.outputs.labels_json }}
+          ISSUE_NUMBER: ${{ steps.gate.outputs.issue_number }}
+          ISSUE_TITLE: ${{ steps.gate.outputs.issue_title }}
+          BRANCH: ${{ steps.gate.outputs.head_ref }}
+          OUTPUT_DIR: ${{ runner.temp }}
+          GH_TOKEN: ${{ secrets.AGENT_PAT }}
+        run: pnpm --dir .sandcastle exec tsx review/review.ts
+
+      - name: Push review fixes
+        if: steps.gate.outputs.proceed == 'true' && success()
+        env:
+          HEAD_REF: ${{ steps.gate.outputs.head_ref }}
+        # Push the agent's fix commits back onto the PR branch BEFORE posting the
+        # review, so inline comments anchor to the pushed head. A no-op when the
+        # agent committed nothing. NOT a force-push: fixes only append to the head
+        # the run checked out; a rejected push means the branch moved under us and
+        # should fail loudly rather than clobber.
+        run: git push origin "HEAD:refs/heads/${HEAD_REF}"
+
+      - name: Final Product CI gate — publish review
+        if: steps.gate.outputs.proceed == 'true' && success()
+        run: pnpm --dir .sandcastle exec tsx product-ci-cli.ts final-gate --pr "$PR_NUMBER" --expected-head-file "${RUNNER_TEMP}/review_head_sha.txt"
+
+      - name: Post the review (summary + inline comments)
+        if: steps.gate.outputs.proceed == 'true' && success()
+        # review.ts wrote a ready-to-POST GitHub reviews-API body (event=COMMENT,
+        # a summary `body`, and any inline `comments` anchored to the diff). Post
+        # it as one review so findings land on their exact lines. A failure here
+        # (e.g. the reviews API 422s on an off-diff anchor) fails the job into the
+        # Mark-blocked path — we do NOT fall back to a degraded plain comment that
+        # would drop the inline findings while reporting success (CVM parity: a
+        # failed post is a run failure, and the anchor check already guards the
+        # common 422 cause).
+        run: gh api --method POST "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews" --input "${RUNNER_TEMP}/review_payload.json"
+
+      - name: Final Product CI gate — mark ready
+        if: steps.gate.outputs.proceed == 'true' && success()
+        run: pnpm --dir .sandcastle exec tsx product-ci-cli.ts final-gate --pr "$PR_NUMBER" --expected-head-file "${RUNNER_TEMP}/review_head_sha.txt"
+
+      - name: Mark the PR ready for review
+        if: steps.gate.outputs.proceed == 'true' && success()
+        # Idempotent: `gh pr ready` errors on an already-ready PR, which would flip
+        # the job to failed and post a contradictory "run failed" comment after we
+        # already posted the findings. Only convert when it is still a draft.
+        run: |
+          set -euo pipefail
+          if [ "$(gh pr view "$PR_NUMBER" --json isDraft --jq '.isDraft')" = "true" ]; then
+            gh pr ready "$PR_NUMBER"
+          else
+            echo "PR #$PR_NUMBER is already ready — nothing to do."
+          fi
+
+      - name: Mark blocked on failure
+        # `failure()` covers crashes and the idle watchdog; `cancelled()` covers a
+        # hard 120-min timeout breach. The PR is left as a draft (not marked ready)
+        # so a stalled review can't be mistaken for a passed one, and it lands in
+        # agent:blocked with a run-URL comment — the same failure lifecycle as
+        # agent-implement.
+        if: steps.gate.outputs.proceed == 'true' && (failure() || cancelled())
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          gh pr edit "$PR_NUMBER" --add-label "agent:blocked" || true
+          reason="(no reason file written — check the workflow logs)"
+          if [ -f "${RUNNER_TEMP}/failure_reason.txt" ]; then
+            reason=$(cat "${RUNNER_TEMP}/failure_reason.txt")
+          fi
+          {
+            printf '%s\n\n' '`agent:review` run failed — the PR was left as a draft.'
+            printf '**Reason:** %s\n\n' "$reason"
+            printf '**Workflow run:** %s\n\n' "$RUN_URL"
+            printf '%s\n' 'Clear `agent:blocked` and re-add `agent:review` to retry.'
+          } > "${RUNNER_TEMP}/review_failed.md"
+          gh pr comment "$PR_NUMBER" --body-file "${RUNNER_TEMP}/review_failed.md" || true
+
+      - name: Always remove in-progress
+        # Clear the active-run marker whatever the outcome (mirrors implement's
+        # `if: always()` in-progress removal). The trigger label was already
+        # cleared in the transition step, so a retry is a clean re-add.
+        if: always() && steps.gate.outputs.proceed == 'true'
+        run: gh pr edit "$PR_NUMBER" --remove-label "agent:in-progress" || true

@@ -1,0 +1,14 @@
+{
+  "name": "coloop",
+  "version": "0.0.0",
+  "private": true,
+  "packageManager": "pnpm@11.12.0",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "scripts": {
+    "ci:product": "pnpm run typecheck && pnpm run test",
+    "test": "pnpm --dir .sandcastle test",
+    "typecheck": "pnpm --dir .sandcastle typecheck"
+  }
+}
