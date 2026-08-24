@@ -20,6 +20,11 @@ A bounded exchange opened from ongoing agent work to obtain input from one or
 more collaborators, ending with an outcome returned to the owner.
 _Avoid_: Session, handoff, meeting
 
+**Episode Phase**:
+The owner-visible position of a collaboration episode in its business
+lifecycle, independent of transient agent and infrastructure operation status.
+_Avoid_: Operation status, health status
+
 **Episode Agent**:
 An AI agent delegated to participate in one collaboration episode using only
 the context and authority granted to that episode.
