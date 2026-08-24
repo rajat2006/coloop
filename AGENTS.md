@@ -2,8 +2,13 @@
 
 ## Agent skills
 
-Project-local skills live under `.agents/skills/` and are sourced from
-`mattpocock/skills`; `skills-lock.json` records the installed revisions.
+Project-local skills live under `.agents/skills/`. Shared engineering skills
+come from `mattpocock/skills`; `skills-lock.json` records their installed
+revisions.
+
+Coding standards live in `.agents/skills/coding-standards/`. Load that skill
+before writing code, reviewing changes, or answering questions about repository
+conventions.
 
 Before using the engineering flow for the first time, run the local
 `setup-matt-pocock-skills` skill to configure the issue tracker, triage labels,
