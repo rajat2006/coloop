@@ -26,8 +26,8 @@ the context and authority granted to that episode.
 _Avoid_: Origin agent, bot
 
 **Context Package**:
-The owner-approved purpose, question, excerpts, and artifacts made available to
-a collaboration episode.
+The owner-approved message prepared from an origin session and made available
+to a collaboration episode, containing a question and its relevant context.
 _Avoid_: Full session, repository snapshot, prompt dump
 
 **Episode Outcome**:
