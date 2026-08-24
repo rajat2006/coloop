@@ -30,6 +30,11 @@ The owner-approved message prepared from an origin session and made available
 to a collaboration episode, containing a question and its relevant context.
 _Avoid_: Full session, repository snapshot, prompt dump
 
+**Handoff Draft**:
+The private, unapproved message preview prepared in an origin session for owner
+review before a collaboration episode is opened.
+_Avoid_: Context Package, draft episode
+
 **Episode Outcome**:
 The structured result returned from a finalized collaboration episode,
 including its accepted answer or decision, accepted artifacts, and unresolved
