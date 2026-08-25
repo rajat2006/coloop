@@ -42,11 +42,15 @@ or context and to finalize or cancel it; conversational participation does not
 exercise episode control.
 _Avoid_: Participation, moderation, shared ownership
 
+**Outcome Proposal**:
+The current, revisable candidate for a collaboration episode's result while the
+episode remains active.
+_Avoid_: Episode Outcome, final answer, transcript summary
+
 **Episode Outcome**:
-The structured result returned from a finalized collaboration episode,
-including its accepted answer or decision, accepted artifacts, and unresolved
-points.
-_Avoid_: Transcript, summary, final answer
+The immutable structured text accepted by the owner when finalizing a
+collaboration episode, comprising its conclusion and any unresolved points.
+_Avoid_: Outcome Proposal, transcript, summary, final answer
 
 **Origin Session**:
 The owner's ongoing interaction with an AI agent from which a collaboration
