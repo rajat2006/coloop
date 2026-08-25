@@ -31,14 +31,16 @@ the context and authority granted to that episode.
 _Avoid_: Origin agent, bot
 
 **Context Package**:
-The owner-approved message prepared from an origin session and made available
-to a collaboration episode, containing a question and its relevant context.
-_Avoid_: Full session, repository snapshot, prompt dump
+An immutable, owner-authorized snapshot of the visible text exchanged in an
+origin session through the opening request, made available to its collaboration
+episode.
+_Avoid_: Full agent state, repository snapshot, prompt dump
 
-**Handoff Draft**:
-The private, unapproved message preview prepared in an origin session for owner
-review before a collaboration episode is opened.
-_Avoid_: Context Package, draft episode
+**Episode Control**:
+The owner's exclusive authority to change a collaboration episode's objective
+or context and to finalize or cancel it; conversational participation does not
+exercise episode control.
+_Avoid_: Participation, moderation, shared ownership
 
 **Episode Outcome**:
 The structured result returned from a finalized collaboration episode,
