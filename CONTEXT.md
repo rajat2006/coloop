@@ -10,6 +10,12 @@ The person accountable for the work who retains authority over the originating
 agent interaction and its outcomes.
 _Avoid_: Host, administrator
 
+**Owner Pairing**:
+The durable association between a Coloop installation's owner and the owner's
+Discord user identity in its configured server, used to authenticate episode
+control.
+_Avoid_: Thread ownership, installer identity, display-name match
+
 **Collaborator**:
 A person temporarily invited to advise, review, or approve part of an owner's
 work without assuming ongoing ownership of it.
