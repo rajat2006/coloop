@@ -4,6 +4,12 @@ Use the project-local skills under `.agents/skills/`.
 
 ## Agent skills
 
+### Coding standards
+
+Coding standards live in `.agents/skills/coding-standards/`. Load that skill
+before writing code, reviewing changes, or answering questions about repository
+conventions.
+
 ### Issue tracker
 
 Issues and specs are tracked in GitHub Issues for `rajat2006/coloop`. See
