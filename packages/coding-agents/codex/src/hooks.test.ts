@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { Readable, Writable } from "node:stream";
 import { describe, expect, test } from "vitest";
 import { runCodexHook } from "./hooks.js";
@@ -119,6 +120,53 @@ describe("Codex CLI integration entry points", () => {
     expect(error.value).toBe(
       "Coloop blocked an unsupported Codex hook payload.\n",
     );
+  });
+
+  test("the next-prompt hook injects a pending Outcome as additional context", async () => {
+    const output = new StringWriter();
+    const error = new StringWriter();
+    const handledHooks: unknown[] = [];
+    const exitCode = await runCodexHook(
+      "user-prompt-submit",
+      Readable.from([
+        await readFile(
+          new URL(
+            "./fixtures/codex-cli-0.150.1-user-prompt-submit.json",
+            import.meta.url,
+          ),
+          "utf8",
+        ),
+      ]),
+      output,
+      error,
+      {
+        handleCodexPromptSubmit: async ({ hook, inject }) => {
+          handledHooks.push(hook);
+          await inject("# Returned Collaboration Episode Outcome\n\nExact result.");
+          return { ok: true, status: "returned" };
+        },
+      },
+    );
+
+    expect(exitCode).toBe(0);
+    expect(error.value).toBe("");
+    expect(handledHooks).toEqual([
+      {
+        client: { name: "codex-cli", version: "0.150.1" },
+        payload: {
+          hook_event_name: "UserPromptSubmit",
+          session_id: "origin-1",
+          turn_id: "next-turn",
+          prompt: "Continue with the rollout work.",
+        },
+      },
+    ]);
+    expect(JSON.parse(output.value)).toEqual({
+      hookSpecificOutput: {
+        additionalContext: "# Returned Collaboration Episode Outcome\n\nExact result.",
+        hookEventName: "UserPromptSubmit",
+      },
+    });
   });
 
 });

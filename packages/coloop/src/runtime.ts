@@ -1,0 +1,3016 @@
+import { createHash, randomUUID } from "node:crypto";
+import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import type { EpisodeAgent } from "@coloop/core";
+import type { DiscordFinalizationInteraction } from "@coloop/discord";
+import type {
+  ApplicationTelemetry,
+  TelemetryEnvelope,
+} from "@coloop/observability";
+import type {
+  CodexRequest,
+  EpisodeToolArguments,
+} from "./codex-episode-contract";
+
+// PRD #41 fixes terminal Context Package retention at 72 hours; changing this
+// alters the Owner-approved disclosure lifecycle.
+const contextPackageRetentionMs = 72 * 60 * 60 * 1_000;
+
+export type EpisodePhase = "OPENING" | "ACTIVE" | "FINALIZED" | "CANCELLED";
+
+export interface OutcomeProposalContent {
+  readonly resultMarkdown: string;
+  readonly unresolvedPoints: readonly string[];
+}
+
+interface ProposalDeliveryReceipt {
+  readonly messageId: string;
+  readonly revisionId: string;
+  readonly contentSha256: string;
+}
+
+export interface EpisodeOutcome {
+  readonly episodeId: string;
+  readonly acceptedProposalRevisionId: string;
+  readonly resultMarkdown: string;
+  readonly unresolvedPoints: readonly string[];
+  readonly finalizedAt: string;
+}
+
+export interface DiscordEpisodeTransport {
+  provisionEpisode(input: {
+    readonly idempotencyKey: string;
+    readonly guildId: string;
+    readonly parentChannelId: string;
+    readonly ownerDiscordUserId: string;
+    readonly episodeId: string;
+    readonly openingBrief: string;
+  }): Promise<{ readonly threadId: string; readonly threadUrl: string }>;
+  presentCancellation(input: {
+    readonly idempotencyKey: string;
+    readonly guildId: string;
+    readonly threadId: string;
+    readonly episodeId: string;
+    readonly reason?: string;
+  }): Promise<void>;
+  presentInterruption(input: {
+    readonly guildId: string;
+    readonly threadId: string;
+    readonly message: string;
+    readonly finalizationDisabled: true;
+  }): Promise<void>;
+  beginAgentResponse(input: {
+    readonly eventId: string;
+    readonly guildId: string;
+    readonly threadId: string;
+  }): Promise<{
+    appendText(delta: string): Promise<void>;
+    complete(): Promise<void>;
+  }>;
+  publishOutcomeProposal(input: OutcomeProposalContent & {
+    readonly eventId: string;
+    readonly guildId: string;
+    readonly threadId: string;
+    readonly revisionId: string;
+    readonly contentSha256: string;
+    readonly finalizationEnabled: true;
+  }): Promise<ProposalDeliveryReceipt>;
+  reviseOutcomeProposal(input: OutcomeProposalContent & {
+    readonly eventId: string;
+    readonly guildId: string;
+    readonly threadId: string;
+    readonly messageId: string;
+    readonly revisionId: string;
+    readonly contentSha256: string;
+    readonly acknowledgement: string;
+    readonly finalizationEnabled: true;
+  }): Promise<ProposalDeliveryReceipt>;
+  presentFinalization(input: {
+    readonly idempotencyKey: string;
+    readonly guildId: string;
+    readonly threadId: string;
+    readonly episodeId: string;
+    readonly status: "FINALIZED";
+    readonly controlsDisabled: true;
+    readonly threadArchived: false;
+    readonly threadLocked: false;
+    readonly threadWritable: true;
+  }): Promise<void>;
+  setFinalizationEnabled(input: {
+    readonly guildId: string;
+    readonly threadId: string;
+    readonly revisionId: string;
+    readonly enabled: boolean;
+  }): Promise<void>;
+}
+
+export type EpisodeAgentTransport = EpisodeAgent;
+
+export interface DiscordMessageEvent {
+  readonly eventId: string;
+  readonly guildId: string;
+  readonly threadId: string;
+  readonly authorKind: "human" | "external-bot" | "webhook" | "coloop";
+  readonly authorDiscordUserId?: string;
+  readonly content: string;
+  readonly mentionsApplication: boolean;
+  readonly relevantConversation?: readonly DiscordConversationMessage[];
+}
+
+export interface DiscordConversationMessage {
+  readonly authorKind: "human" | "external-bot" | "webhook";
+  readonly content: string;
+}
+
+export type { DiscordFinalizationInteraction } from "@coloop/discord";
+
+export type DiscordMessageResult =
+  | { readonly ok: true; readonly status: "completed" | "duplicate" | "ignored" }
+  | { readonly ok: false; readonly reason: string; readonly code: string };
+
+export type EpisodeView =
+  | {
+      readonly id: string;
+      readonly originSessionId: string;
+      readonly phase: "OPENING" | "ACTIVE";
+      readonly collaborationUrl?: string;
+      readonly contextPackage: {
+        readonly reference: string;
+        readonly sha256: string;
+      };
+      readonly outcomeProposal?: {
+        readonly messageId: string;
+        readonly revisionId: string;
+        readonly sha256: string;
+      };
+      readonly interruption?: {
+        readonly kind: ConnectedPathInterruptionClass;
+        readonly interruptedAt: string;
+        readonly requiresCancellation: true;
+      };
+    }
+  | {
+      readonly id: string;
+      readonly phase: "CANCELLED";
+      readonly cancellation: {
+        readonly cancelledAt: string;
+        readonly reason?: string;
+      };
+    }
+  | {
+      readonly id: string;
+      readonly phase: "FINALIZED";
+      readonly outcome: EpisodeOutcome;
+    };
+
+interface RuntimeConfiguration {
+  readonly databasePath: string;
+  readonly artifactDirectory: string;
+  readonly ownerDiscordUserId: string;
+  readonly guildId: string;
+  readonly parentChannelId: string;
+  readonly discord: DiscordEpisodeTransport;
+  readonly agent?: EpisodeAgentTransport;
+  readonly now?: () => Date;
+  readonly createId?: () => string;
+  readonly createTelemetryId?: () => string;
+  readonly telemetry?: ApplicationTelemetry;
+}
+
+interface CodexPromptReturnerConfiguration {
+  readonly databasePath: string;
+  readonly now?: () => Date;
+  readonly telemetry?: ApplicationTelemetry;
+}
+
+interface TrustedHook {
+  readonly event: "PreToolUse";
+  readonly client: "codex-cli";
+  readonly clientVersion: "0.150.1";
+  readonly sessionId: string;
+  readonly turnId: string;
+  readonly toolUseId: string;
+  readonly toolName: string;
+  readonly transcriptPath: string;
+}
+
+interface TrustedPromptHook {
+  readonly event: "UserPromptSubmit";
+  readonly client: "codex-cli";
+  readonly clientVersion: "0.150.1";
+  readonly sessionId: string;
+  readonly turnId: string;
+}
+
+export type CodexPromptReturnResult =
+  | { readonly ok: true; readonly status: "returned" | "nothing-pending" }
+  | { readonly ok: false; readonly reason: string; readonly code: string };
+
+export type EpisodeOperationResult =
+  | { readonly ok: true; readonly episode: EpisodeView; readonly created?: boolean }
+  | { readonly ok: false; readonly reason: string; readonly code: string };
+
+export interface EpisodeModule {
+  openEpisode(input: {
+    readonly originSessionId: string;
+    readonly originTurnId: string;
+    readonly originalQuestion: string;
+    readonly openingBrief: string;
+    readonly contextMarkdown: string;
+  }): Promise<EpisodeOperationResult>;
+  getEpisode(input: {
+    readonly originSessionId: string;
+    readonly episodeId: string;
+  }): EpisodeOperationResult;
+  cancelEpisode(input: {
+    readonly originSessionId: string;
+    readonly episodeId: string;
+    readonly reason?: string;
+  }): Promise<EpisodeOperationResult>;
+}
+
+export interface CodexEpisodeRuntime {
+  handleCodexOperation(input: {
+    readonly hook: unknown;
+    readonly request: unknown;
+    readonly approval?: unknown;
+  }): Promise<EpisodeOperationResult>;
+  handleDiscordMessage(input: unknown): Promise<DiscordMessageResult>;
+  handleDiscordFinalization(input: unknown): Promise<EpisodeOperationResult>;
+  handleConnectedPathInterruption(input: {
+    readonly kind: "RUNTIME_INTERRUPTED" | "DISCORD_GATEWAY_INTERRUPTED";
+  }): Promise<{ readonly ok: true; readonly interruptedEpisodes: number }>;
+  handleConnectedPathAvailable(): Promise<{
+    readonly ok: true;
+    readonly presentedEpisodes: number;
+  }>;
+  handleCodexPromptSubmit(input: {
+    readonly hook: unknown;
+    readonly inject: (additionalContext: string) => Promise<void>;
+  }): Promise<CodexPromptReturnResult>;
+  close(): void;
+}
+
+export function createCodexPromptReturner(
+  configuration: CodexPromptReturnerConfiguration,
+): Pick<CodexEpisodeRuntime, "handleCodexPromptSubmit"> {
+  return {
+    async handleCodexPromptSubmit(input): Promise<CodexPromptReturnResult> {
+      const hook = parseTrustedPromptHook(input.hook);
+      if (!hook.ok) return hook;
+      const database = new DatabaseSync(configuration.databasePath);
+      try {
+        migrate(database);
+        return await returnPendingOutcome(
+          database,
+          hook.value,
+          input.inject,
+          configuration.now ?? (() => new Date()),
+          configuration.telemetry,
+        );
+      } finally {
+        database.close();
+      }
+    },
+  };
+}
+
+interface InternalEpisodeModule extends EpisodeModule {
+  findByOrigin(originSessionId: string): EpisodeView | undefined;
+}
+
+interface EpisodeRow {
+  readonly id: string;
+  readonly telemetry_id: string;
+  readonly origin_session_id: string;
+  readonly owner_discord_user_id: string;
+  readonly guild_id: string;
+  readonly phase: EpisodePhase;
+  readonly phase_version: number;
+  readonly thread_id: string | null;
+  readonly thread_url: string | null;
+  readonly context_reference: string;
+  readonly context_digest: string;
+  readonly context_retention_deadline: string | null;
+  readonly cancelled_at: string | null;
+  readonly cancellation_reason: string | null;
+  readonly agent_previous_response_id: string | null;
+  readonly proposal_message_id: string | null;
+  readonly proposal_revision_id: string | null;
+  readonly proposal_digest: string | null;
+  readonly outcome_revision_id: string | null;
+  readonly outcome_result_markdown: string | null;
+  readonly outcome_unresolved_points: string | null;
+  readonly finalized_at: string | null;
+  readonly return_pending: number;
+  readonly return_claim_turn_id: string | null;
+  readonly returned_at: string | null;
+  readonly returned_turn_id: string | null;
+  readonly original_question: string;
+}
+
+interface EpisodeInterruptionRow {
+  readonly episode_id: string;
+  readonly error_class: ConnectedPathInterruptionClass;
+  readonly interrupted_at: string;
+  readonly presented_at: string | null;
+}
+
+export type ConnectedPathInterruptionClass =
+  | "RUNTIME_INTERRUPTED"
+  | "DISCORD_GATEWAY_INTERRUPTED"
+  | "AGENT_PROVIDER_FAILED"
+  | "AGENT_CONTINUATION_REJECTED"
+  | "DISCORD_DELIVERY_AMBIGUOUS";
+
+export function createColoopRuntime(configuration: RuntimeConfiguration): CodexEpisodeRuntime {
+  mkdirSyncParent(configuration.databasePath);
+  const database = new DatabaseSync(configuration.databasePath);
+  database.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
+  migrate(database);
+  const now = configuration.now ?? (() => new Date());
+  recordRuntimeRestartInterruptions(database, now);
+  const createId = configuration.createId ?? randomUUID;
+  const createTelemetryId = configuration.createTelemetryId ?? randomUUID;
+  const episodes = createEpisodeModule(
+    database,
+    configuration,
+    now,
+    createId,
+    createTelemetryId,
+  );
+  const discordTurnQueues = new Map<string, Promise<void>>();
+
+  return {
+    async handleCodexOperation(input: {
+      readonly hook: unknown;
+      readonly request: unknown;
+      readonly approval?: unknown;
+    }): Promise<EpisodeOperationResult> {
+      const hook = parseTrustedHook(input.hook);
+      if (!hook.ok) return hook;
+      const request = parseCodexRequest(input.request);
+      if (!request.ok) return request;
+      if (hook.value.toolName !== `mcp__coloop__${request.value.operation}`) {
+        return failure(
+          "TRUSTED_TOOL_MISMATCH",
+          "The trusted Codex hook does not match the requested Episode operation.",
+        );
+      }
+      const replay = checkReplay(database, hook.value, request.value);
+      if (replay !== undefined) return replay;
+      let result: EpisodeOperationResult;
+      switch (request.value.operation) {
+        case "open_episode": {
+          const existing = episodes.findByOrigin(hook.value.sessionId);
+          if (existing !== undefined) {
+            result = { ok: true, created: false, episode: existing };
+            break;
+          }
+          const transcript = await captureTranscript(hook.value);
+          if (!transcript.ok) {
+            result = transcript;
+            break;
+          }
+          if (
+            !matchesOwnerApproval(
+              input.approval,
+              hook.value.toolUseId,
+              "open_episode",
+              openApprovalDigest(request.value.arguments, transcript.contextMarkdown),
+            )
+          ) {
+            result = failure(
+              "APPROVAL_REQUIRED",
+              "Opening a Collaboration Episode requires approval of the exact Context Package and Opening Brief.",
+            );
+            break;
+          }
+          if (lastOwnerText(transcript.messages) !== request.value.arguments.originalRequest) {
+            result = failure(
+              "ORIGINAL_REQUEST_MISMATCH",
+              "The approved original request does not match the current trusted transcript.",
+            );
+            break;
+          }
+          const credentialFinding = findCredential(
+            `${transcript.contextMarkdown}\n${request.value.arguments.openingBrief}`,
+          );
+          if (credentialFinding !== undefined) {
+            result = failure(
+              "CREDENTIAL_DETECTED",
+              `Opening blocked: remove the credential-like value ${credentialFinding}.`,
+            );
+            break;
+          }
+          result = await episodes.openEpisode({
+            originSessionId: hook.value.sessionId,
+            originTurnId: hook.value.turnId,
+            originalQuestion: request.value.arguments.originalRequest,
+            openingBrief: request.value.arguments.openingBrief,
+            contextMarkdown: transcript.contextMarkdown,
+          });
+          break;
+        }
+        case "get_episode":
+          result = episodes.getEpisode({
+            originSessionId: hook.value.sessionId,
+            episodeId: request.value.arguments.episodeId,
+          });
+          break;
+        case "cancel_episode": {
+          if (
+            !matchesOwnerApproval(
+              input.approval,
+              hook.value.toolUseId,
+              "cancel_episode",
+              cancellationApprovalDigest(request.value.arguments),
+            )
+          ) {
+            result = failure(
+              "APPROVAL_REQUIRED",
+              "Cancelling a Collaboration Episode requires approval of the exact cancellation request.",
+            );
+            break;
+          }
+          result = await episodes.cancelEpisode({
+            originSessionId: hook.value.sessionId,
+            episodeId: request.value.arguments.episodeId,
+            ...(request.value.arguments.reason === undefined
+              ? {}
+              : { reason: request.value.arguments.reason }),
+          });
+          break;
+        }
+      }
+      if (result.ok && request.value.operation !== "get_episode") {
+        recordCompletedOperation(database, hook.value, request.value, result.episode.id, now());
+      }
+      if (result.ok) {
+        const row = findById(database, result.episode.id);
+        if (row !== undefined) {
+          emitTelemetry(configuration, {
+            schemaVersion: 1,
+            stream: "product",
+            name: "episode.control",
+            occurredAt: now().toISOString(),
+            telemetryEpisodeId: row.telemetry_id,
+            attributes: {
+              control: request.value.operation.replace("_episode", ""),
+              result:
+                request.value.operation === "open_episode" && result.created === false
+                  ? "duplicate"
+                  : "succeeded",
+              authorizationResult: "allowed",
+            },
+          });
+        }
+      }
+      return result;
+    },
+
+    async handleCodexPromptSubmit(input): Promise<CodexPromptReturnResult> {
+      const hook = parseTrustedPromptHook(input.hook);
+      if (!hook.ok) return hook;
+      return await returnPendingOutcome(
+        database,
+        hook.value,
+        input.inject,
+        now,
+        configuration.telemetry,
+      );
+    },
+    async handleDiscordMessage(input): Promise<DiscordMessageResult> {
+      const event = parseDiscordMessageEvent(input);
+      if (!event.ok) return event;
+      return await serializeDiscordTurn(
+        discordTurnQueues,
+        `${event.value.guildId}:${event.value.threadId}`,
+        async () =>
+          await processDiscordMessage(
+            database,
+            configuration,
+            event.value,
+            now,
+            createId,
+          ),
+      );
+    },
+    async handleDiscordFinalization(input): Promise<EpisodeOperationResult> {
+      const interaction = parseDiscordFinalizationInteraction(input);
+      if (!interaction.ok) return interaction;
+      return await finalizeEpisode(
+        database,
+        configuration,
+        interaction.value,
+        now,
+      );
+    },
+    async handleConnectedPathInterruption(input) {
+      return await interruptConnectedEpisodes(database, configuration, input.kind, now);
+    },
+    async handleConnectedPathAvailable() {
+      return await presentPendingInterruptions(database, configuration);
+    },
+    close(): void {
+      database.close();
+    },
+  };
+}
+
+function parseDiscordFinalizationInteraction(
+  value: unknown,
+):
+  | { readonly ok: true; readonly value: DiscordFinalizationInteraction }
+  | { readonly ok: false; readonly reason: string; readonly code: string } {
+  if (
+    !isRecord(value) ||
+    !isNonEmptyString(value.interactionId) ||
+    !isNonEmptyString(value.guildId) ||
+    !isNonEmptyString(value.threadId) ||
+    (value.actorKind !== "human" &&
+      value.actorKind !== "bot" &&
+      value.actorKind !== "webhook") ||
+    (value.actorDiscordUserId !== undefined &&
+      !isNonEmptyString(value.actorDiscordUserId)) ||
+    !isNonEmptyString(value.revisionId)
+  ) {
+    return failure(
+      "INVALID_DISCORD_FINALIZATION",
+      "The Discord finalization interaction is unsupported or malformed.",
+    );
+  }
+  const proposal = parseOutcomeProposalCandidate(value.proposal);
+  if (proposal === undefined) {
+    return failure(
+      "INVALID_DISCORD_FINALIZATION",
+      "The Discord finalization interaction is unsupported or malformed.",
+    );
+  }
+  return {
+    ok: true,
+    value: {
+      interactionId: value.interactionId,
+      guildId: value.guildId,
+      threadId: value.threadId,
+      actorKind: value.actorKind,
+      ...(value.actorDiscordUserId === undefined
+        ? {}
+        : { actorDiscordUserId: value.actorDiscordUserId }),
+      revisionId: value.revisionId,
+      proposal,
+    },
+  };
+}
+
+function parseDiscordMessageEvent(
+  value: unknown,
+):
+  | { readonly ok: true; readonly value: DiscordMessageEvent }
+  | { readonly ok: false; readonly reason: string; readonly code: string } {
+  if (
+    !isRecord(value) ||
+    !isNonEmptyString(value.eventId) ||
+    !isNonEmptyString(value.guildId) ||
+    !isNonEmptyString(value.threadId) ||
+    !isDiscordMessageAuthor(value.authorKind) ||
+    (value.authorDiscordUserId !== undefined &&
+      !isNonEmptyString(value.authorDiscordUserId)) ||
+    !isNonEmptyString(value.content) ||
+    typeof value.mentionsApplication !== "boolean"
+  ) {
+    return invalidDiscordEvent();
+  }
+  let relevantConversation: DiscordConversationMessage[] | undefined;
+  if (value.relevantConversation !== undefined) {
+    if (!Array.isArray(value.relevantConversation)) return invalidDiscordEvent();
+    relevantConversation = [];
+    for (const message of value.relevantConversation) {
+      if (
+        !isRecord(message) ||
+        !isParticipantAuthor(message.authorKind) ||
+        !isNonEmptyString(message.content)
+      ) {
+        return invalidDiscordEvent();
+      }
+      relevantConversation.push({
+        authorKind: message.authorKind,
+        content: message.content,
+      });
+    }
+    const triggeringMessage = relevantConversation.at(-1);
+    if (
+      value.authorKind !== "coloop" &&
+      (triggeringMessage?.authorKind !== value.authorKind ||
+        triggeringMessage.content !== value.content)
+    ) {
+      return invalidDiscordEvent();
+    }
+  }
+  return {
+    ok: true,
+    value: {
+      eventId: value.eventId,
+      guildId: value.guildId,
+      threadId: value.threadId,
+      authorKind: value.authorKind,
+      ...(value.authorDiscordUserId === undefined
+        ? {}
+        : { authorDiscordUserId: value.authorDiscordUserId }),
+      content: value.content,
+      mentionsApplication: value.mentionsApplication,
+      ...(relevantConversation === undefined ? {} : { relevantConversation }),
+    },
+  };
+}
+
+function isDiscordMessageAuthor(
+  value: unknown,
+): value is DiscordMessageEvent["authorKind"] {
+  return value === "human" || isParticipantAuthor(value) || value === "coloop";
+}
+
+function isParticipantAuthor(
+  value: unknown,
+): value is DiscordConversationMessage["authorKind"] {
+  return value === "human" || value === "external-bot" || value === "webhook";
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function invalidDiscordEvent(): {
+  readonly ok: false;
+  readonly reason: string;
+  readonly code: string;
+} {
+  return failure(
+    "INVALID_DISCORD_EVENT",
+    "The Discord message event is unsupported or malformed.",
+  );
+}
+
+const interruptionMessage =
+  "This Collaboration Episode was interrupted and cannot continue. Cancel it from Codex, then open a new Episode from a fresh Origin Session.";
+
+async function interruptConnectedEpisodes(
+  database: DatabaseSync,
+  configuration: RuntimeConfiguration,
+  errorClass: ConnectedPathInterruptionClass,
+  now: () => Date,
+): Promise<{ readonly ok: true; readonly interruptedEpisodes: number }> {
+  const episodes = database
+    .prepare("SELECT * FROM episodes WHERE phase IN ('OPENING', 'ACTIVE')")
+    .all()
+    .map((value) => {
+      const episode = parseEpisodeRow(value);
+      if (episode === undefined) throw new Error("Episode state is malformed.");
+      return episode;
+    });
+  const interruptedAt = now().toISOString();
+  let interruptedEpisodes = 0;
+  for (const episode of episodes) {
+    const result = await recordAndPresentInterruption(
+      database,
+      configuration,
+      episode,
+      errorClass,
+      interruptedAt,
+    );
+    if (result.recorded) {
+      interruptedEpisodes += 1;
+    }
+  }
+  return { ok: true, interruptedEpisodes };
+}
+
+async function presentPendingInterruptions(
+  database: DatabaseSync,
+  configuration: RuntimeConfiguration,
+): Promise<{ readonly ok: true; readonly presentedEpisodes: number }> {
+  const episodes = database
+    .prepare(
+      `SELECT episodes.* FROM episodes JOIN episode_interruptions
+         ON episode_interruptions.episode_id = episodes.id
+       WHERE episodes.phase IN ('OPENING', 'ACTIVE')
+         AND episodes.thread_id IS NOT NULL
+         AND episode_interruptions.presented_at IS NULL`,
+    )
+    .all()
+    .map((value) => {
+      const episode = parseEpisodeRow(value);
+      if (episode === undefined) throw new Error("Episode state is malformed.");
+      return episode;
+    });
+  let presentedEpisodes = 0;
+  for (const episode of episodes) {
+    const interruption = findEpisodeInterruption(database, episode.id);
+    if (
+      interruption !== undefined &&
+      (await presentInterruption(database, configuration, episode, interruption))
+    ) {
+      presentedEpisodes += 1;
+    }
+  }
+  return { ok: true, presentedEpisodes };
+}
+
+function recordRuntimeRestartInterruptions(
+  database: DatabaseSync,
+  now: () => Date,
+): void {
+  const interruptedAt = now().toISOString();
+  database
+    .prepare(
+      `INSERT OR IGNORE INTO episode_interruptions
+       (episode_id, error_class, interrupted_at, presented_at)
+       SELECT id, 'RUNTIME_INTERRUPTED', ?, NULL FROM episodes
+       WHERE phase IN ('OPENING', 'ACTIVE')`,
+    )
+    .run(interruptedAt);
+}
+
+async function interruptEpisode(
+  database: DatabaseSync,
+  configuration: RuntimeConfiguration,
+  episode: EpisodeRow,
+  errorClass: ConnectedPathInterruptionClass,
+  now: () => Date,
+): Promise<void> {
+  await recordAndPresentInterruption(
+    database,
+    configuration,
+    episode,
+    errorClass,
+    now().toISOString(),
+  );
+}
+
+async function recordAndPresentInterruption(
+  database: DatabaseSync,
+  configuration: RuntimeConfiguration,
+  episode: EpisodeRow,
+  errorClass: ConnectedPathInterruptionClass,
+  interruptedAt: string,
+): Promise<{ readonly recorded: boolean }> {
+  const result = database
+    .prepare(
+      `INSERT OR IGNORE INTO episode_interruptions
+       (episode_id, error_class, interrupted_at, presented_at)
+       VALUES (?, ?, ?, NULL)`,
+    )
+    .run(episode.id, errorClass, interruptedAt);
+  const interruption = findEpisodeInterruption(database, episode.id);
+  if (result.changes === 1) {
+    emitTelemetry(configuration, {
+      schemaVersion: 1,
+      stream: "operational",
+      name:
+        errorClass === "DISCORD_GATEWAY_INTERRUPTED"
+          ? "discord.gateway"
+          : errorClass === "DISCORD_DELIVERY_AMBIGUOUS"
+            ? "delivery"
+            : "agent.run",
+      occurredAt: interruptedAt,
+      telemetryEpisodeId: episode.telemetry_id,
+      attributes: {
+        result: "interrupted",
+        errorClass,
+        ...(errorClass === "DISCORD_DELIVERY_AMBIGUOUS"
+          ? { destination: "discord" }
+          : {}),
+      },
+    });
+    if (
+      errorClass === "AGENT_PROVIDER_FAILED" ||
+      errorClass === "AGENT_CONTINUATION_REJECTED"
+    ) {
+      emitTelemetry(configuration, {
+        schemaVersion: 1,
+        stream: "operational",
+        name: "provider.call",
+        occurredAt: interruptedAt,
+        telemetryEpisodeId: episode.telemetry_id,
+        attributes: {
+          provider: "openai",
+          operation: "stream",
+          result: "failed",
+          errorClass,
+        },
+      });
+    }
+  }
+  if (interruption !== undefined) {
+    await presentInterruption(database, configuration, episode, interruption);
+  }
+  return { recorded: result.changes === 1 };
+}
+
+function findEpisodeInterruption(
+  database: DatabaseSync,
+  episodeId: string,
+): EpisodeInterruptionRow | undefined {
+  const value = database
+    .prepare("SELECT * FROM episode_interruptions WHERE episode_id = ?")
+    .get(episodeId);
+  if (value === undefined) return undefined;
+  if (
+    !isRecord(value) ||
+    value.episode_id !== episodeId ||
+    !isConnectedPathInterruptionClass(value.error_class) ||
+    !isIsoTimestamp(value.interrupted_at) ||
+    !isNullableString(value.presented_at)
+  ) {
+    throw new Error("Episode interruption state is malformed.");
+  }
+  return {
+    episode_id: value.episode_id,
+    error_class: value.error_class,
+    interrupted_at: value.interrupted_at,
+    presented_at: value.presented_at,
+  };
+}
+
+async function presentInterruption(
+  database: DatabaseSync,
+  configuration: RuntimeConfiguration,
+  episode: EpisodeRow,
+  interruption: EpisodeInterruptionRow,
+): Promise<boolean> {
+  if (episode.thread_id === null || interruption.presented_at !== null) return false;
+  try {
+    await configuration.discord.presentInterruption({
+      guildId: episode.guild_id,
+      threadId: episode.thread_id,
+      message: interruptionMessage,
+      finalizationDisabled: true,
+    });
+  } catch {
+    // Keep presentation unacknowledged so the next connected-path input retries
+    // the one actionable status after Discord becomes available again.
+    return false;
+  }
+  database
+    .prepare(
+      `UPDATE episode_interruptions SET presented_at = ?
+       WHERE episode_id = ? AND presented_at IS NULL`,
+    )
+    .run(new Date().toISOString(), episode.id);
+  return true;
+}
+
+function isConnectedPathInterruptionClass(
+  value: unknown,
+): value is ConnectedPathInterruptionClass {
+  return (
+    value === "RUNTIME_INTERRUPTED" ||
+    value === "DISCORD_GATEWAY_INTERRUPTED" ||
+    value === "AGENT_PROVIDER_FAILED" ||
+    value === "AGENT_CONTINUATION_REJECTED" ||
+    value === "DISCORD_DELIVERY_AMBIGUOUS"
+  );
+}
+
+async function serializeDiscordTurn<Value>(
+  queues: Map<string, Promise<void>>,
+  key: string,
+  operation: () => Promise<Value>,
+): Promise<Value> {
+  const previous = queues.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const queued = previous.then(() => current);
+  queues.set(key, queued);
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (queues.get(key) === queued) queues.delete(key);
+  }
+}
+
+async function processDiscordMessage(
+  database: DatabaseSync,
+  configuration: RuntimeConfiguration,
+  input: DiscordMessageEvent,
+  now: () => Date,
+  createId: () => string,
+): Promise<DiscordMessageResult> {
+  if (!input.mentionsApplication || input.authorKind === "coloop") {
+    return { ok: true, status: "ignored" };
+  }
+  const episode = findActiveByDiscord(database, input.guildId, input.threadId);
+  if (episode === undefined) return { ok: true, status: "ignored" };
+  const interruption = findEpisodeInterruption(database, episode.id);
+  if (interruption !== undefined) {
+    await presentInterruption(database, configuration, episode, interruption);
+    return failure(
+      "EPISODE_INTERRUPTED",
+      "This Collaboration Episode was interrupted. Cancel it and open a new Episode from a fresh Origin Session.",
+    );
+  }
+
+  const replayDigest = digest(JSON.stringify(input));
+  const replay = findProviderInput(database, input.eventId);
+  if (replay !== undefined) {
+    if (replay !== replayDigest) {
+      return failure(
+        "DISCORD_EVENT_REUSE",
+        "The Discord event identity was reused with different input.",
+      );
+    }
+    return { ok: true, status: "duplicate" };
+  }
+
+  const requestsSynthesis = requestsOutcomeProposal(input.content);
+  const requestsRevision = requestsProposalRevision(input.content);
+  if (requestsSynthesis && episode.proposal_revision_id === null) {
+    if (input.authorDiscordUserId !== episode.owner_discord_user_id) {
+      return failure(
+        "OWNER_REQUIRED",
+        "Only the paired Owner can request the first Outcome Proposal.",
+      );
+    }
+    return await synthesizeOutcomeProposal(
+      database,
+      configuration,
+      episode,
+      input,
+      now,
+      createId,
+    );
+  }
+  if (requestsRevision && episode.proposal_revision_id !== null) {
+    return await synthesizeOutcomeProposal(
+      database,
+      configuration,
+      episode,
+      input,
+      now,
+      createId,
+    );
+  }
+
+  const inputDigest = replayDigest;
+  const receivedAt = now().toISOString();
+  inTransaction(database, () => {
+    database
+      .prepare(
+        `INSERT INTO provider_inbox (
+          provider_event_id, episode_id, input_digest, effect_kind, status, received_at
+        ) VALUES (?, ?, ?, 'agent_turn', 'PROCESSING', ?)`,
+      )
+      .run(input.eventId, episode.id, inputDigest, receivedAt);
+    database
+      .prepare(
+        `INSERT INTO recovery_outbox (
+          action_id, episode_id, sequence, action_kind, idempotency_key,
+          destination_reference, state, payload, created_at
+        ) VALUES (?, ?, (
+          SELECT COALESCE(MAX(sequence), 0) + 1 FROM recovery_outbox WHERE episode_id = ?
+        ), 'DISCORD_AGENT_RESPONSE', ?, ?, 'PENDING', NULL, ?)`,
+      )
+      .run(
+        randomUUID(),
+        episode.id,
+        episode.id,
+        `agent-response:${input.eventId}`,
+        input.threadId,
+        receivedAt,
+      );
+  });
+
+  if (configuration.agent === undefined) {
+    abandonAgentTurn(database, input.eventId);
+    await interruptEpisode(database, configuration, episode, "AGENT_PROVIDER_FAILED", now);
+    return failure("AGENT_UNAVAILABLE", "The Episode Agent is not configured.");
+  }
+
+  let response: Awaited<ReturnType<DiscordEpisodeTransport["beginAgentResponse"]>>;
+  try {
+    response = await configuration.discord.beginAgentResponse({
+      eventId: input.eventId,
+      guildId: input.guildId,
+      threadId: input.threadId,
+    });
+  } catch {
+    abandonAgentTurn(database, input.eventId);
+    await interruptEpisode(
+      database,
+      configuration,
+      episode,
+      "DISCORD_DELIVERY_AMBIGUOUS",
+      now,
+    );
+    return failure("DISCORD_DELIVERY_FAILED", "Discord response delivery failed.");
+  }
+
+  if (episode.proposal_revision_id !== null) {
+    try {
+      await configuration.discord.setFinalizationEnabled({
+        guildId: input.guildId,
+        threadId: input.threadId,
+        revisionId: episode.proposal_revision_id,
+        enabled: false,
+      });
+    } catch {
+      abandonAgentTurn(database, input.eventId);
+      await interruptEpisode(
+        database,
+        configuration,
+        episode,
+        "DISCORD_DELIVERY_AMBIGUOUS",
+        now,
+      );
+      return failure("DISCORD_DELIVERY_FAILED", "Discord response delivery failed.");
+    }
+  }
+
+  const contextPackage = await readFile(episode.context_reference, "utf8");
+  const agentResult = await configuration.agent.streamResponse({
+    contextPackage,
+    message: renderDiscordConversation(input),
+    ...(episode.agent_previous_response_id === null
+      ? {}
+      : { previousResponseId: episode.agent_previous_response_id }),
+    onTextDelta: async (delta) => {
+      try {
+        await response.appendText(delta);
+        return { ok: true };
+      } catch {
+        return { ok: false, reason: "delivery-failed" };
+      }
+    },
+  });
+  if (!agentResult.ok) {
+    abandonAgentTurn(database, input.eventId);
+    await interruptEpisode(
+      database,
+      configuration,
+      episode,
+      agentResult.reason === "delivery-failed"
+        ? "DISCORD_DELIVERY_AMBIGUOUS"
+        : episode.agent_previous_response_id === null
+          ? "AGENT_PROVIDER_FAILED"
+          : "AGENT_CONTINUATION_REJECTED",
+      now,
+    );
+    return agentResult.reason === "delivery-failed"
+      ? failure("DISCORD_DELIVERY_FAILED", "Discord response delivery failed.")
+      : failure("AGENT_PROVIDER_FAILED", "The Episode Agent provider call failed.");
+  }
+  try {
+    await response.complete();
+  } catch {
+    abandonAgentTurn(database, input.eventId);
+    await interruptEpisode(
+      database,
+      configuration,
+      episode,
+      "DISCORD_DELIVERY_AMBIGUOUS",
+      now,
+    );
+    return failure("DISCORD_DELIVERY_FAILED", "Discord response delivery failed.");
+  }
+  if (findEpisodeInterruption(database, episode.id) !== undefined) {
+    abandonAgentTurn(database, input.eventId);
+    return failure(
+      "EPISODE_INTERRUPTED",
+      "This Collaboration Episode was interrupted before the Agent turn was acknowledged.",
+    );
+  }
+
+  const completedAt = now().toISOString();
+  inTransaction(database, () => {
+    database
+      .prepare(
+        "UPDATE episodes SET agent_previous_response_id = ?, updated_at = ? WHERE id = ?",
+      )
+      .run(agentResult.responseId, completedAt, episode.id);
+    database
+      .prepare(
+        `UPDATE provider_inbox SET status = 'COMPLETED', completed_at = ?
+         WHERE provider_event_id = ?`,
+      )
+      .run(completedAt, input.eventId);
+    database
+      .prepare(
+        `UPDATE recovery_outbox SET state = 'ACKNOWLEDGED', acknowledged_at = ?
+         WHERE idempotency_key = ?`,
+      )
+      .run(completedAt, `agent-response:${input.eventId}`);
+  });
+  emitSuccessfulAgentRun(configuration, episode, completedAt, "stream");
+  const current = findActiveByDiscord(database, input.guildId, input.threadId);
+  if (
+    episode.proposal_revision_id !== null &&
+    current?.proposal_revision_id === episode.proposal_revision_id
+  ) {
+    try {
+      await configuration.discord.setFinalizationEnabled({
+        guildId: input.guildId,
+        threadId: input.threadId,
+        revisionId: episode.proposal_revision_id,
+        enabled: true,
+      });
+    } catch {
+      await interruptEpisode(
+        database,
+        configuration,
+        episode,
+        "DISCORD_DELIVERY_AMBIGUOUS",
+        now,
+      );
+      return failure("DISCORD_DELIVERY_FAILED", "Discord response delivery failed.");
+    }
+  }
+  return { ok: true, status: "completed" };
+}
+
+function requestsOutcomeProposal(content: string): boolean {
+  return (
+    (/\boutcome\s+proposal\b/i.test(content) &&
+      /\b(synthesize|create|draft|prepare|publish|make)\b/i.test(content)) ||
+    (/\b(synthesize|summarize|turn|convert)\b/i.test(content) &&
+      /\b(discussion|conversation|this)\b/i.test(content) &&
+      /\b(recommendation|conclusion|result)\b/i.test(content))
+  );
+}
+
+function requestsProposalRevision(content: string): boolean {
+  return (
+    /\b(revise|update|correct|change|amend|restore|fix|replace|make)\b/i.test(
+      content,
+    ) &&
+    (/\boutcome\s+proposal\b/i.test(content) ||
+      /\b(recommendation|conclusion|result|rollout|proposal)\b/i.test(content))
+  );
+}
+
+type OutcomeProposalCandidate = OutcomeProposalContent;
+
+async function synthesizeOutcomeProposal(
+  database: DatabaseSync,
+  configuration: RuntimeConfiguration,
+  episode: EpisodeRow,
+  input: DiscordMessageEvent,
+  now: () => Date,
+  createId: () => string,
+): Promise<DiscordMessageResult> {
+  const inputDigest = digest(JSON.stringify(input));
+  if (configuration.agent === undefined) {
+    await interruptEpisode(database, configuration, episode, "AGENT_PROVIDER_FAILED", now);
+    return failure("AGENT_UNAVAILABLE", "The Episode Agent is not configured.");
+  }
+
+  const receivedAt = now().toISOString();
+  const revisionId = createId();
+  const isRevision = episode.proposal_revision_id !== null;
+  const effectKind = isRevision ? "proposal_revision" : "proposal_synthesis";
+  const actionKind = isRevision
+    ? "DISCORD_PROPOSAL_REVISION"
+    : "DISCORD_PROPOSAL_PUBLISH";
+  inTransaction(database, () => {
+    database
+      .prepare(
+        `INSERT INTO provider_inbox (
+          provider_event_id, episode_id, input_digest, effect_kind, status, received_at
+        ) VALUES (?, ?, ?, ?, 'PROCESSING', ?)`,
+      )
+      .run(input.eventId, episode.id, inputDigest, effectKind, receivedAt);
+    database
+      .prepare(
+        `INSERT INTO recovery_outbox (
+          action_id, episode_id, sequence, action_kind, idempotency_key,
+          destination_reference, state, payload, created_at
+        ) VALUES (?, ?, (
+          SELECT COALESCE(MAX(sequence), 0) + 1 FROM recovery_outbox WHERE episode_id = ?
+        ), ?, ?, ?, 'PENDING', NULL, ?)`,
+      )
+      .run(
+        randomUUID(),
+        episode.id,
+        episode.id,
+        actionKind,
+        `proposal:${input.eventId}`,
+        input.threadId,
+        receivedAt,
+      );
+  });
+
+  if (isRevision && episode.proposal_revision_id !== null) {
+    try {
+      await configuration.discord.setFinalizationEnabled({
+        guildId: input.guildId,
+        threadId: input.threadId,
+        revisionId: episode.proposal_revision_id,
+        enabled: false,
+      });
+    } catch {
+      abandonProposal(database, input.eventId);
+      await interruptEpisode(
+        database,
+        configuration,
+        episode,
+        "DISCORD_DELIVERY_AMBIGUOUS",
+        now,
+      );
+      return failure("DISCORD_DELIVERY_FAILED", "Discord proposal delivery failed.");
+    }
+  }
+
+  const candidateResult = await configuration.agent.synthesizeOutcomeProposal({
+    contextPackage: await readFile(episode.context_reference, "utf8"),
+    message: renderDiscordConversation(input),
+    ...(episode.agent_previous_response_id === null
+      ? {}
+      : { previousResponseId: episode.agent_previous_response_id }),
+  });
+  if (!candidateResult.ok) {
+    abandonProposal(database, input.eventId);
+    await interruptEpisode(
+      database,
+      configuration,
+      episode,
+      episode.agent_previous_response_id === null
+        ? "AGENT_PROVIDER_FAILED"
+        : "AGENT_CONTINUATION_REJECTED",
+      now,
+    );
+    return failure("AGENT_PROVIDER_FAILED", "The Episode Agent provider call failed.");
+  }
+  const candidate = parseOutcomeProposalCandidate(candidateResult.candidate);
+  if (candidate === undefined) {
+    abandonProposal(database, input.eventId);
+    await interruptEpisode(database, configuration, episode, "AGENT_PROVIDER_FAILED", now);
+    return failure(
+      "INVALID_PROPOSAL_OUTPUT",
+      "The Episode Agent did not return a valid Outcome Proposal.",
+    );
+  }
+
+  const proposalDigest = digest(JSON.stringify(candidate));
+  let delivery: ProposalDeliveryReceipt;
+  try {
+    if (episode.proposal_message_id === null) {
+      delivery = await configuration.discord.publishOutcomeProposal({
+        eventId: input.eventId,
+        guildId: input.guildId,
+        threadId: input.threadId,
+        revisionId,
+        resultMarkdown: candidate.resultMarkdown,
+        unresolvedPoints: candidate.unresolvedPoints,
+        contentSha256: proposalDigest,
+        finalizationEnabled: true,
+      });
+    } else {
+      delivery = await configuration.discord.reviseOutcomeProposal({
+        eventId: input.eventId,
+        guildId: input.guildId,
+        threadId: input.threadId,
+        messageId: episode.proposal_message_id,
+        revisionId,
+        resultMarkdown: candidate.resultMarkdown,
+        unresolvedPoints: candidate.unresolvedPoints,
+        contentSha256: proposalDigest,
+        acknowledgement: `Outcome Proposal revised to ${revisionId}.`,
+        finalizationEnabled: true,
+      });
+    }
+  } catch {
+    abandonProposal(database, input.eventId);
+    await interruptEpisode(
+      database,
+      configuration,
+      episode,
+      "DISCORD_DELIVERY_AMBIGUOUS",
+      now,
+    );
+    return failure("DISCORD_DELIVERY_FAILED", "Discord proposal delivery failed.");
+  }
+  const expectedMessageId = episode.proposal_message_id ?? delivery.messageId;
+  if (
+    delivery.messageId !== expectedMessageId ||
+    delivery.revisionId !== revisionId ||
+    delivery.contentSha256 !== proposalDigest
+  ) {
+    abandonProposal(database, input.eventId);
+    await interruptEpisode(
+      database,
+      configuration,
+      episode,
+      "DISCORD_DELIVERY_AMBIGUOUS",
+      now,
+    );
+    return failure(
+      "STALE_PROPOSAL_DELIVERY",
+      "Discord did not acknowledge the current Outcome Proposal revision.",
+    );
+  }
+  if (findEpisodeInterruption(database, episode.id) !== undefined) {
+    abandonProposal(database, input.eventId);
+    return failure(
+      "EPISODE_INTERRUPTED",
+      "This Collaboration Episode was interrupted before the Outcome Proposal was acknowledged.",
+    );
+  }
+
+  const completedAt = now().toISOString();
+  // Discord must acknowledge the exact content before it becomes current locally.
+  // A failed compare-and-set leaves the connected-only Episode unsafe to continue;
+  // the interruption guard above prevents a late provider result from committing.
+  inTransaction(database, () => {
+    const proposalUpdate =
+      episode.proposal_revision_id === null
+        ? database
+            .prepare(
+              `UPDATE episodes SET proposal_message_id = ?, proposal_revision_id = ?,
+               proposal_digest = ?, agent_previous_response_id = ?, updated_at = ?
+               WHERE id = ? AND phase = 'ACTIVE' AND proposal_revision_id IS NULL`,
+            )
+            .run(
+              delivery.messageId,
+              revisionId,
+              proposalDigest,
+              candidateResult.responseId,
+              completedAt,
+              episode.id,
+            )
+        : database
+            .prepare(
+              `UPDATE episodes SET proposal_revision_id = ?, proposal_digest = ?,
+               agent_previous_response_id = ?, updated_at = ?
+               WHERE id = ? AND phase = 'ACTIVE' AND proposal_revision_id = ?`,
+            )
+            .run(
+              revisionId,
+              proposalDigest,
+              candidateResult.responseId,
+              completedAt,
+              episode.id,
+              episode.proposal_revision_id,
+            );
+    if (proposalUpdate.changes !== 1) {
+      throw new Error("The current Outcome Proposal changed during delivery.");
+    }
+    database
+      .prepare(
+        `UPDATE provider_inbox SET status = 'COMPLETED', completed_at = ?
+         WHERE provider_event_id = ?`,
+      )
+      .run(completedAt, input.eventId);
+    database
+      .prepare(
+        `UPDATE recovery_outbox SET state = 'ACKNOWLEDGED', acknowledged_at = ?
+         WHERE idempotency_key = ?`,
+      )
+      .run(completedAt, `proposal:${input.eventId}`);
+  });
+  emitSuccessfulAgentRun(configuration, episode, completedAt, "synthesize");
+  return { ok: true, status: "completed" };
+}
+
+function parseOutcomeProposalCandidate(value: unknown): OutcomeProposalCandidate | undefined {
+  if (
+    !isRecord(value) ||
+    Object.keys(value).length !== 2 ||
+    !isNonBlankString(value.resultMarkdown) ||
+    !Array.isArray(value.unresolvedPoints) ||
+    !value.unresolvedPoints.every(isNonBlankString)
+  ) {
+    return undefined;
+  }
+  return {
+    resultMarkdown: value.resultMarkdown,
+    unresolvedPoints: value.unresolvedPoints,
+  };
+}
+
+function isNonBlankString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function abandonProposal(database: DatabaseSync, eventId: string): void {
+  abandonProviderEffect(database, eventId, `proposal:${eventId}`);
+}
+
+function abandonAgentTurn(database: DatabaseSync, eventId: string): void {
+  abandonProviderEffect(database, eventId, `agent-response:${eventId}`);
+}
+
+function abandonProviderEffect(
+  database: DatabaseSync,
+  eventId: string,
+  idempotencyKey: string,
+): void {
+  inTransaction(database, () => {
+    database
+      .prepare("UPDATE provider_inbox SET status = 'FAILED' WHERE provider_event_id = ?")
+      .run(eventId);
+    database
+      .prepare("UPDATE recovery_outbox SET state = 'ABANDONED' WHERE idempotency_key = ?")
+      .run(idempotencyKey);
+  });
+}
+
+function renderDiscordConversation(input: DiscordMessageEvent): string {
+  if (input.relevantConversation === undefined) return input.content;
+  return (
+    "# Relevant Discord conversation\n\n" +
+    input.relevantConversation
+      .map((message) => `${message.authorKind}: ${message.content}`)
+      .join("\n\n")
+  );
+}
+
+function createEpisodeModule(
+  database: DatabaseSync,
+  configuration: RuntimeConfiguration,
+  now: () => Date,
+  createId: () => string,
+  createTelemetryId: () => string,
+): InternalEpisodeModule {
+  return {
+    openEpisode: (input) =>
+      openEpisode(database, configuration, now, createId, createTelemetryId, input),
+    getEpisode: (input) => getEpisode(database, input.originSessionId, input.episodeId),
+    cancelEpisode: (input) => cancelEpisode(database, configuration, now, input),
+    findByOrigin: (originSessionId) => {
+      const row = findByOrigin(database, originSessionId);
+      return row === undefined
+        ? undefined
+        : toView(row, findEpisodeInterruption(database, row.id));
+    },
+  };
+}
+
+async function openEpisode(
+  database: DatabaseSync,
+  configuration: RuntimeConfiguration,
+  now: () => Date,
+  createId: () => string,
+  createTelemetryId: () => string,
+  input: Parameters<EpisodeModule["openEpisode"]>[0],
+): Promise<EpisodeOperationResult> {
+  const existing = findByOrigin(database, input.originSessionId);
+  if (existing !== undefined) {
+    return {
+      ok: true,
+      created: false,
+      episode: toView(existing, findEpisodeInterruption(database, existing.id)),
+    };
+  }
+
+  const episodeId = createId();
+  const telemetryEpisodeId = createTelemetryId();
+  const episodeDirectory = resolve(configuration.artifactDirectory, episodeId);
+  const contextReference = join(episodeDirectory, "context.md");
+  await mkdir(episodeDirectory, { recursive: true, mode: 0o700 });
+  await writeFile(contextReference, input.contextMarkdown, { mode: 0o600, flag: "wx" });
+  await chmod(contextReference, 0o400);
+  const contextDigest = digest(input.contextMarkdown);
+  const createdAt = now().toISOString();
+
+  try {
+    inTransaction(database, () => {
+      database
+        .prepare(
+          `INSERT INTO episodes (
+            id, telemetry_id, origin_session_id, origin_turn_id, owner_discord_user_id, guild_id,
+            parent_channel_id, phase, phase_version, original_question, opening_brief,
+            context_reference, context_digest, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'OPENING', 1, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          episodeId,
+          telemetryEpisodeId,
+          input.originSessionId,
+          input.originTurnId,
+          configuration.ownerDiscordUserId,
+          configuration.guildId,
+          configuration.parentChannelId,
+          input.originalQuestion,
+          input.openingBrief,
+          contextReference,
+          contextDigest,
+          createdAt,
+          createdAt,
+        );
+      addAudit(database, episodeId, 1, "EPISODE_OPENING", "owner", createdAt);
+      addPendingOpeningOutbox(
+        database,
+        episodeId,
+        configuration.parentChannelId,
+        createdAt,
+      );
+    });
+    emitTelemetry(configuration, {
+      schemaVersion: 1,
+      stream: "product",
+      name: "episode.lifecycle",
+      occurredAt: createdAt,
+      telemetryEpisodeId,
+      attributes: { phase: "OPENING", result: "succeeded", created: true },
+    });
+  } catch (error) {
+    const winner = findByOrigin(database, input.originSessionId);
+    if (winner === undefined) throw error;
+    if (winner.id !== episodeId) {
+      await rm(episodeDirectory, { recursive: true, force: true });
+    }
+    return { ok: true, created: false, episode: toView(winner) };
+  }
+
+  let provisioned: Awaited<
+    ReturnType<DiscordEpisodeTransport["provisionEpisode"]>
+  >;
+  try {
+    provisioned = await configuration.discord.provisionEpisode({
+      idempotencyKey: `episode-opened:${episodeId}`,
+      guildId: configuration.guildId,
+      parentChannelId: configuration.parentChannelId,
+      ownerDiscordUserId: configuration.ownerDiscordUserId,
+      episodeId,
+      openingBrief: input.openingBrief,
+    });
+  } catch {
+    const row = findById(database, episodeId);
+    if (row !== undefined) {
+      await interruptEpisode(
+        database,
+        configuration,
+        row,
+        "DISCORD_DELIVERY_AMBIGUOUS",
+        now,
+      );
+    }
+    return failure(
+      "DISCORD_PROVISIONING_FAILED",
+      `Episode ${episodeId} remains OPENING because Discord provisioning failed.`,
+    );
+  }
+
+  const activatedAt = now().toISOString();
+  inTransaction(database, () => {
+    const activation = database
+      .prepare(
+        `UPDATE episodes SET phase = 'ACTIVE', phase_version = 2, thread_id = ?,
+         thread_url = ?, updated_at = ? WHERE id = ? AND phase = 'OPENING'`,
+      )
+      .run(provisioned.threadId, provisioned.threadUrl, activatedAt, episodeId);
+    acknowledgeOpeningOutbox(database, episodeId, provisioned.threadId, activatedAt);
+    if (activation.changes === 1) {
+      addAudit(database, episodeId, 2, "EPISODE_ACTIVATED", "discord", activatedAt);
+      return;
+    }
+    const winner = findById(database, episodeId);
+    if (winner?.phase === "CANCELLED") {
+      addPendingCancellationOutbox(database, episodeId, provisioned.threadId, activatedAt);
+    }
+  });
+  const row = findById(database, episodeId);
+  if (row === undefined) throw new Error("Activated Episode was not found.");
+  if (row.phase === "CANCELLED") {
+    const delivery = await deliverPendingCancellation(database, configuration, row, now);
+    if (delivery !== undefined) return delivery;
+  }
+  emitTelemetry(configuration, {
+    schemaVersion: 1,
+    stream: "product",
+    name: "episode.lifecycle",
+    occurredAt: activatedAt,
+    telemetryEpisodeId: row.telemetry_id,
+    attributes: { phase: "ACTIVE", result: "succeeded" },
+  });
+  emitSuccessfulWrite(configuration, row, activatedAt);
+  emitSuccessfulDelivery(configuration, row, activatedAt);
+  return { ok: true, created: true, episode: toView(row) };
+}
+
+function getEpisode(
+  database: DatabaseSync,
+  originSessionId: string,
+  episodeId: string,
+): EpisodeOperationResult {
+  const row = findById(database, episodeId);
+  if (row === undefined || row.origin_session_id !== originSessionId) {
+    return failure("EPISODE_NOT_FOUND", "No Episode is available to this Origin Session.");
+  }
+  return {
+    ok: true,
+    episode: toView(row, findEpisodeInterruption(database, row.id)),
+  };
+}
+
+async function cancelEpisode(
+  database: DatabaseSync,
+  configuration: RuntimeConfiguration,
+  now: () => Date,
+  input: Parameters<EpisodeModule["cancelEpisode"]>[0],
+): Promise<EpisodeOperationResult> {
+  const row = findById(database, input.episodeId);
+  if (row === undefined || row.origin_session_id !== input.originSessionId) {
+    return failure("EPISODE_NOT_FOUND", "No Episode is available to this Origin Session.");
+  }
+  if (row.phase === "FINALIZED") {
+    return { ok: true, episode: toView(row) };
+  }
+  if (row.phase === "CANCELLED") {
+    const delivery = await deliverPendingCancellation(database, configuration, row, now);
+    return delivery ?? { ok: true, episode: toView(row) };
+  }
+  const cancelledAt = now().toISOString();
+  const retentionDeadline = new Date(
+    new Date(cancelledAt).getTime() + contextPackageRetentionMs,
+  ).toISOString();
+  let transitioned = false;
+  inTransaction(database, () => {
+    const update = database
+      .prepare(
+        `UPDATE episodes SET phase = 'CANCELLED', phase_version = phase_version + 1,
+         cancelled_at = ?, cancellation_reason = ?, context_retention_deadline = ?, updated_at = ?
+         WHERE id = ? AND phase IN ('OPENING', 'ACTIVE')`,
+      )
+      .run(
+        cancelledAt,
+        input.reason ?? null,
+        retentionDeadline,
+        cancelledAt,
+        row.id,
+      );
+    if (update.changes !== 1) return;
+    transitioned = true;
+    addAudit(
+      database,
+      row.id,
+      row.phase_version + 1,
+      "EPISODE_CANCELLED",
+      "owner",
+      cancelledAt,
+    );
+    if (row.thread_id !== null) {
+      addPendingCancellationOutbox(database, row.id, row.thread_id, cancelledAt);
+    }
+  });
+  if (!transitioned) {
+    const winner = findById(database, row.id);
+    if (winner === undefined) throw new Error("Terminal Episode was not found.");
+    if (winner.phase === "CANCELLED") {
+      const delivery = await deliverPendingCancellation(database, configuration, winner, now);
+      if (delivery !== undefined) return delivery;
+    }
+    return { ok: true, episode: toView(winner) };
+  }
+  emitTelemetry(configuration, {
+    schemaVersion: 1,
+    stream: "product",
+    name: "episode.lifecycle",
+    occurredAt: cancelledAt,
+    telemetryEpisodeId: row.telemetry_id,
+    attributes: { phase: "CANCELLED", result: "succeeded" },
+  });
+  emitSuccessfulWrite(configuration, row, cancelledAt);
+  const cancelled = findById(database, row.id);
+  if (cancelled === undefined) throw new Error("Cancelled Episode was not found.");
+  const delivery = await deliverPendingCancellation(database, configuration, cancelled, now);
+  if (delivery !== undefined) return delivery;
+  return { ok: true, episode: toView(cancelled) };
+}
+
+async function finalizeEpisode(
+  database: DatabaseSync,
+  configuration: RuntimeConfiguration,
+  input: DiscordFinalizationInteraction,
+  now: () => Date,
+): Promise<EpisodeOperationResult> {
+  const episode = findByDiscord(database, input.guildId, input.threadId);
+  if (episode === undefined) {
+    return failure(
+      "FINALIZATION_SCOPE_INVALID",
+      "Finalization is unavailable outside the configured Episode thread.",
+    );
+  }
+  if (
+    episode.phase === "ACTIVE" &&
+    findEpisodeInterruption(database, episode.id) !== undefined
+  ) {
+    return failure(
+      "EPISODE_INTERRUPTED",
+      "This Collaboration Episode was interrupted and cannot be finalized.",
+    );
+  }
+  const inputDigest = digest(JSON.stringify(input));
+  const replay = findProviderInput(database, input.interactionId);
+  if (replay !== undefined) {
+    if (replay !== inputDigest) {
+      return failure(
+        "DISCORD_FINALIZATION_REUSE",
+        "The Discord interaction identity was reused with different input.",
+      );
+    }
+    if (episode.phase === "FINALIZED") {
+      const delivery = await deliverPendingFinalization(
+        database,
+        configuration,
+        episode,
+        input.interactionId,
+        now,
+      );
+      if (delivery !== undefined) return delivery;
+      return { ok: true, episode: toView(episode) };
+    }
+    return failure(
+      "FINALIZATION_IN_PROGRESS",
+      "This finalization interaction is already being processed.",
+    );
+  }
+  if (
+    input.actorKind !== "human" ||
+    input.actorDiscordUserId !== episode.owner_discord_user_id
+  ) {
+    return failure(
+      "OWNER_REQUIRED",
+      "Only the paired Owner can finalize the Episode Outcome.",
+    );
+  }
+  const finalizedAt = now().toISOString();
+  const retentionDeadline = new Date(
+    new Date(finalizedAt).getTime() + contextPackageRetentionMs,
+  ).toISOString();
+  let transitionFailure:
+    | { readonly ok: false; readonly code: string; readonly reason: string }
+    | undefined;
+  inTransaction(database, () => {
+    const current = findById(database, episode.id);
+    if (current === undefined || current.phase !== "ACTIVE") {
+      transitionFailure = failure(
+        "FINALIZATION_UNAVAILABLE",
+        "This Episode cannot be finalized.",
+      );
+      return;
+    }
+    if (
+      current.proposal_revision_id === null ||
+      current.proposal_digest === null
+    ) {
+      transitionFailure = failure(
+        "OUTCOME_PROPOSAL_REQUIRED",
+        "Finalization requires a current delivered Outcome Proposal.",
+      );
+      return;
+    }
+    const busy = database
+      .prepare(
+        `SELECT 1 FROM provider_inbox WHERE episode_id = ? AND status = 'PROCESSING'
+         AND effect_kind IN ('agent_turn', 'proposal_synthesis', 'proposal_revision') LIMIT 1`,
+      )
+      .get(current.id);
+    if (busy !== undefined) {
+      transitionFailure = failure(
+        "EPISODE_AGENT_BUSY",
+        "Finalization is disabled while the Episode Agent is running.",
+      );
+      return;
+    }
+    if (
+      input.revisionId !== current.proposal_revision_id ||
+      digest(JSON.stringify(input.proposal)) !== current.proposal_digest
+    ) {
+      transitionFailure = failure(
+        "STALE_OUTCOME_PROPOSAL",
+        "Review the current visible Outcome Proposal before finalizing it.",
+      );
+      return;
+    }
+    database
+      .prepare(
+        `INSERT INTO provider_inbox (
+          provider_event_id, episode_id, input_digest, effect_kind, status, received_at
+        ) VALUES (?, ?, ?, 'finalization', 'PROCESSING', ?)`,
+      )
+      .run(input.interactionId, episode.id, inputDigest, finalizedAt);
+    const update = database
+      .prepare(
+        `UPDATE episodes SET phase = 'FINALIZED', phase_version = phase_version + 1,
+         outcome_revision_id = ?, outcome_result_markdown = ?, outcome_unresolved_points = ?,
+         finalized_at = ?, return_pending = 1, context_retention_deadline = ?, updated_at = ?
+         WHERE id = ? AND phase = 'ACTIVE' AND proposal_revision_id = ? AND proposal_digest = ?`,
+      )
+      .run(
+        input.revisionId,
+        input.proposal.resultMarkdown,
+        JSON.stringify(input.proposal.unresolvedPoints),
+        finalizedAt,
+        retentionDeadline,
+        finalizedAt,
+        episode.id,
+        input.revisionId,
+        current.proposal_digest,
+      );
+    if (update.changes !== 1) {
+      throw new Error("The Episode changed during finalization.");
+    }
+    addAudit(
+      database,
+      episode.id,
+      current.phase_version + 1,
+      "EPISODE_FINALIZED",
+      "owner",
+      finalizedAt,
+    );
+    database
+      .prepare(
+        `INSERT INTO recovery_outbox (
+          action_id, episode_id, sequence, action_kind, idempotency_key,
+          destination_reference, state, payload, created_at
+        ) VALUES (?, ?, (
+          SELECT COALESCE(MAX(sequence), 0) + 1 FROM recovery_outbox WHERE episode_id = ?
+        ), 'DISCORD_EPISODE_FINALIZED', ?, ?, 'PENDING', NULL, ?)`,
+      )
+      .run(
+        randomUUID(),
+        episode.id,
+        episode.id,
+        `episode-finalized:${episode.id}`,
+        input.threadId,
+        finalizedAt,
+      );
+  });
+  if (transitionFailure !== undefined) return transitionFailure;
+
+  emitTelemetry(configuration, {
+    schemaVersion: 1,
+    stream: "product",
+    name: "episode.lifecycle",
+    occurredAt: finalizedAt,
+    telemetryEpisodeId: episode.telemetry_id,
+    attributes: { phase: "FINALIZED", result: "succeeded" },
+  });
+  emitSuccessfulWrite(configuration, episode, finalizedAt);
+
+  const delivery = await deliverPendingFinalization(
+    database,
+    configuration,
+    episode,
+    input.interactionId,
+    now,
+  );
+  if (delivery !== undefined) return delivery;
+  const finalized = findById(database, episode.id);
+  if (finalized === undefined) throw new Error("Finalized Episode was not found.");
+  return { ok: true, episode: toView(finalized) };
+}
+
+type CapturedMessage =
+  | { readonly author: "owner"; readonly text: string }
+  | { readonly author: "codex"; readonly phase: "commentary" | "final_answer"; readonly text: string };
+
+async function captureTranscript(
+  hook: TrustedHook,
+): Promise<
+  | { readonly ok: true; readonly messages: readonly CapturedMessage[]; readonly contextMarkdown: string }
+  | { readonly ok: false; readonly reason: string; readonly code: string }
+> {
+  let source: string;
+  try {
+    source = await readFile(hook.transcriptPath, "utf8");
+  } catch {
+    return failure("TRANSCRIPT_UNREADABLE", "The trusted Codex transcript cannot be read.");
+  }
+  const lines = source.trim().split("\n");
+  const records: unknown[] = [];
+  for (const line of lines) {
+    try {
+      records.push(JSON.parse(line) as unknown);
+    } catch {
+      return failure("UNSUPPORTED_TRANSCRIPT", "The Codex transcript is not valid JSONL.");
+    }
+  }
+  const metadata = records.shift();
+  if (!isSessionMetadata(metadata, hook.sessionId)) {
+    return failure(
+      "UNSUPPORTED_TRANSCRIPT",
+      "The transcript session or Codex CLI provenance is unsupported.",
+    );
+  }
+  const messages: CapturedMessage[] = [];
+  let trustedTurnFound = false;
+  let trustedToolFound = false;
+  for (const record of records) {
+    if (isRecord(record) && record.type === "turn_context" && isRecord(record.payload)) {
+      if (record.payload.turn_id === hook.turnId) trustedTurnFound = true;
+      else if (typeof record.payload.turn_id !== "string") {
+        return failure("UNSUPPORTED_TRANSCRIPT", "A transcript turn has no trusted identity.");
+      }
+      continue;
+    }
+    if (isTrustedToolCall(record, hook)) {
+      trustedToolFound = true;
+      break;
+    }
+    const parsed = parseVisibleRecord(record);
+    if (parsed === "excluded") continue;
+    if (parsed === undefined) {
+      return failure(
+        "UNSUPPORTED_TRANSCRIPT",
+        "The transcript contains an unsupported or ambiguous visible record.",
+      );
+    }
+    messages.push(parsed);
+  }
+  if (!trustedTurnFound) {
+    return failure(
+      "UNSUPPORTED_TRANSCRIPT",
+      "The trusted Codex turn is not present in the transcript.",
+    );
+  }
+  if (!trustedToolFound) {
+    return failure(
+      "UNSUPPORTED_TRANSCRIPT",
+      "The trusted Codex tool invocation is not present in the transcript.",
+    );
+  }
+  if (messages.length === 0 || !messages.some((message) => message.author === "owner")) {
+    return failure("UNSUPPORTED_TRANSCRIPT", "The transcript has no visible Owner request.");
+  }
+  return { ok: true, messages, contextMarkdown: renderContext(messages) };
+}
+
+function parseVisibleRecord(record: unknown): CapturedMessage | "excluded" | undefined {
+  if (!isRecord(record) || !isRecord(record.payload)) return undefined;
+  if (record.type === "event_msg" && record.payload.type === "user_message") {
+    return (record.payload.provenance === undefined || record.payload.provenance === "owner") &&
+      typeof record.payload.message === "string" &&
+      record.payload.message.length > 0
+      ? { author: "owner", text: record.payload.message }
+      : undefined;
+  }
+  if (record.type === "response_item" && record.payload.type === "message") {
+    if (record.payload.role === "system" || record.payload.role === "developer") return "excluded";
+    if (
+      record.payload.role !== "assistant" ||
+      (record.payload.phase !== "commentary" && record.payload.phase !== "final_answer") ||
+      !Array.isArray(record.payload.content) ||
+      record.payload.content.length !== 1
+    ) {
+      return undefined;
+    }
+    const content = record.payload.content[0];
+    return isRecord(content) &&
+      content.type === "output_text" &&
+      typeof content.text === "string"
+      ? {
+          author: "codex",
+          phase: record.payload.phase,
+          text: content.text,
+        }
+      : undefined;
+  }
+  if (
+    record.type === "response_item" &&
+    (record.payload.type === "reasoning" ||
+      record.payload.type === "function_call" ||
+      record.payload.type === "function_call_output")
+  ) {
+    return "excluded";
+  }
+  if (record.type === "event_msg" && record.payload.type === "token_count") return "excluded";
+  return undefined;
+}
+
+function renderContext(messages: readonly CapturedMessage[]): string {
+  const sections = messages.map((message) => {
+    if (message.author === "owner") return `## Owner\n\n${message.text}`;
+    return `## Codex ${message.phase === "final_answer" ? "final" : "commentary"}\n\n${message.text}`;
+  });
+  return `# Collaboration Episode Context\n\n${sections.join("\n\n")}\n`;
+}
+
+function lastOwnerText(messages: readonly CapturedMessage[]): string | undefined {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.author === "owner") return message.text;
+  }
+  return undefined;
+}
+
+function findCredential(content: string): string | undefined {
+  const patterns = [
+    /\bsk-[A-Za-z0-9_-]{20,}\b/g,
+    /\bgh[pousr]_[A-Za-z0-9]{20,}\b/g,
+    /\bAKIA[A-Z0-9]{16}\b/g,
+    /\b[A-Za-z\d_-]{23,28}\.[A-Za-z\d_-]{6}\.[A-Za-z\d_-]{27,}\b/g,
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(content)?.[0];
+    if (match !== undefined) return `${match.slice(0, 3)}…${match.slice(-4)}`;
+  }
+  return undefined;
+}
+
+function parseTrustedHook(
+  value: unknown,
+):
+  | { readonly ok: true; readonly value: TrustedHook }
+  | { readonly ok: false; readonly code: string; readonly reason: string } {
+  if (
+    !isRecord(value) ||
+    !isRecord(value.client) ||
+    value.client.name !== "codex-cli" ||
+    value.client.version !== "0.150.1" ||
+    !isRecord(value.payload) ||
+    value.payload.hook_event_name !== "PreToolUse" ||
+    typeof value.payload.session_id !== "string" ||
+    value.payload.session_id.length === 0 ||
+    typeof value.payload.turn_id !== "string" ||
+    value.payload.turn_id.length === 0 ||
+    typeof value.payload.tool_use_id !== "string" ||
+    value.payload.tool_use_id.length === 0 ||
+    typeof value.payload.tool_name !== "string" ||
+    value.payload.tool_name.length === 0 ||
+    typeof value.payload.transcript_path !== "string" ||
+    value.payload.transcript_path.length === 0
+  ) {
+    return failure(
+      "UNSUPPORTED_CODEX_CLIENT",
+      "A trusted Codex CLI 0.150.1 pre-tool hook is required.",
+    );
+  }
+  return {
+    ok: true,
+    value: {
+      event: value.payload.hook_event_name,
+      client: value.client.name,
+      clientVersion: value.client.version,
+      sessionId: value.payload.session_id,
+      turnId: value.payload.turn_id,
+      toolUseId: value.payload.tool_use_id,
+      toolName: value.payload.tool_name,
+      transcriptPath: value.payload.transcript_path,
+    },
+  };
+}
+
+function parseTrustedPromptHook(
+  value: unknown,
+):
+  | { readonly ok: true; readonly value: TrustedPromptHook }
+  | { readonly ok: false; readonly code: string; readonly reason: string } {
+  if (
+    !isRecord(value) ||
+    !isRecord(value.client) ||
+    value.client.name !== "codex-cli" ||
+    value.client.version !== "0.150.1" ||
+    !isRecord(value.payload) ||
+    value.payload.hook_event_name !== "UserPromptSubmit" ||
+    typeof value.payload.session_id !== "string" ||
+    value.payload.session_id.length === 0 ||
+    typeof value.payload.turn_id !== "string" ||
+    value.payload.turn_id.length === 0 ||
+    typeof value.payload.prompt !== "string"
+  ) {
+    return failure(
+      "UNSUPPORTED_CODEX_CLIENT",
+      "A trusted Codex CLI 0.150.1 next-prompt hook is required.",
+    );
+  }
+  return {
+    ok: true,
+    value: {
+      event: "UserPromptSubmit",
+      client: "codex-cli",
+      clientVersion: "0.150.1",
+      sessionId: value.payload.session_id,
+      turnId: value.payload.turn_id,
+    },
+  };
+}
+
+async function returnPendingOutcome(
+  database: DatabaseSync,
+  hook: TrustedPromptHook,
+  inject: (additionalContext: string) => Promise<void>,
+  now: () => Date,
+  telemetry?: ApplicationTelemetry,
+): Promise<CodexPromptReturnResult> {
+  let episode: EpisodeRow | undefined;
+  try {
+    episode = parseEpisodeRow(
+      database
+        .prepare(
+          `SELECT * FROM episodes WHERE origin_session_id = ? AND phase = 'FINALIZED'
+           AND return_pending = 1`,
+        )
+        .get(hook.sessionId),
+    );
+  } catch {
+    return failure(
+      "MALFORMED_EPISODE_OUTCOME",
+      "The pending Episode Outcome is malformed and was not returned.",
+    );
+  }
+  if (episode === undefined) return { ok: true, status: "nothing-pending" };
+
+  let additionalContext: string;
+  try {
+    additionalContext = renderReturnedOutcome(episode);
+  } catch {
+    return failure(
+      "MALFORMED_EPISODE_OUTCOME",
+      "The pending Episode Outcome is malformed and was not returned.",
+    );
+  }
+
+  // The claim must be durable before hook output begins. Only that turn may
+  // acknowledge it; a known injection failure releases it for a later prompt.
+  const claim = database
+    .prepare(
+      `UPDATE episodes SET return_claim_turn_id = ?
+       WHERE id = ? AND return_pending = 1 AND return_claim_turn_id IS NULL`,
+    )
+    .run(hook.turnId, episode.id);
+  if (claim.changes !== 1) return { ok: true, status: "nothing-pending" };
+
+  try {
+    await inject(additionalContext);
+  } catch {
+    database
+      .prepare(
+        `UPDATE episodes SET return_claim_turn_id = NULL
+         WHERE id = ? AND return_pending = 1 AND return_claim_turn_id = ?`,
+      )
+      .run(episode.id, hook.turnId);
+    return failure(
+      "CODEX_INJECTION_FAILED",
+      "The Episode Outcome could not be added to the next Codex prompt.",
+    );
+  }
+
+  const returnedAt = now().toISOString();
+  const acknowledgement = database
+    .prepare(
+      `UPDATE episodes SET return_pending = 0, return_claim_turn_id = NULL,
+       returned_at = ?, returned_turn_id = ?, updated_at = ?
+       WHERE id = ? AND return_pending = 1 AND return_claim_turn_id = ?`,
+    )
+    .run(returnedAt, hook.turnId, returnedAt, episode.id, hook.turnId);
+  if (acknowledgement.changes !== 1) {
+    return failure(
+      "RETURN_ACKNOWLEDGEMENT_FAILED",
+      "The Episode Outcome return could not be acknowledged safely.",
+    );
+  }
+  emitTelemetry({ telemetry }, {
+    schemaVersion: 1,
+    stream: "product",
+    name: "episode.return",
+    occurredAt: returnedAt,
+    telemetryEpisodeId: episode.telemetry_id,
+    attributes: { result: "succeeded" },
+  });
+  return { ok: true, status: "returned" };
+}
+
+function renderReturnedOutcome(row: EpisodeRow): string {
+  if (
+    !isNonEmptyString(row.id) ||
+    !isNonEmptyString(row.original_question) ||
+    !isNonEmptyString(row.outcome_revision_id) ||
+    !isNonEmptyString(row.outcome_result_markdown) ||
+    !isIsoTimestamp(row.finalized_at)
+  ) {
+    throw new Error("The finalized Episode Outcome is malformed.");
+  }
+  const view = toView(row);
+  if (view.phase !== "FINALIZED") {
+    throw new Error("Only finalized Outcomes can be returned.");
+  }
+  const unresolvedPoints = view.outcome.unresolvedPoints.length === 0
+    ? "None."
+    : view.outcome.unresolvedPoints
+        .map((point, index) => `${index + 1}. ${point}`)
+        .join("\n");
+  return (
+    "# Returned Collaboration Episode Outcome\n\n" +
+    "Present the exact accepted result and ordered unresolved points before continuing with the Owner's newly submitted request.\n\n" +
+    `Episode identity: ${row.id}\n\n` +
+    `## Original question\n\n${row.original_question}\n\n` +
+    `## Accepted result\n\n${view.outcome.resultMarkdown}\n\n` +
+    `## Ordered unresolved points\n\n${unresolvedPoints}\n`
+  );
+}
+
+function isTrustedToolCall(value: unknown, hook: TrustedHook): boolean {
+  return (
+    isRecord(value) &&
+    value.type === "response_item" &&
+    isRecord(value.payload) &&
+    value.payload.type === "function_call" &&
+    value.payload.call_id === hook.toolUseId &&
+    value.payload.name === hook.toolName
+  );
+}
+
+function parseCodexRequest(
+  value: unknown,
+):
+  | { readonly ok: true; readonly value: CodexRequest }
+  | { readonly ok: false; readonly code: string; readonly reason: string } {
+  if (!isRecord(value) || !isRecord(value.arguments)) return invalidOperation();
+  if (
+    value.operation === "open_episode" &&
+    typeof value.arguments.openingBrief === "string" &&
+    typeof value.arguments.originalRequest === "string"
+  ) {
+    return {
+      ok: true,
+      value: {
+        operation: "open_episode",
+        arguments: {
+          openingBrief: value.arguments.openingBrief,
+          originalRequest: value.arguments.originalRequest,
+        },
+      },
+    };
+  }
+  if (value.operation === "get_episode" && typeof value.arguments.episodeId === "string") {
+    return {
+      ok: true,
+      value: { operation: "get_episode", arguments: { episodeId: value.arguments.episodeId } },
+    };
+  }
+  if (
+    value.operation === "cancel_episode" &&
+    typeof value.arguments.episodeId === "string" &&
+    (value.arguments.reason === undefined || typeof value.arguments.reason === "string")
+  ) {
+    return {
+      ok: true,
+      value: {
+        operation: "cancel_episode",
+        arguments: {
+          episodeId: value.arguments.episodeId,
+          ...(value.arguments.reason === undefined ? {} : { reason: value.arguments.reason }),
+        },
+      },
+    };
+  }
+  return invalidOperation();
+}
+
+type OpenEpisodeApprovalInput = {
+  readonly toolUseId: string;
+  readonly operation: "open_episode";
+  readonly contextMarkdown: string;
+} & EpisodeToolArguments["open_episode"];
+
+type CancelEpisodeApprovalInput = {
+  readonly toolUseId: string;
+  readonly operation: "cancel_episode";
+} & EpisodeToolArguments["cancel_episode"];
+
+export function createOwnerApproval(input: OpenEpisodeApprovalInput): object;
+export function createOwnerApproval(input: CancelEpisodeApprovalInput): object;
+export function createOwnerApproval(
+  input: OpenEpisodeApprovalInput | CancelEpisodeApprovalInput,
+): object {
+  const inputDigest =
+    input.operation === "open_episode"
+      ? openApprovalDigest(input, input.contextMarkdown)
+      : cancellationApprovalDigest(input);
+  return {
+    source: "trusted_owner_approval",
+    toolUseId: input.toolUseId,
+    operation: input.operation,
+    inputDigest,
+  };
+}
+
+function cancellationApprovalDigest(
+  input: EpisodeToolArguments["cancel_episode"],
+): string {
+  return digest(
+    JSON.stringify({
+      episodeId: input.episodeId,
+      ...(input.reason === undefined ? {} : { reason: input.reason }),
+    }),
+  );
+}
+
+function openApprovalDigest(
+  input: EpisodeToolArguments["open_episode"],
+  contextMarkdown: string,
+): string {
+  return digest(
+    JSON.stringify({
+      openingBrief: input.openingBrief,
+      originalRequest: input.originalRequest,
+      contextPackageSha256: digest(contextMarkdown),
+    }),
+  );
+}
+
+function matchesOwnerApproval(
+  value: unknown,
+  toolUseId: string,
+  operation: CodexRequest["operation"],
+  inputDigest: string,
+): boolean {
+  return (
+    isRecord(value) &&
+    value.source === "trusted_owner_approval" &&
+    value.toolUseId === toolUseId &&
+    value.operation === operation &&
+    value.inputDigest === inputDigest
+  );
+}
+
+function invalidOperation(): { readonly ok: false; readonly code: string; readonly reason: string } {
+  return failure(
+    "INVALID_OPERATION",
+    "The Codex Episode operation is unsupported or malformed.",
+  );
+}
+
+function isSessionMetadata(value: unknown, sessionId: string): boolean {
+  return (
+    isRecord(value) &&
+    value.type === "session_meta" &&
+    isRecord(value.payload) &&
+    value.payload.id === sessionId &&
+    value.payload.source === "cli"
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function digest(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function failure(code: string, reason: string): { readonly ok: false; readonly code: string; readonly reason: string } {
+  return { ok: false, code, reason };
+}
+
+function emitTelemetry(
+  configuration: { readonly telemetry?: ApplicationTelemetry },
+  envelope: TelemetryEnvelope,
+): void {
+  try {
+    configuration.telemetry?.record(envelope);
+  } catch {
+    // Remote telemetry is deliberately lossy and cannot participate in Episode correctness.
+  }
+}
+
+function emitSuccessfulAgentRun(
+  configuration: RuntimeConfiguration,
+  episode: EpisodeRow,
+  occurredAt: string,
+  operation: "stream" | "synthesize",
+): void {
+  emitTelemetry(configuration, {
+    schemaVersion: 1,
+    stream: "operational",
+    name: "agent.run",
+    occurredAt,
+    telemetryEpisodeId: episode.telemetry_id,
+    attributes: { result: "succeeded", acceptedTurns: 1 },
+  });
+  emitTelemetry(configuration, {
+    schemaVersion: 1,
+    stream: "operational",
+    name: "provider.call",
+    occurredAt,
+    telemetryEpisodeId: episode.telemetry_id,
+    attributes: { provider: "openai", operation, result: "succeeded" },
+  });
+  emitSuccessfulDelivery(configuration, episode, occurredAt);
+}
+
+function emitSuccessfulDelivery(
+  configuration: RuntimeConfiguration,
+  episode: EpisodeRow,
+  occurredAt: string,
+): void {
+  emitTelemetry(configuration, {
+    schemaVersion: 1,
+    stream: "operational",
+    name: "delivery",
+    occurredAt,
+    telemetryEpisodeId: episode.telemetry_id,
+    attributes: { destination: "discord", result: "succeeded" },
+  });
+}
+
+function emitSuccessfulWrite(
+  configuration: RuntimeConfiguration,
+  episode: EpisodeRow,
+  occurredAt: string,
+): void {
+  emitTelemetry(configuration, {
+    schemaVersion: 1,
+    stream: "operational",
+    name: "sqlite.operation",
+    occurredAt,
+    telemetryEpisodeId: episode.telemetry_id,
+    attributes: { operation: "write", result: "succeeded" },
+  });
+}
+
+function findByOrigin(database: DatabaseSync, originSessionId: string): EpisodeRow | undefined {
+  return parseEpisodeRow(
+    database
+    .prepare("SELECT * FROM episodes WHERE origin_session_id = ?")
+      .get(originSessionId),
+  );
+}
+
+function findById(database: DatabaseSync, episodeId: string): EpisodeRow | undefined {
+  return parseEpisodeRow(
+    database.prepare("SELECT * FROM episodes WHERE id = ?").get(episodeId),
+  );
+}
+
+function findActiveByDiscord(
+  database: DatabaseSync,
+  guildId: string,
+  threadId: string,
+): EpisodeRow | undefined {
+  return parseEpisodeRow(
+    database
+      .prepare(
+        "SELECT * FROM episodes WHERE guild_id = ? AND thread_id = ? AND phase = 'ACTIVE'",
+      )
+      .get(guildId, threadId),
+  );
+}
+
+function findByDiscord(
+  database: DatabaseSync,
+  guildId: string,
+  threadId: string,
+): EpisodeRow | undefined {
+  return parseEpisodeRow(
+    database
+      .prepare("SELECT * FROM episodes WHERE guild_id = ? AND thread_id = ?")
+      .get(guildId, threadId),
+  );
+}
+
+function findProviderInput(
+  database: DatabaseSync,
+  providerEventId: string,
+): string | undefined {
+  const value = database
+    .prepare("SELECT input_digest FROM provider_inbox WHERE provider_event_id = ?")
+    .get(providerEventId);
+  if (value === undefined) return undefined;
+  if (!isRecord(value) || typeof value.input_digest !== "string") {
+    throw new Error("Stored provider input is malformed.");
+  }
+  return value.input_digest;
+}
+
+function parseEpisodeRow(value: unknown): EpisodeRow | undefined {
+  if (value === undefined) return undefined;
+  if (
+    !isRecord(value) ||
+    typeof value.id !== "string" ||
+    typeof value.telemetry_id !== "string" ||
+    typeof value.origin_session_id !== "string" ||
+    typeof value.owner_discord_user_id !== "string" ||
+    typeof value.guild_id !== "string" ||
+    !isEpisodePhase(value.phase) ||
+    typeof value.phase_version !== "number" ||
+    !isNullableString(value.thread_id) ||
+    !isNullableString(value.thread_url) ||
+    typeof value.context_reference !== "string" ||
+    typeof value.context_digest !== "string" ||
+    typeof value.original_question !== "string" ||
+    !isNullableString(value.context_retention_deadline) ||
+    !isNullableString(value.cancelled_at) ||
+    !isNullableString(value.cancellation_reason) ||
+    !isNullableString(value.agent_previous_response_id)
+    || !isNullableString(value.proposal_message_id)
+    || !isNullableString(value.proposal_revision_id)
+    || !isNullableString(value.proposal_digest)
+    || !isNullableString(value.outcome_revision_id)
+    || !isNullableString(value.outcome_result_markdown)
+    || !isNullableString(value.outcome_unresolved_points)
+    || !isNullableString(value.finalized_at)
+    || (value.return_pending !== 0 && value.return_pending !== 1)
+    || !isNullableString(value.return_claim_turn_id)
+    || !isNullableString(value.returned_at)
+    || !isNullableString(value.returned_turn_id)
+  ) {
+    throw new Error("Stored Episode state is malformed.");
+  }
+  return {
+    id: value.id,
+    telemetry_id: value.telemetry_id,
+    origin_session_id: value.origin_session_id,
+    owner_discord_user_id: value.owner_discord_user_id,
+    guild_id: value.guild_id,
+    phase: value.phase,
+    phase_version: value.phase_version,
+    thread_id: value.thread_id,
+    thread_url: value.thread_url,
+    context_reference: value.context_reference,
+    context_digest: value.context_digest,
+    original_question: value.original_question,
+    context_retention_deadline: value.context_retention_deadline,
+    cancelled_at: value.cancelled_at,
+    cancellation_reason: value.cancellation_reason,
+    agent_previous_response_id: value.agent_previous_response_id,
+    proposal_message_id: value.proposal_message_id,
+    proposal_revision_id: value.proposal_revision_id,
+    proposal_digest: value.proposal_digest,
+    outcome_revision_id: value.outcome_revision_id,
+    outcome_result_markdown: value.outcome_result_markdown,
+    outcome_unresolved_points: value.outcome_unresolved_points,
+    finalized_at: value.finalized_at,
+    return_pending: value.return_pending,
+    return_claim_turn_id: value.return_claim_turn_id,
+    returned_at: value.returned_at,
+    returned_turn_id: value.returned_turn_id,
+  };
+}
+
+function isEpisodePhase(value: unknown): value is EpisodePhase {
+  return (
+    value === "OPENING" ||
+    value === "ACTIVE" ||
+    value === "FINALIZED" ||
+    value === "CANCELLED"
+  );
+}
+
+function isNullableString(value: unknown): value is string | null {
+  return value === null || typeof value === "string";
+}
+
+function isIsoTimestamp(value: unknown): value is string {
+  if (!isNonEmptyString(value)) return false;
+  const parsed = new Date(value);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
+}
+
+function toView(
+  row: EpisodeRow,
+  interruption?: EpisodeInterruptionRow,
+): EpisodeView {
+  if (row.phase === "CANCELLED") {
+    if (row.cancelled_at === null) throw new Error("Cancelled Episode has no terminal timestamp.");
+    return {
+      id: row.id,
+      phase: "CANCELLED",
+      cancellation: {
+        cancelledAt: row.cancelled_at,
+        ...(row.cancellation_reason === null ? {} : { reason: row.cancellation_reason }),
+      },
+    };
+  }
+  if (row.phase === "FINALIZED") {
+    if (
+      row.outcome_revision_id === null ||
+      row.outcome_result_markdown === null ||
+      row.outcome_unresolved_points === null ||
+      row.finalized_at === null
+    ) {
+      throw new Error("Finalized Episode has no Episode Outcome.");
+    }
+    let unresolvedPoints: unknown;
+    try {
+      unresolvedPoints = JSON.parse(row.outcome_unresolved_points) as unknown;
+    } catch {
+      throw new Error("Finalized Episode has malformed unresolved points.");
+    }
+    if (
+      !Array.isArray(unresolvedPoints) ||
+      !unresolvedPoints.every(isNonEmptyString)
+    ) {
+      throw new Error("Finalized Episode has malformed unresolved points.");
+    }
+    return {
+      id: row.id,
+      phase: "FINALIZED",
+      outcome: {
+        episodeId: row.id,
+        acceptedProposalRevisionId: row.outcome_revision_id,
+        resultMarkdown: row.outcome_result_markdown,
+        unresolvedPoints,
+        finalizedAt: row.finalized_at,
+      },
+    };
+  }
+  return {
+    id: row.id,
+    originSessionId: row.origin_session_id,
+    phase: row.phase,
+    ...(row.thread_url === null ? {} : { collaborationUrl: row.thread_url }),
+    contextPackage: {
+      reference: row.context_reference,
+      sha256: row.context_digest,
+    },
+    ...(row.proposal_message_id === null ||
+    row.proposal_revision_id === null ||
+    row.proposal_digest === null
+      ? {}
+      : {
+          outcomeProposal: {
+            messageId: row.proposal_message_id,
+            revisionId: row.proposal_revision_id,
+            sha256: row.proposal_digest,
+          },
+        }),
+    ...(interruption === undefined
+      ? {}
+      : {
+          interruption: {
+            kind: interruption.error_class,
+            interruptedAt: interruption.interrupted_at,
+            requiresCancellation: true as const,
+          },
+        }),
+  };
+}
+
+function migrate(database: DatabaseSync): void {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS episodes (
+      id TEXT PRIMARY KEY, telemetry_id TEXT NOT NULL UNIQUE,
+      origin_session_id TEXT NOT NULL UNIQUE, origin_turn_id TEXT NOT NULL,
+      owner_discord_user_id TEXT NOT NULL, guild_id TEXT NOT NULL, parent_channel_id TEXT NOT NULL,
+      thread_id TEXT, thread_url TEXT, phase TEXT NOT NULL, phase_version INTEGER NOT NULL,
+      original_question TEXT NOT NULL, opening_brief TEXT NOT NULL, context_reference TEXT NOT NULL,
+      context_digest TEXT NOT NULL, context_retention_deadline TEXT,
+      cancelled_at TEXT, cancellation_reason TEXT, agent_previous_response_id TEXT,
+      proposal_message_id TEXT, proposal_revision_id TEXT, proposal_digest TEXT,
+      outcome_revision_id TEXT, outcome_result_markdown TEXT,
+      outcome_unresolved_points TEXT, finalized_at TEXT, return_pending INTEGER NOT NULL DEFAULT 0,
+      return_claim_turn_id TEXT, returned_at TEXT, returned_turn_id TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS provider_inbox (
+      provider_event_id TEXT PRIMARY KEY, episode_id TEXT NOT NULL, input_digest TEXT NOT NULL,
+      effect_kind TEXT NOT NULL, status TEXT NOT NULL, received_at TEXT NOT NULL, completed_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS recovery_outbox (
+      action_id TEXT PRIMARY KEY, episode_id TEXT NOT NULL, sequence INTEGER NOT NULL,
+      action_kind TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE, destination_reference TEXT NOT NULL,
+      state TEXT NOT NULL, payload TEXT, created_at TEXT NOT NULL, acknowledged_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS episode_audit (
+      id TEXT PRIMARY KEY, episode_id TEXT NOT NULL, phase_version INTEGER NOT NULL,
+      transition_type TEXT NOT NULL, actor_kind TEXT NOT NULL, schema_version INTEGER NOT NULL,
+      occurred_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS episode_interruptions (
+      episode_id TEXT PRIMARY KEY, error_class TEXT NOT NULL,
+      interrupted_at TEXT NOT NULL, presented_at TEXT
+    );
+  `);
+  const episodeColumns = database
+    .prepare("PRAGMA table_info(episodes)")
+    .all()
+    .filter(isRecord)
+    .map((column) => column.name);
+  if (!episodeColumns.includes("telemetry_id")) {
+    database.exec("ALTER TABLE episodes ADD COLUMN telemetry_id TEXT");
+    const rows = database.prepare("SELECT id FROM episodes WHERE telemetry_id IS NULL").all();
+    for (const row of rows) {
+      if (!isRecord(row) || typeof row.id !== "string") {
+        throw new Error("Stored Episode identity is malformed.");
+      }
+      database
+        .prepare("UPDATE episodes SET telemetry_id = ? WHERE id = ?")
+        .run(randomUUID(), row.id);
+    }
+  }
+  if (!episodeColumns.includes("agent_previous_response_id")) {
+    database.exec("ALTER TABLE episodes ADD COLUMN agent_previous_response_id TEXT");
+  }
+  if (!episodeColumns.includes("proposal_message_id")) {
+    database.exec("ALTER TABLE episodes ADD COLUMN proposal_message_id TEXT");
+  }
+  if (!episodeColumns.includes("proposal_revision_id")) {
+    database.exec("ALTER TABLE episodes ADD COLUMN proposal_revision_id TEXT");
+  }
+  if (!episodeColumns.includes("proposal_digest")) {
+    database.exec("ALTER TABLE episodes ADD COLUMN proposal_digest TEXT");
+  }
+  if (!episodeColumns.includes("outcome_revision_id")) {
+    database.exec("ALTER TABLE episodes ADD COLUMN outcome_revision_id TEXT");
+  }
+  if (!episodeColumns.includes("outcome_result_markdown")) {
+    database.exec("ALTER TABLE episodes ADD COLUMN outcome_result_markdown TEXT");
+  }
+  if (!episodeColumns.includes("outcome_unresolved_points")) {
+    database.exec("ALTER TABLE episodes ADD COLUMN outcome_unresolved_points TEXT");
+  }
+  if (!episodeColumns.includes("finalized_at")) {
+    database.exec("ALTER TABLE episodes ADD COLUMN finalized_at TEXT");
+  }
+  if (!episodeColumns.includes("return_pending")) {
+    database.exec(
+      "ALTER TABLE episodes ADD COLUMN return_pending INTEGER NOT NULL DEFAULT 0",
+    );
+  }
+  if (!episodeColumns.includes("return_claim_turn_id")) {
+    database.exec("ALTER TABLE episodes ADD COLUMN return_claim_turn_id TEXT");
+  }
+  if (!episodeColumns.includes("returned_at")) {
+    database.exec("ALTER TABLE episodes ADD COLUMN returned_at TEXT");
+  }
+  if (!episodeColumns.includes("returned_turn_id")) {
+    database.exec("ALTER TABLE episodes ADD COLUMN returned_turn_id TEXT");
+  }
+}
+
+function addAudit(
+  database: DatabaseSync,
+  episodeId: string,
+  phaseVersion: number,
+  transitionType: string,
+  actorKind: string,
+  occurredAt: string,
+): void {
+  database
+    .prepare(
+      "INSERT INTO episode_audit VALUES (?, ?, ?, ?, ?, 1, ?)",
+    )
+    .run(randomUUID(), episodeId, phaseVersion, transitionType, actorKind, occurredAt);
+}
+
+function addPendingOpeningOutbox(
+  database: DatabaseSync,
+  episodeId: string,
+  parentChannelId: string,
+  occurredAt: string,
+): void {
+  database
+    .prepare(
+      `INSERT INTO recovery_outbox VALUES (?, ?, 1, 'DISCORD_EPISODE_OPENED', ?, ?,
+       'PENDING', NULL, ?, NULL)`,
+    )
+    .run(
+      randomUUID(),
+      episodeId,
+      `episode-opened:${episodeId}`,
+      parentChannelId,
+      occurredAt,
+    );
+}
+
+function acknowledgeOpeningOutbox(
+  database: DatabaseSync,
+  episodeId: string,
+  threadId: string,
+  occurredAt: string,
+): void {
+  database
+    .prepare(
+      `UPDATE recovery_outbox SET destination_reference = ?, state = 'ACKNOWLEDGED',
+       acknowledged_at = ? WHERE episode_id = ? AND action_kind = 'DISCORD_EPISODE_OPENED'
+       AND state = 'PENDING'`,
+    )
+    .run(threadId, occurredAt, episodeId);
+}
+
+function addPendingCancellationOutbox(
+  database: DatabaseSync,
+  episodeId: string,
+  threadId: string,
+  occurredAt: string,
+): void {
+  database
+    .prepare(
+      `INSERT INTO recovery_outbox VALUES (?, ?, 2, 'DISCORD_EPISODE_CANCELLED', ?, ?,
+       'PENDING', NULL, ?, NULL)`,
+    )
+    .run(
+      randomUUID(),
+      episodeId,
+      `episode-cancelled:${episodeId}`,
+      threadId,
+      occurredAt,
+    );
+}
+
+async function deliverPendingCancellation(
+  database: DatabaseSync,
+  configuration: RuntimeConfiguration,
+  episode: EpisodeRow,
+  now: () => Date,
+): Promise<{ readonly ok: false; readonly code: string; readonly reason: string } | undefined> {
+  const pending = findPendingTerminalAction(
+    database,
+    episode.id,
+    "DISCORD_EPISODE_CANCELLED",
+  );
+  if (!pending.ok) return pending;
+  if (pending.action === undefined) return undefined;
+  try {
+    await configuration.discord.presentCancellation({
+      idempotencyKey: pending.action.idempotencyKey,
+      guildId: configuration.guildId,
+      threadId: pending.action.destinationReference,
+      episodeId: episode.id,
+      ...(episode.cancellation_reason === null
+        ? {}
+        : { reason: episode.cancellation_reason }),
+    });
+  } catch {
+    return failure(
+      "DISCORD_PRESENTATION_FAILED",
+      `Episode ${episode.id} is CANCELLED; Discord terminal presentation remains pending.`,
+    );
+  }
+  acknowledgePendingTerminalAction(
+    database,
+    pending.action.actionId,
+    now().toISOString(),
+  );
+  return undefined;
+}
+
+async function deliverPendingFinalization(
+  database: DatabaseSync,
+  configuration: RuntimeConfiguration,
+  episode: EpisodeRow,
+  interactionId: string,
+  now: () => Date,
+): Promise<{ readonly ok: false; readonly code: string; readonly reason: string } | undefined> {
+  const pending = findPendingTerminalAction(
+    database,
+    episode.id,
+    "DISCORD_EPISODE_FINALIZED",
+  );
+  if (!pending.ok) return pending;
+  if (pending.action === undefined) return undefined;
+  const action = pending.action;
+  try {
+    await configuration.discord.presentFinalization({
+      idempotencyKey: action.idempotencyKey,
+      guildId: episode.guild_id,
+      threadId: action.destinationReference,
+      episodeId: episode.id,
+      status: "FINALIZED",
+      controlsDisabled: true,
+      threadArchived: false,
+      threadLocked: false,
+      threadWritable: true,
+    });
+  } catch {
+    return failure(
+      "DISCORD_PRESENTATION_FAILED",
+      `Episode ${episode.id} is FINALIZED; Discord terminal presentation remains pending.`,
+    );
+  }
+  const acknowledgedAt = now().toISOString();
+  inTransaction(database, () => {
+    database
+      .prepare(
+        `UPDATE provider_inbox SET status = 'COMPLETED', completed_at = ?
+         WHERE provider_event_id = ?`,
+      )
+      .run(acknowledgedAt, interactionId);
+    acknowledgePendingTerminalAction(
+      database,
+      action.actionId,
+      acknowledgedAt,
+    );
+  });
+  return undefined;
+}
+
+interface PendingTerminalAction {
+  readonly actionId: string;
+  readonly idempotencyKey: string;
+  readonly destinationReference: string;
+}
+
+function findPendingTerminalAction(
+  database: DatabaseSync,
+  episodeId: string,
+  actionKind: "DISCORD_EPISODE_CANCELLED" | "DISCORD_EPISODE_FINALIZED",
+):
+  | { readonly ok: true; readonly action?: PendingTerminalAction }
+  | { readonly ok: false; readonly code: string; readonly reason: string } {
+  const value = database
+    .prepare(
+      `SELECT action_id, idempotency_key, destination_reference FROM recovery_outbox
+       WHERE episode_id = ? AND action_kind = ? AND state = 'PENDING'`,
+    )
+    .get(episodeId, actionKind);
+  if (value === undefined) return { ok: true };
+  if (
+    !isRecord(value) ||
+    typeof value.action_id !== "string" ||
+    typeof value.idempotency_key !== "string" ||
+    typeof value.destination_reference !== "string"
+  ) {
+    return failure("DURABLE_STATE_INVALID", "The pending terminal action is malformed.");
+  }
+  return {
+    ok: true,
+    action: {
+      actionId: value.action_id,
+      idempotencyKey: value.idempotency_key,
+      destinationReference: value.destination_reference,
+    },
+  };
+}
+
+function acknowledgePendingTerminalAction(
+  database: DatabaseSync,
+  actionId: string,
+  acknowledgedAt: string,
+): void {
+  database
+    .prepare(
+      `UPDATE recovery_outbox SET state = 'ACKNOWLEDGED', payload = NULL,
+       acknowledged_at = ? WHERE action_id = ? AND state = 'PENDING'`,
+    )
+    .run(acknowledgedAt, actionId);
+}
+
+function checkReplay(
+  database: DatabaseSync,
+  hook: TrustedHook,
+  request: CodexRequest,
+): { readonly ok: false; readonly code: string; readonly reason: string } | undefined {
+  const value = database
+    .prepare("SELECT input_digest FROM provider_inbox WHERE provider_event_id = ?")
+    .get(providerEventId(hook, request));
+  if (value !== undefined && (!isRecord(value) || typeof value.input_digest !== "string")) {
+    return failure("DURABLE_STATE_INVALID", "The stored provider event is malformed.");
+  }
+  if (value !== undefined && value.input_digest !== digest(JSON.stringify(request))) {
+    return failure(
+      "REPLAY_INPUT_MISMATCH",
+      "The trusted operation identity was reused with different input.",
+    );
+  }
+  return undefined;
+}
+
+function inTransaction<T>(database: DatabaseSync, operation: () => T): T {
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    const result = operation();
+    database.exec("COMMIT");
+    return result;
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+function recordCompletedOperation(
+  database: DatabaseSync,
+  hook: TrustedHook,
+  request: CodexRequest,
+  episodeId: string,
+  occurredAt: Date,
+): void {
+  const timestamp = occurredAt.toISOString();
+  database
+    .prepare(
+      `INSERT INTO provider_inbox (
+        provider_event_id, episode_id, input_digest, effect_kind, status, received_at, completed_at
+      ) VALUES (?, ?, ?, ?, 'COMPLETED', ?, ?)
+      ON CONFLICT(provider_event_id) DO UPDATE SET status = 'COMPLETED', completed_at = excluded.completed_at`,
+    )
+    .run(
+      providerEventId(hook, request),
+      episodeId,
+      digest(JSON.stringify(request)),
+      request.operation,
+      timestamp,
+      timestamp,
+    );
+}
+
+function providerEventId(hook: TrustedHook, request: CodexRequest): string {
+  return `${hook.sessionId}:${hook.toolUseId}:${request.operation}`;
+}
+
+function mkdirSyncParent(path: string): void {
+  const parent = dirname(resolve(path));
+  // DatabaseSync cannot create its parent. The product composition owns this local setup step.
+  requireDirectory(parent);
+}
+
+function requireDirectory(path: string): void {
+  const { mkdirSync } = process.getBuiltinModule("node:fs");
+  mkdirSync(path, { recursive: true, mode: 0o700 });
+}

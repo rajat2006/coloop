@@ -19,6 +19,7 @@ import {
 } from "@coloop/local-storage";
 import type { ColoopDependencies } from "../dependencies.js";
 import { Terminal } from "../terminal/terminal.js";
+import { recordTelemetry } from "../telemetry.js";
 
 const openForOwnerAction = async (
   dependencies: ColoopDependencies,
@@ -268,6 +269,13 @@ export const runSetup = async (
   }
   config.ownerUserId = ownerId;
   await saveConfig(paths.configFile, config);
+  recordTelemetry(dependencies, {
+    schemaVersion: 1,
+    stream: "product",
+    name: "owner.pairing",
+    occurredAt: new Date().toISOString(),
+    attributes: { result: "succeeded", authorizationResult: "allowed" },
+  });
 
   terminal.line();
   terminal.line("OpenAI Platform credential");
@@ -319,4 +327,11 @@ export const runSetup = async (
   // Every prerequisite above was verified as it was saved, so avoid repeating provider calls.
   terminal.line("Readiness check passed.");
   terminal.line("Ready. Run `coloop run` to start Coloop.");
+  recordTelemetry(dependencies, {
+    schemaVersion: 1,
+    stream: "product",
+    name: "setup.readiness",
+    occurredAt: new Date().toISOString(),
+    attributes: { result: "succeeded", check: "configuration" },
+  });
 };

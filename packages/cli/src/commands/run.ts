@@ -1,6 +1,7 @@
 import type { ColoopDependencies } from "../dependencies.js";
 import { checkReadiness } from "../readiness.js";
 import { Terminal } from "../terminal/terminal.js";
+import { recordTelemetry } from "../telemetry.js";
 
 export const runRuntime = async (
   dependencies: ColoopDependencies,
@@ -10,7 +11,23 @@ export const runRuntime = async (
   terminal.line("Coloop runtime startup");
   // Runtime startup is validation-only; all repair and selection belongs to setup.
   const readiness = await checkReadiness(dependencies, environment);
-  if (!readiness.ok) throw new Error(readiness.message);
+  if (!readiness.ok) {
+    recordTelemetry(dependencies, {
+      schemaVersion: 1,
+      stream: "product",
+      name: "setup.readiness",
+      occurredAt: new Date().toISOString(),
+      attributes: { result: "failed", check: "configuration" },
+    });
+    throw new Error(readiness.message);
+  }
+  recordTelemetry(dependencies, {
+    schemaVersion: 1,
+    stream: "product",
+    name: "setup.readiness",
+    occurredAt: new Date().toISOString(),
+    attributes: { result: "succeeded", check: "configuration" },
+  });
   terminal.line("Readiness check passed.");
 
   // Do not connect Discord until every local and remote readiness check has passed.
