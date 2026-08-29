@@ -1,0 +1,9 @@
+services:
+  coloop-collector:
+    image: otel/opentelemetry-collector-contrib:0.153.0
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    network_mode: host
+    restart: "no"
+    volumes:
+      - ./collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+      - ${COLOOP_DIAGNOSTICS_DIRECTORY:-./diagnostics}:/var/lib/coloop

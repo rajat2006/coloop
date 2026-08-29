@@ -24,6 +24,7 @@
   },
   "dependencies": {
     "@coloop/core": "workspace:*",
-    "@coloop/discord": "workspace:*"
+    "@coloop/discord": "workspace:*",
+    "@coloop/observability": "workspace:*"
   }
 }

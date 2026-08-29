@@ -4,6 +4,10 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import type {
+  ApplicationTelemetry,
+  TelemetryEnvelope,
+} from "@coloop/observability";
 import {
   registerCodexEpisodeTools,
   type EpisodeToolRegistrar,
@@ -32,6 +36,100 @@ afterEach(async () => {
 });
 
 describe("Codex Episode operations", () => {
+  it("correlates content-safe lifecycle and Agent results without domain identities", async () => {
+    const envelopes: TelemetryEnvelope[] = [];
+    const telemetry: ApplicationTelemetry = {
+      record(value) {
+        envelopes.push(value as TelemetryEnvelope);
+        return { ok: true };
+      },
+      async flush() {
+        return { exported: 0, failed: 0, dropped: 0 };
+      },
+    };
+    const fixture = await openProposalFixture({
+      telemetry,
+      agent: new RecordingEpisodeAgent([
+        { deltas: ["Use a canary."], responseId: "response-1" },
+      ]),
+    });
+
+    await fixture.runtime.handleDiscordMessage(
+      discordMessage("agent-event-1", "@Coloop compare the rollout options."),
+    );
+
+    expect(envelopes).toEqual([
+      {
+        schemaVersion: 1,
+        stream: "product",
+        name: "episode.lifecycle",
+        occurredAt: "2026-08-29T12:00:00.000Z",
+        telemetryEpisodeId: "correlation-a",
+        attributes: { phase: "OPENING", result: "succeeded", created: true },
+      },
+      {
+        schemaVersion: 1,
+        stream: "product",
+        name: "episode.lifecycle",
+        occurredAt: "2026-08-29T12:00:00.000Z",
+        telemetryEpisodeId: "correlation-a",
+        attributes: { phase: "ACTIVE", result: "succeeded" },
+      },
+      {
+        schemaVersion: 1,
+        stream: "operational",
+        name: "agent.run",
+        occurredAt: "2026-08-29T12:00:00.000Z",
+        telemetryEpisodeId: "correlation-a",
+        attributes: { result: "succeeded", acceptedTurns: 1 },
+      },
+    ]);
+    expect(JSON.stringify(envelopes)).not.toContain("episode-1");
+    expect(JSON.stringify(envelopes)).not.toContain("Choose a rollout plan");
+    const database = new DatabaseSync(fixture.databasePath);
+    expect(database.prepare("SELECT telemetry_id FROM episodes").get()).toEqual({
+      telemetry_id: "correlation-a",
+    });
+    database.close();
+    fixture.runtime.close();
+  });
+
+  it("keeps Episode outcomes unchanged when every telemetry write fails", async () => {
+    const telemetry: ApplicationTelemetry = {
+      record() {
+        throw new Error("all telemetry destinations unavailable");
+      },
+      async flush() {
+        throw new Error("all telemetry destinations unavailable");
+      },
+    };
+    const fixture = await openProposalFixture({ telemetry });
+
+    await fixture.runtime.handleDiscordMessage({
+      ...discordMessage("proposal-event-1", "@Coloop create an Outcome Proposal."),
+      authorDiscordUserId: "1001",
+    });
+
+    await expect(
+      fixture.runtime.handleDiscordFinalization(
+        finalizationInteraction("proposal-revision-1"),
+      ),
+    ).resolves.toMatchObject({
+      ok: true,
+      episode: {
+        phase: "FINALIZED",
+        outcome: { resultMarkdown: "Use a canary rollout." },
+      },
+    });
+    const database = new DatabaseSync(fixture.databasePath);
+    expect(database.prepare("SELECT phase, return_pending FROM episodes").get()).toEqual({
+      phase: "FINALIZED",
+      return_pending: 1,
+    });
+    database.close();
+    fixture.runtime.close();
+  });
+
   it("returns a finalized Outcome on the Origin Session's next prompt", async () => {
     const fixture = await openProposalFixture({});
     await fixture.runtime.handleDiscordMessage({
@@ -2952,6 +3050,7 @@ async function openProposalFixture(options: {
   readonly finalizationFailure?: boolean;
   readonly proposalFailure?: "publish" | "revise";
   readonly staleProposalDelivery?: boolean;
+  readonly telemetry?: ApplicationTelemetry;
 }) {
   const directory = await mkdtemp(join(tmpdir(), "coloop-proposal-fixture-"));
   temporaryDirectories.push(directory);
@@ -2995,6 +3094,10 @@ async function openProposalFixture(options: {
     agent,
     now: () => new Date("2026-08-29T12:00:00.000Z"),
     createId: () => ids.shift() ?? "unexpected-id",
+    ...(options.telemetry === undefined
+      ? {}
+      : { createTelemetryId: () => "correlation-a" }),
+    ...(options.telemetry === undefined ? {} : { telemetry: options.telemetry }),
   });
   const opened = await runtime.handleCodexOperation({
     hook: trustedHook("origin-1", transcriptPath),

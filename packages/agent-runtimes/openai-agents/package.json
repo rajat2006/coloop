@@ -21,6 +21,7 @@
   },
   "dependencies": {
     "@coloop/core": "workspace:*",
+    "@coloop/observability": "workspace:*",
     "@openai/agents": "0.17.0"
   }
 }

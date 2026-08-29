@@ -5,6 +5,10 @@ import { DatabaseSync } from "node:sqlite";
 import type { EpisodeAgent } from "@coloop/core";
 import type { DiscordFinalizationInteraction } from "@coloop/discord";
 import type {
+  ApplicationTelemetry,
+  TelemetryEnvelope,
+} from "@coloop/observability";
+import type {
   CodexRequest,
   EpisodeToolArguments,
 } from "./codex-episode-contract";
@@ -170,6 +174,8 @@ interface RuntimeConfiguration {
   readonly agent?: EpisodeAgentTransport;
   readonly now?: () => Date;
   readonly createId?: () => string;
+  readonly createTelemetryId?: () => string;
+  readonly telemetry?: ApplicationTelemetry;
 }
 
 interface CodexPromptReturnerConfiguration {
@@ -274,6 +280,7 @@ interface InternalEpisodeModule extends EpisodeModule {
 
 interface EpisodeRow {
   readonly id: string;
+  readonly telemetry_id: string;
   readonly origin_session_id: string;
   readonly owner_discord_user_id: string;
   readonly guild_id: string;
@@ -323,7 +330,14 @@ export function createColoopRuntime(configuration: RuntimeConfiguration): CodexE
   const now = configuration.now ?? (() => new Date());
   recordRuntimeRestartInterruptions(database, now);
   const createId = configuration.createId ?? randomUUID;
-  const episodes = createEpisodeModule(database, configuration, now, createId);
+  const createTelemetryId = configuration.createTelemetryId ?? randomUUID;
+  const episodes = createEpisodeModule(
+    database,
+    configuration,
+    now,
+    createId,
+    createTelemetryId,
+  );
   const discordTurnQueues = new Map<string, Promise<void>>();
 
   return {
@@ -721,6 +735,27 @@ async function recordAndPresentInterruption(
     )
     .run(episode.id, errorClass, interruptedAt);
   const interruption = findEpisodeInterruption(database, episode.id);
+  if (result.changes === 1) {
+    emitTelemetry(configuration, {
+      schemaVersion: 1,
+      stream: "operational",
+      name:
+        errorClass === "DISCORD_GATEWAY_INTERRUPTED"
+          ? "discord.gateway"
+          : errorClass === "DISCORD_DELIVERY_AMBIGUOUS"
+            ? "delivery"
+            : "agent.run",
+      occurredAt: interruptedAt,
+      telemetryEpisodeId: episode.telemetry_id,
+      attributes: {
+        result: "interrupted",
+        errorClass,
+        ...(errorClass === "DISCORD_DELIVERY_AMBIGUOUS"
+          ? { destination: "discord" }
+          : {}),
+      },
+    });
+  }
   if (interruption !== undefined) {
     await presentInterruption(database, configuration, episode, interruption);
   }
@@ -1024,6 +1059,14 @@ async function processDiscordMessage(
       )
       .run(completedAt, `agent-response:${input.eventId}`);
   });
+  emitTelemetry(configuration, {
+    schemaVersion: 1,
+    stream: "operational",
+    name: "agent.run",
+    occurredAt: completedAt,
+    telemetryEpisodeId: episode.telemetry_id,
+    attributes: { result: "succeeded", acceptedTurns: 1 },
+  });
   const current = findActiveByDiscord(database, input.guildId, input.threadId);
   if (
     episode.proposal_revision_id !== null &&
@@ -1289,6 +1332,14 @@ async function synthesizeOutcomeProposal(
       )
       .run(completedAt, `proposal:${input.eventId}`);
   });
+  emitTelemetry(configuration, {
+    schemaVersion: 1,
+    stream: "operational",
+    name: "agent.run",
+    occurredAt: completedAt,
+    telemetryEpisodeId: episode.telemetry_id,
+    attributes: { result: "succeeded", acceptedTurns: 1 },
+  });
   return { ok: true, status: "completed" };
 }
 
@@ -1350,9 +1401,11 @@ function createEpisodeModule(
   configuration: RuntimeConfiguration,
   now: () => Date,
   createId: () => string,
+  createTelemetryId: () => string,
 ): InternalEpisodeModule {
   return {
-    openEpisode: (input) => openEpisode(database, configuration, now, createId, input),
+    openEpisode: (input) =>
+      openEpisode(database, configuration, now, createId, createTelemetryId, input),
     getEpisode: (input) => getEpisode(database, input.originSessionId, input.episodeId),
     cancelEpisode: (input) => cancelEpisode(database, configuration, now, input),
     findByOrigin: (originSessionId) => {
@@ -1369,6 +1422,7 @@ async function openEpisode(
   configuration: RuntimeConfiguration,
   now: () => Date,
   createId: () => string,
+  createTelemetryId: () => string,
   input: Parameters<EpisodeModule["openEpisode"]>[0],
 ): Promise<EpisodeOperationResult> {
   const existing = findByOrigin(database, input.originSessionId);
@@ -1381,6 +1435,7 @@ async function openEpisode(
   }
 
   const episodeId = createId();
+  const telemetryEpisodeId = createTelemetryId();
   const episodeDirectory = resolve(configuration.artifactDirectory, episodeId);
   const contextReference = join(episodeDirectory, "context.md");
   await mkdir(episodeDirectory, { recursive: true, mode: 0o700 });
@@ -1394,13 +1449,14 @@ async function openEpisode(
       database
         .prepare(
           `INSERT INTO episodes (
-            id, origin_session_id, origin_turn_id, owner_discord_user_id, guild_id,
+            id, telemetry_id, origin_session_id, origin_turn_id, owner_discord_user_id, guild_id,
             parent_channel_id, phase, phase_version, original_question, opening_brief,
             context_reference, context_digest, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, 'OPENING', 1, ?, ?, ?, ?, ?, ?)`,
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, 'OPENING', 1, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           episodeId,
+          telemetryEpisodeId,
           input.originSessionId,
           input.originTurnId,
           configuration.ownerDiscordUserId,
@@ -1420,6 +1476,14 @@ async function openEpisode(
         configuration.parentChannelId,
         createdAt,
       );
+    });
+    emitTelemetry(configuration, {
+      schemaVersion: 1,
+      stream: "product",
+      name: "episode.lifecycle",
+      occurredAt: createdAt,
+      telemetryEpisodeId,
+      attributes: { phase: "OPENING", result: "succeeded", created: true },
     });
   } catch (error) {
     const winner = findByOrigin(database, input.originSessionId);
@@ -1483,6 +1547,14 @@ async function openEpisode(
     const delivery = await deliverPendingCancellation(database, configuration, row, now);
     if (delivery !== undefined) return delivery;
   }
+  emitTelemetry(configuration, {
+    schemaVersion: 1,
+    stream: "product",
+    name: "episode.lifecycle",
+    occurredAt: activatedAt,
+    telemetryEpisodeId: row.telemetry_id,
+    attributes: { phase: "ACTIVE", result: "succeeded" },
+  });
   return { ok: true, created: true, episode: toView(row) };
 }
 
@@ -1560,6 +1632,14 @@ async function cancelEpisode(
     }
     return { ok: true, episode: toView(winner) };
   }
+  emitTelemetry(configuration, {
+    schemaVersion: 1,
+    stream: "product",
+    name: "episode.lifecycle",
+    occurredAt: cancelledAt,
+    telemetryEpisodeId: row.telemetry_id,
+    attributes: { phase: "CANCELLED", result: "succeeded" },
+  });
   const cancelled = findById(database, row.id);
   if (cancelled === undefined) throw new Error("Cancelled Episode was not found.");
   const delivery = await deliverPendingCancellation(database, configuration, cancelled, now);
@@ -1727,6 +1807,15 @@ async function finalizeEpisode(
       );
   });
   if (transitionFailure !== undefined) return transitionFailure;
+
+  emitTelemetry(configuration, {
+    schemaVersion: 1,
+    stream: "product",
+    name: "episode.lifecycle",
+    occurredAt: finalizedAt,
+    telemetryEpisodeId: episode.telemetry_id,
+    attributes: { phase: "FINALIZED", result: "succeeded" },
+  });
 
   const delivery = await deliverPendingFinalization(
     database,
@@ -2225,6 +2314,17 @@ function failure(code: string, reason: string): { readonly ok: false; readonly c
   return { ok: false, code, reason };
 }
 
+function emitTelemetry(
+  configuration: RuntimeConfiguration,
+  envelope: TelemetryEnvelope,
+): void {
+  try {
+    configuration.telemetry?.record(envelope);
+  } catch {
+    // Remote telemetry is deliberately lossy and cannot participate in Episode correctness.
+  }
+}
+
 function findByOrigin(database: DatabaseSync, originSessionId: string): EpisodeRow | undefined {
   return parseEpisodeRow(
     database
@@ -2284,6 +2384,7 @@ function parseEpisodeRow(value: unknown): EpisodeRow | undefined {
   if (
     !isRecord(value) ||
     typeof value.id !== "string" ||
+    typeof value.telemetry_id !== "string" ||
     typeof value.origin_session_id !== "string" ||
     typeof value.owner_discord_user_id !== "string" ||
     typeof value.guild_id !== "string" ||
@@ -2314,6 +2415,7 @@ function parseEpisodeRow(value: unknown): EpisodeRow | undefined {
   }
   return {
     id: value.id,
+    telemetry_id: value.telemetry_id,
     origin_session_id: value.origin_session_id,
     owner_discord_user_id: value.owner_discord_user_id,
     guild_id: value.guild_id,
@@ -2444,7 +2546,8 @@ function toView(
 function migrate(database: DatabaseSync): void {
   database.exec(`
     CREATE TABLE IF NOT EXISTS episodes (
-      id TEXT PRIMARY KEY, origin_session_id TEXT NOT NULL UNIQUE, origin_turn_id TEXT NOT NULL,
+      id TEXT PRIMARY KEY, telemetry_id TEXT NOT NULL UNIQUE,
+      origin_session_id TEXT NOT NULL UNIQUE, origin_turn_id TEXT NOT NULL,
       owner_discord_user_id TEXT NOT NULL, guild_id TEXT NOT NULL, parent_channel_id TEXT NOT NULL,
       thread_id TEXT, thread_url TEXT, phase TEXT NOT NULL, phase_version INTEGER NOT NULL,
       original_question TEXT NOT NULL, opening_brief TEXT NOT NULL, context_reference TEXT NOT NULL,
@@ -2480,6 +2583,18 @@ function migrate(database: DatabaseSync): void {
     .all()
     .filter(isRecord)
     .map((column) => column.name);
+  if (!episodeColumns.includes("telemetry_id")) {
+    database.exec("ALTER TABLE episodes ADD COLUMN telemetry_id TEXT");
+    const rows = database.prepare("SELECT id FROM episodes WHERE telemetry_id IS NULL").all();
+    for (const row of rows) {
+      if (!isRecord(row) || typeof row.id !== "string") {
+        throw new Error("Stored Episode identity is malformed.");
+      }
+      database
+        .prepare("UPDATE episodes SET telemetry_id = ? WHERE id = ?")
+        .run(randomUUID(), row.id);
+    }
+  }
   if (!episodeColumns.includes("agent_previous_response_id")) {
     database.exec("ALTER TABLE episodes ADD COLUMN agent_previous_response_id TEXT");
   }

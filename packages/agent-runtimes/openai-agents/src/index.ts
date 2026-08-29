@@ -1,4 +1,5 @@
 import type { EmptyResult, EpisodeAgent } from "@coloop/core";
+import type { PrivateAgentTracePolicy } from "@coloop/observability";
 import {
   Agent,
   Runner,
@@ -55,6 +56,7 @@ const outcomeProposalOutput = {
 
 export const createEpisodeAgent = (configuration: {
   readonly model?: Model | string;
+  readonly privateAgentTracePolicy?: PrivateAgentTracePolicy;
 } = {}): EpisodeAgent => {
   const manager = new Agent<
     EpisodeAgentContext,
@@ -77,15 +79,31 @@ Synthesize the requested public Outcome Proposal from the authorized context and
     tools: [],
     outputType: outcomeProposalOutput,
   });
-  const runner = new Runner({
+  const defaultRunner = new Runner({
     traceIncludeSensitiveData: false,
     tracingDisabled: true,
   });
+  const privateTrialRunner = new Runner({
+    traceIncludeSensitiveData: true,
+    tracingDisabled: false,
+    workflowName: "Coloop private Collaboration Episode trial",
+  });
+
+  const selectRunner = (content: string): {
+    readonly runner: Runner;
+    readonly sensitiveTraceEnabled: boolean;
+  } => {
+    const decision = configuration.privateAgentTracePolicy?.decide(content);
+    return decision?.enabled === true
+      ? { runner: privateTrialRunner, sensitiveTraceEnabled: true }
+      : { runner: defaultRunner, sensitiveTraceEnabled: false };
+  };
 
   return {
     async streamResponse(input) {
       try {
-        const stream = await runner.run(manager, input.message, {
+        const trace = selectRunner(`${input.contextPackage}\n${input.message}`);
+        const stream = await trace.runner.run(manager, input.message, {
           context: { contextPackage: input.contextPackage },
           maxTurns: 1,
           ...(input.previousResponseId === undefined
@@ -101,6 +119,9 @@ Synthesize the requested public Outcome Proposal from the authorized context and
         if (stream.lastResponseId === undefined) {
           return { ok: false, reason: "provider-failed" };
         }
+        if (trace.sensitiveTraceEnabled) {
+          configuration.privateAgentTracePolicy?.recordAcceptedAgentTurn();
+        }
         return { ok: true, responseId: stream.lastResponseId };
       } catch {
         return { ok: false, reason: "provider-failed" };
@@ -108,7 +129,8 @@ Synthesize the requested public Outcome Proposal from the authorized context and
     },
     async synthesizeOutcomeProposal(input) {
       try {
-        const result = await runner.run(proposalManager, input.message, {
+        const trace = selectRunner(`${input.contextPackage}\n${input.message}`);
+        const result = await trace.runner.run(proposalManager, input.message, {
           context: { contextPackage: input.contextPackage },
           maxTurns: 1,
           ...(input.previousResponseId === undefined
@@ -117,6 +139,9 @@ Synthesize the requested public Outcome Proposal from the authorized context and
         });
         if (result.lastResponseId === undefined || result.finalOutput === undefined) {
           return { ok: false, reason: "provider-failed" };
+        }
+        if (trace.sensitiveTraceEnabled) {
+          configuration.privateAgentTracePolicy?.recordAcceptedAgentTurn();
         }
         return {
           ok: true,

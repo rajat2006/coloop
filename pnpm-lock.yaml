@@ -45,6 +45,9 @@ importers:
       '@coloop/core':
         specifier: workspace:*
         version: link:../../core
+      '@coloop/observability':
+        specifier: workspace:*
+        version: link:../../observability
       '@openai/agents':
         specifier: 0.17.0
         version: 0.17.0(ws@8.21.3)(zod@4.4.3)
@@ -95,6 +98,9 @@ importers:
       '@coloop/discord':
         specifier: workspace:*
         version: link:../collaboration-channels/discord
+      '@coloop/observability':
+        specifier: workspace:*
+        version: link:../observability
     devDependencies:
       '@types/node':
         specifier: ^24.0.0
@@ -107,6 +113,8 @@ importers:
         version: 3.2.7(@types/node@24.13.3)(tsx@4.23.12)
 
   packages/core: {}
+
+  packages/observability: {}
 
   packages/storage/local:
     dependencies:
