@@ -1,0 +1,79 @@
+{
+  "status": "passed",
+  "runtime": "Node.js v24.20.0",
+  "environment": {
+    "verified_client": "codex-cli 0.150.1",
+    "hooks_feature": "stable, enabled",
+    "ide_extension": "unverified",
+    "desktop_app": "unverified"
+  },
+  "checks": [
+    {
+      "name": "hook injects trusted identity",
+      "passed": true,
+      "detail": "PreToolUse overwrote internal Origin Session fields."
+    },
+    {
+      "name": "synchronous opening returns ACTIVE",
+      "passed": true,
+      "detail": {
+        "provisioning_ms": 35,
+        "phase": "ACTIVE"
+      }
+    },
+    {
+      "name": "visible-text capture excludes injected/tool/reasoning records",
+      "passed": true,
+      "detail": {
+        "message_count": 4,
+        "sha256": "39f6991b128cbd1e960df6f714531e3e1f29dc54da897e7dd120f4188771a767"
+      }
+    },
+    {
+      "name": "repeat opening is idempotent",
+      "passed": true,
+      "detail": "Same Episode returned unchanged with created: false."
+    },
+    {
+      "name": "different Origin Session cannot retrieve",
+      "passed": true,
+      "detail": "Cross-session lookup failed closed."
+    },
+    {
+      "name": "finalization is immutable",
+      "passed": true,
+      "detail": "Repeated finalization retained the first exact result and unresolved points."
+    },
+    {
+      "name": "outcome waits for the same Origin Session's next turn",
+      "passed": true,
+      "detail": "Wrong session received nothing; bound session received exact result and unresolved points."
+    },
+    {
+      "name": "return injection is at most once",
+      "passed": true,
+      "detail": "Repeated UserPromptSubmit produced no second injection."
+    },
+    {
+      "name": "get_episode remains a fallback",
+      "passed": true,
+      "detail": "Retrieval returned the same immutable Episode Outcome after injection."
+    },
+    {
+      "name": "late cancellation cannot replace finalization",
+      "passed": true,
+      "detail": "Late cancellation returned the unchanged FINALIZED Episode."
+    },
+    {
+      "name": "credential preflight blocks with masked finding",
+      "passed": true,
+      "detail": "Opening blocked with only the masked finding sk-p…6789."
+    }
+  ],
+  "notes": [
+    "The standalone hook.mjs also passed a real stdin/stdout PreToolUse invocation under Node 24.",
+    "Discord provisioning is a measured local stand-in, not a live Discord API call.",
+    "Hook payload and transcript shape are pinned to the documented and observed Codex schema.",
+    "The clickable HTML walkthrough is the human-feedback surface."
+  ]
+}
