@@ -12,6 +12,7 @@ const dependencies = createProductionDependencies({
 });
 
 const args = process.argv.slice(2);
+// Codex installs these two internal entry points; setup and run remain the Owner-facing CLI.
 if (args[0] === "mcp") {
   process.exitCode = await runMcpServer(process.stdin, process.stdout);
 } else if (args[0] === "codex-hook") {

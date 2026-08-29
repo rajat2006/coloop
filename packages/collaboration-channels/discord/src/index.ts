@@ -51,6 +51,7 @@ export const requiredDiscordPermissions =
   (1n << 38n);
 
 export const verifyPermissions = (channel: DiscordChannel): void => {
+  // The dedicated application must have exactly this set: no Administrator and no extras.
   let permissions: bigint;
   try {
     permissions = BigInt(channel.permissions);
@@ -78,6 +79,7 @@ export const verifyChannelIsolation = (
   channels: DiscordChannel[],
   parentChannel: DiscordChannel,
 ): void => {
+  // The selected parent is the only channel the dedicated application may view.
   for (const channel of channels) {
     if (channel.id === parentChannel.id) continue;
     let permissions: bigint;
@@ -94,6 +96,7 @@ export const verifyChannelIsolation = (
   }
 };
 
+// Network payloads stay unknown until the provider converts them into trusted domain shapes.
 interface DiscordApplicationResponse {
   bot?: { id?: unknown };
   flags?: unknown;
@@ -198,6 +201,7 @@ const calculateChannelPermissions = (
   roles: DiscordRoleResponse[],
   overwrites: DiscordOverwriteResponse[],
 ): string => {
+  // Discord resolves base roles, everyone overwrite, role overwrites, then member overwrite.
   const everyone = roles.find((role) => role.id === guildId);
   if (!everyone) {
     throw new Error("provider_response_invalid");
@@ -249,6 +253,7 @@ const connectDiscordGateway = async (
   const socket = new WebSocket(`${gatewayUrl}?v=10&encoding=json`);
   let heartbeat: NodeJS.Timeout | undefined;
 
+  // Resolve only after READY so callers never receive a half-initialized connection.
   await new Promise<void>((resolve, reject) => {
     const timeout = setTimeout(() => {
       socket.close();

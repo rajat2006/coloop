@@ -17,6 +17,7 @@ export const runCodex = async (args: string[]): Promise<CommandResult> => {
     });
     return { exitCode: 0, stderr: result.stderr, stdout: result.stdout };
   } catch (error) {
+    // Normalize spawn failures and non-zero exits into the same result shape.
     const failure = error as {
       code?: unknown;
       stderr?: unknown;

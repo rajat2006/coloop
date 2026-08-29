@@ -75,6 +75,7 @@ export const saveConfig = async (
   const directory = dirname(configFile);
   await mkdir(directory, { mode: 0o700, recursive: true });
   await chmod(directory, 0o700);
+  // Writing then renaming prevents an interruption from leaving partial JSON behind.
   const temporaryFile = `${configFile}.tmp`;
   await writeFile(temporaryFile, `${JSON.stringify(config, null, 2)}\n`, {
     mode: 0o600,
@@ -87,6 +88,7 @@ export const saveConfig = async (
 export const initializePrivateStorage = async (
   paths: InstallationPaths,
 ): Promise<void> => {
+  // State, artifacts, and the database are Owner-only even when they already exist.
   await mkdir(paths.stateDirectory, { mode: 0o700, recursive: true });
   await mkdir(paths.artifactsDirectory, { mode: 0o700, recursive: true });
   await chmod(paths.stateDirectory, 0o700);
@@ -112,6 +114,7 @@ export const verifyPrivateStorage = async (
   paths: InstallationPaths,
 ): Promise<void> => {
   try {
+    // Readiness covers path types, privacy bits, and the initialized schema marker.
     const [state, artifacts, databaseFile] = await Promise.all([
       stat(paths.stateDirectory),
       stat(paths.artifactsDirectory),

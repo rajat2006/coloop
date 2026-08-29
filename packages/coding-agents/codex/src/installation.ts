@@ -35,6 +35,7 @@ const hookCommand = (
   dependencies: CodexIntegrationDependencies,
   hook: "pre-tool-use" | "user-prompt-submit",
 ): string =>
+  // Hooks must call the exact executable being verified, including wrapper arguments.
   [
     dependencies.coloopEntrypoint.command,
     ...dependencies.coloopEntrypoint.args,
@@ -171,6 +172,7 @@ export const verifyCodexIntegration = async (
   codexHome: string,
   dependencies: CodexIntegrationDependencies,
 ): Promise<void> => {
+  // Runtime verification is intentionally read-only; setup owns all repairs.
   await verifyCodexVersion(dependencies);
   await verifyMcpEntryPoint(dependencies);
   await verifyHookEntryPoint(codexHome, dependencies);
@@ -183,6 +185,7 @@ export const installAndVerifyCodexIntegration = async (
 ): Promise<void> => {
   await verifyCodexVersion(dependencies);
 
+  // Replace a stale Coloop MCP registration, then re-read it before continuing.
   let mcp = await dependencies.runCodex(["mcp", "get", "--json", "coloop"]);
   if (
     mcp.exitCode !== 0 ||
@@ -235,6 +238,7 @@ export const installAndVerifyCodexIntegration = async (
     typeof document.hooks === "object" && document.hooks !== null
       ? { ...document.hooks }
       : {};
+  // Replace only Coloop's matcher and preserve every hook owned by the user or another tool.
   const preToolUse = Array.isArray(hooks.PreToolUse)
     ? hooks.PreToolUse.filter((entry) => !matchesPreToolMatcher(entry))
     : [];

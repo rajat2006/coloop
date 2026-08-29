@@ -28,6 +28,7 @@ export const runCodexHook = async (
   try {
     const event = JSON.parse(await readInput(input)) as Record<string, unknown>;
     if (hook === "user-prompt-submit") {
+      // This hook validates the next-prompt context but does not modify it.
       if (
         event.hook_event_name !== "UserPromptSubmit" ||
         !isNonEmptyString(event.session_id) ||
@@ -50,6 +51,7 @@ export const runCodexHook = async (
     ) {
       throw new Error("unsupported_hook_shape");
     }
+    // Trusted Codex fields replace any model-authored origin fields in the tool input.
     output.write(
       `${JSON.stringify({
         hookSpecificOutput: {
@@ -66,6 +68,7 @@ export const runCodexHook = async (
     );
     return 0;
   } catch {
+    // Hook validation fails closed so unsupported payloads cannot open an Episode.
     error.write("Coloop blocked an unsupported Codex hook payload.\n");
     return 2;
   }

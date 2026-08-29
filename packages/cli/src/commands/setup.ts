@@ -99,6 +99,7 @@ export const runSetup = async (
   terminal: Terminal,
   environment: NodeJS.ProcessEnv,
 ): Promise<void> => {
+  // Each validated non-secret step is saved immediately so setup can resume safely.
   terminal.line("Coloop setup");
   terminal.line();
   const discordToken = environment.DISCORD_TOKEN;
@@ -214,6 +215,7 @@ export const runSetup = async (
 
   terminal.line();
   terminal.line("Owner Pairing");
+  // A transient lookup failure must not erase a pairing that may still be valid.
   let ownerId = config.ownerUserId;
   let member = ownerId
     ? await resolveOwnerMember(dependencies, discordToken, guild.id, ownerId)
@@ -266,6 +268,7 @@ export const runSetup = async (
   terminal.line(
     "OPENAI_API_KEY belongs to the Owner's Platform project and funds Episode Agent inference.",
   );
+  // Provider credentials are read from the environment for validation and are never persisted.
   const openaiApiKey = environment.OPENAI_API_KEY;
   if (!openaiApiKey) {
     await openForOwnerAction(

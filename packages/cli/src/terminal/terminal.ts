@@ -25,6 +25,7 @@ export class Terminal {
       if (reader) {
         reader(line);
       } else {
+        // Buffer early input so piped setup answers are not lost between prompts.
         this.#lines.push(line);
       }
     });

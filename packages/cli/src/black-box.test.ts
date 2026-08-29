@@ -154,6 +154,7 @@ const readFiles = async (directory: string): Promise<Buffer[]> => {
 
 describe("built coloop CLI", () => {
   test("covers setup, recovery, provider failures, readiness, privacy, and runtime across the process boundary", async () => {
+    // Internal Codex entry points must work through the built executable.
     const freshHarness = await createHarness();
     const mcp = await runBuiltCli(
       freshHarness,
@@ -182,6 +183,7 @@ describe("built coloop CLI", () => {
       stderr: "Usage: coloop <setup|run>\n",
       stdout: "",
     });
+    // A fresh installation must complete without persisting either provider secret.
     const fresh = await runBuiltCli(
       freshHarness,
       ["setup"],
@@ -201,6 +203,7 @@ describe("built coloop CLI", () => {
       false,
     );
 
+    // A ready installation opens and cleanly closes the foreground Gateway runtime.
     const runtime = await runBuiltCli(
       freshHarness,
       ["run"],
@@ -224,6 +227,7 @@ describe("built coloop CLI", () => {
       "OPENAI_API_KEY was rejected by OpenAI Platform.",
     );
 
+    // Interrupted setup resumes from saved non-secret progress and repairs stale state.
     const recoveryHarness = await createHarness();
     const permissionFailure = await runBuiltCli(
       recoveryHarness,
@@ -265,6 +269,7 @@ describe("built coloop CLI", () => {
     );
     expect(JSON.parse(recoveredConfig)).toMatchObject({ ownerUserId: ownerId });
 
+    // Provider and identity failures remain actionable without exposing credentials.
     const invalidCredentialHarness = await createHarness();
     const invalidCredential = await runBuiltCli(
       invalidCredentialHarness,

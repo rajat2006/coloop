@@ -24,6 +24,7 @@ export const runRuntime = async (
 ): Promise<void> => {
   terminal.line("Coloop runtime startup");
   const paths = getInstallationPaths(environment);
+  // Runtime startup is validation-only; all repair and selection belongs to setup.
   const config = requireReadyInstallation(await loadConfig(paths.configFile));
 
   const discordToken = environment.DISCORD_TOKEN;
@@ -112,6 +113,7 @@ export const runRuntime = async (
   await verifyCodexIntegration(paths.codexHome, dependencies);
   terminal.line("Readiness check passed.");
 
+  // Do not connect Discord until every local and remote readiness check has passed.
   let gateway;
   try {
     gateway = await dependencies.discord.connectGateway(discordToken);
@@ -124,6 +126,7 @@ export const runRuntime = async (
   try {
     await dependencies.waitForShutdown();
   } finally {
+    // Always release the Gateway connection when the foreground wait ends.
     await gateway.close();
   }
 };

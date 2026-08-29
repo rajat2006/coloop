@@ -30,6 +30,7 @@ export const runMcpServer = async (
   input: Readable,
   output: Writable,
 ): Promise<number> => {
+  // Codex's stdio transport sends one complete JSON-RPC message per line.
   const lines = createInterface({ input, terminal: false });
   for await (const line of lines) {
     let request: JsonRpcRequest;
@@ -44,6 +45,7 @@ export const runMcpServer = async (
       continue;
     }
     if (request.id === undefined) {
+      // Notifications have no response by JSON-RPC definition.
       continue;
     }
     if (request.method === "initialize") {
@@ -80,6 +82,7 @@ export const runMcpServer = async (
         });
         continue;
       }
+      // Tool discovery works now, but Episode creation waits for the later runtime package.
       writeMessage(output, {
         id: request.id,
         jsonrpc: "2.0",
