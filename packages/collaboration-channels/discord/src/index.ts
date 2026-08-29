@@ -40,6 +40,101 @@ export interface DiscordMember {
   username: string;
 }
 
+export const discordFinalizeCommand = {
+  name: "finalize",
+  description: "Finalize the current Outcome Proposal",
+  type: 1,
+} as const;
+
+export interface DiscordVisibleOutcomeProposal {
+  readonly revisionId: string;
+  readonly resultMarkdown: string;
+  readonly unresolvedPoints: readonly string[];
+}
+
+export interface DiscordFinalizationInteraction {
+  readonly interactionId: string;
+  readonly guildId: string;
+  readonly threadId: string;
+  readonly actorKind: "human";
+  readonly actorDiscordUserId: string;
+  readonly revisionId: string;
+  readonly proposal: {
+    readonly resultMarkdown: string;
+    readonly unresolvedPoints: readonly string[];
+  };
+}
+
+export type DiscordFinalizationMappingResult = Result<
+  DiscordFinalizationInteraction,
+  "invalid-proposal" | "unsupported-actor" | "unsupported-interaction" | "wrong-scope"
+>;
+
+export function mapDiscordFinalizeInteraction(
+  value: unknown,
+  context: {
+    readonly guildId: string;
+    readonly threadId: string;
+    readonly proposal: DiscordVisibleOutcomeProposal;
+  },
+): DiscordFinalizationMappingResult {
+  if (!isRecord(value) || value.type !== 2 || !isRecord(value.data)) {
+    return { ok: false, reason: "unsupported-interaction" };
+  }
+  if (
+    value.data.name !== discordFinalizeCommand.name ||
+    value.data.type !== discordFinalizeCommand.type
+  ) {
+    return { ok: false, reason: "unsupported-interaction" };
+  }
+  const guildId = parseDiscordGuildId(value.guild_id);
+  const threadId = parseDiscordChannelId(value.channel_id);
+  if (
+    !guildId.ok ||
+    !threadId.ok ||
+    guildId.value !== context.guildId ||
+    threadId.value !== context.threadId
+  ) {
+    return { ok: false, reason: "wrong-scope" };
+  }
+  if (!isRecord(value.member) || !isRecord(value.member.user)) {
+    return { ok: false, reason: "unsupported-actor" };
+  }
+  const actorDiscordUserId = parseDiscordUserId(value.member.user.id);
+  if (!actorDiscordUserId.ok || value.member.user.bot !== false) {
+    return { ok: false, reason: "unsupported-actor" };
+  }
+  if (
+    typeof value.id !== "string" ||
+    value.id.length === 0 ||
+    typeof context.proposal.revisionId !== "string" ||
+    context.proposal.revisionId.length === 0 ||
+    typeof context.proposal.resultMarkdown !== "string" ||
+    context.proposal.resultMarkdown.length === 0 ||
+    !Array.isArray(context.proposal.unresolvedPoints) ||
+    !context.proposal.unresolvedPoints.every(
+      (point) => typeof point === "string" && point.length > 0,
+    )
+  ) {
+    return { ok: false, reason: "invalid-proposal" };
+  }
+  return {
+    ok: true,
+    value: {
+      interactionId: value.id,
+      guildId: guildId.value,
+      threadId: threadId.value,
+      actorKind: "human",
+      actorDiscordUserId: actorDiscordUserId.value,
+      revisionId: context.proposal.revisionId,
+      proposal: {
+        resultMarkdown: context.proposal.resultMarkdown,
+        unresolvedPoints: context.proposal.unresolvedPoints,
+      },
+    },
+  };
+}
+
 export type DiscordProviderFailureReason =
   | "credential-rejected"
   | "invalid-response"

@@ -73,12 +73,18 @@ export interface DiscordEpisodeTransport {
     readonly revisionId: string;
     readonly contentSha256: string;
     readonly acknowledgement: string;
+    readonly finalizationEnabled: true;
   }): Promise<ProposalDeliveryReceipt>;
   presentFinalization(input: {
     readonly idempotencyKey: string;
     readonly guildId: string;
     readonly threadId: string;
     readonly episodeId: string;
+    readonly status: "FINALIZED";
+    readonly controlsDisabled: true;
+    readonly threadArchived: false;
+    readonly threadLocked: false;
+    readonly threadWritable: true;
   }): Promise<void>;
   setFinalizationEnabled(input: {
     readonly guildId: string;
@@ -682,24 +688,6 @@ async function processDiscordMessage(
     return failure("DISCORD_DELIVERY_FAILED", "Discord response delivery failed.");
   }
 
-  const current = findActiveByDiscord(database, input.guildId, input.threadId);
-  if (
-    episode.proposal_revision_id !== null &&
-    current?.proposal_revision_id === episode.proposal_revision_id
-  ) {
-    try {
-      await configuration.discord.setFinalizationEnabled({
-        guildId: input.guildId,
-        threadId: input.threadId,
-        revisionId: episode.proposal_revision_id,
-        enabled: true,
-      });
-    } catch {
-      abandonAgentTurn(database, input.eventId);
-      return failure("DISCORD_DELIVERY_FAILED", "Discord response delivery failed.");
-    }
-  }
-
   const completedAt = now().toISOString();
   inTransaction(database, () => {
     database
@@ -720,6 +708,22 @@ async function processDiscordMessage(
       )
       .run(completedAt, `agent-response:${input.eventId}`);
   });
+  const current = findActiveByDiscord(database, input.guildId, input.threadId);
+  if (
+    episode.proposal_revision_id !== null &&
+    current?.proposal_revision_id === episode.proposal_revision_id
+  ) {
+    try {
+      await configuration.discord.setFinalizationEnabled({
+        guildId: input.guildId,
+        threadId: input.threadId,
+        revisionId: episode.proposal_revision_id,
+        enabled: true,
+      });
+    } catch {
+      return failure("DISCORD_DELIVERY_FAILED", "Discord response delivery failed.");
+    }
+  }
   return { ok: true, status: "completed" };
 }
 
@@ -793,6 +797,20 @@ async function synthesizeOutcomeProposal(
       );
   });
 
+  if (isRevision && episode.proposal_revision_id !== null) {
+    try {
+      await configuration.discord.setFinalizationEnabled({
+        guildId: input.guildId,
+        threadId: input.threadId,
+        revisionId: episode.proposal_revision_id,
+        enabled: false,
+      });
+    } catch {
+      abandonProposal(database, input.eventId);
+      return failure("DISCORD_DELIVERY_FAILED", "Discord proposal delivery failed.");
+    }
+  }
+
   const candidateResult = await configuration.agent.synthesizeOutcomeProposal({
     contextPackage: await readFile(episode.context_reference, "utf8"),
     message: renderDiscordConversation(input),
@@ -838,6 +856,7 @@ async function synthesizeOutcomeProposal(
         unresolvedPoints: candidate.unresolvedPoints,
         contentSha256: proposalDigest,
         acknowledgement: `Outcome Proposal revised to ${revisionId}.`,
+        finalizationEnabled: true,
       });
     }
   } catch {
@@ -1212,44 +1231,55 @@ async function finalizeEpisode(
       "Only the paired Owner can finalize the Episode Outcome.",
     );
   }
-  if (episode.phase !== "ACTIVE") {
-    return failure("FINALIZATION_UNAVAILABLE", "This Episode cannot be finalized.");
-  }
-  if (
-    episode.proposal_revision_id === null ||
-    episode.proposal_digest === null
-  ) {
-    return failure(
-      "OUTCOME_PROPOSAL_REQUIRED",
-      "Finalization requires a current delivered Outcome Proposal.",
-    );
-  }
-  const busy = database
-    .prepare(
-      "SELECT 1 FROM provider_inbox WHERE episode_id = ? AND status = 'PROCESSING' LIMIT 1",
-    )
-    .get(episode.id);
-  if (busy !== undefined) {
-    return failure(
-      "EPISODE_AGENT_BUSY",
-      "Finalization is disabled while the Episode Agent is running.",
-    );
-  }
-  if (
-    input.revisionId !== episode.proposal_revision_id ||
-    digest(JSON.stringify(input.proposal)) !== episode.proposal_digest
-  ) {
-    return failure(
-      "STALE_OUTCOME_PROPOSAL",
-      "Review the current visible Outcome Proposal before finalizing it.",
-    );
-  }
-
   const finalizedAt = now().toISOString();
   const retentionDeadline = new Date(
     new Date(finalizedAt).getTime() + contextPackageRetentionMs,
   ).toISOString();
+  let transitionFailure:
+    | { readonly ok: false; readonly code: string; readonly reason: string }
+    | undefined;
   inTransaction(database, () => {
+    const current = findById(database, episode.id);
+    if (current === undefined || current.phase !== "ACTIVE") {
+      transitionFailure = failure(
+        "FINALIZATION_UNAVAILABLE",
+        "This Episode cannot be finalized.",
+      );
+      return;
+    }
+    if (
+      current.proposal_revision_id === null ||
+      current.proposal_digest === null
+    ) {
+      transitionFailure = failure(
+        "OUTCOME_PROPOSAL_REQUIRED",
+        "Finalization requires a current delivered Outcome Proposal.",
+      );
+      return;
+    }
+    const busy = database
+      .prepare(
+        `SELECT 1 FROM provider_inbox WHERE episode_id = ? AND status = 'PROCESSING'
+         AND effect_kind IN ('agent_turn', 'proposal_synthesis', 'proposal_revision') LIMIT 1`,
+      )
+      .get(current.id);
+    if (busy !== undefined) {
+      transitionFailure = failure(
+        "EPISODE_AGENT_BUSY",
+        "Finalization is disabled while the Episode Agent is running.",
+      );
+      return;
+    }
+    if (
+      input.revisionId !== current.proposal_revision_id ||
+      digest(JSON.stringify(input.proposal)) !== current.proposal_digest
+    ) {
+      transitionFailure = failure(
+        "STALE_OUTCOME_PROPOSAL",
+        "Review the current visible Outcome Proposal before finalizing it.",
+      );
+      return;
+    }
     database
       .prepare(
         `INSERT INTO provider_inbox (
@@ -1273,7 +1303,7 @@ async function finalizeEpisode(
         finalizedAt,
         episode.id,
         input.revisionId,
-        episode.proposal_digest,
+        current.proposal_digest,
       );
     if (update.changes !== 1) {
       throw new Error("The Episode changed during finalization.");
@@ -1281,7 +1311,7 @@ async function finalizeEpisode(
     addAudit(
       database,
       episode.id,
-      episode.phase_version + 1,
+      current.phase_version + 1,
       "EPISODE_FINALIZED",
       "owner",
       finalizedAt,
@@ -1304,6 +1334,7 @@ async function finalizeEpisode(
         finalizedAt,
       );
   });
+  if (transitionFailure !== undefined) return transitionFailure;
 
   const delivery = await deliverPendingFinalization(
     database,
@@ -1993,26 +2024,18 @@ async function deliverPendingCancellation(
   episode: EpisodeRow,
   now: () => Date,
 ): Promise<{ readonly ok: false; readonly code: string; readonly reason: string } | undefined> {
-  const value = database
-    .prepare(
-      `SELECT action_id, idempotency_key, destination_reference FROM recovery_outbox
-       WHERE episode_id = ? AND action_kind = 'DISCORD_EPISODE_CANCELLED' AND state = 'PENDING'`,
-    )
-    .get(episode.id);
-  if (value === undefined) return undefined;
-  if (
-    !isRecord(value) ||
-    typeof value.action_id !== "string" ||
-    typeof value.idempotency_key !== "string" ||
-    typeof value.destination_reference !== "string"
-  ) {
-    return failure("DURABLE_STATE_INVALID", "The pending cancellation action is malformed.");
-  }
+  const pending = findPendingTerminalAction(
+    database,
+    episode.id,
+    "DISCORD_EPISODE_CANCELLED",
+  );
+  if (!pending.ok) return pending;
+  if (pending.action === undefined) return undefined;
   try {
     await configuration.discord.presentCancellation({
-      idempotencyKey: value.idempotency_key,
+      idempotencyKey: pending.action.idempotencyKey,
       guildId: configuration.guildId,
-      threadId: value.destination_reference,
+      threadId: pending.action.destinationReference,
       episodeId: episode.id,
       ...(episode.cancellation_reason === null
         ? {}
@@ -2024,13 +2047,11 @@ async function deliverPendingCancellation(
       `Episode ${episode.id} is CANCELLED; Discord terminal presentation remains pending.`,
     );
   }
-  const acknowledgedAt = now().toISOString();
-  database
-    .prepare(
-      `UPDATE recovery_outbox SET state = 'ACKNOWLEDGED', payload = NULL, acknowledged_at = ?
-       WHERE action_id = ? AND state = 'PENDING'`,
-    )
-    .run(acknowledgedAt, value.action_id);
+  acknowledgePendingTerminalAction(
+    database,
+    pending.action.actionId,
+    now().toISOString(),
+  );
   return undefined;
 }
 
@@ -2041,27 +2062,25 @@ async function deliverPendingFinalization(
   interactionId: string,
   now: () => Date,
 ): Promise<{ readonly ok: false; readonly code: string; readonly reason: string } | undefined> {
-  const value = database
-    .prepare(
-      `SELECT action_id, idempotency_key, destination_reference FROM recovery_outbox
-       WHERE episode_id = ? AND action_kind = 'DISCORD_EPISODE_FINALIZED' AND state = 'PENDING'`,
-    )
-    .get(episode.id);
-  if (value === undefined) return undefined;
-  if (
-    !isRecord(value) ||
-    typeof value.action_id !== "string" ||
-    typeof value.idempotency_key !== "string" ||
-    typeof value.destination_reference !== "string"
-  ) {
-    return failure("DURABLE_STATE_INVALID", "The pending finalization action is malformed.");
-  }
+  const pending = findPendingTerminalAction(
+    database,
+    episode.id,
+    "DISCORD_EPISODE_FINALIZED",
+  );
+  if (!pending.ok) return pending;
+  if (pending.action === undefined) return undefined;
+  const action = pending.action;
   try {
     await configuration.discord.presentFinalization({
-      idempotencyKey: value.idempotency_key,
+      idempotencyKey: action.idempotencyKey,
       guildId: episode.guild_id,
-      threadId: value.destination_reference,
+      threadId: action.destinationReference,
       episodeId: episode.id,
+      status: "FINALIZED",
+      controlsDisabled: true,
+      threadArchived: false,
+      threadLocked: false,
+      threadWritable: true,
     });
   } catch {
     return failure(
@@ -2077,14 +2096,64 @@ async function deliverPendingFinalization(
          WHERE provider_event_id = ?`,
       )
       .run(acknowledgedAt, interactionId);
-    database
-      .prepare(
-        `UPDATE recovery_outbox SET state = 'ACKNOWLEDGED', payload = NULL,
-         acknowledged_at = ? WHERE action_id = ? AND state = 'PENDING'`,
-      )
-      .run(acknowledgedAt, value.action_id);
+    acknowledgePendingTerminalAction(
+      database,
+      action.actionId,
+      acknowledgedAt,
+    );
   });
   return undefined;
+}
+
+interface PendingTerminalAction {
+  readonly actionId: string;
+  readonly idempotencyKey: string;
+  readonly destinationReference: string;
+}
+
+function findPendingTerminalAction(
+  database: DatabaseSync,
+  episodeId: string,
+  actionKind: "DISCORD_EPISODE_CANCELLED" | "DISCORD_EPISODE_FINALIZED",
+):
+  | { readonly ok: true; readonly action?: PendingTerminalAction }
+  | { readonly ok: false; readonly code: string; readonly reason: string } {
+  const value = database
+    .prepare(
+      `SELECT action_id, idempotency_key, destination_reference FROM recovery_outbox
+       WHERE episode_id = ? AND action_kind = ? AND state = 'PENDING'`,
+    )
+    .get(episodeId, actionKind);
+  if (value === undefined) return { ok: true };
+  if (
+    !isRecord(value) ||
+    typeof value.action_id !== "string" ||
+    typeof value.idempotency_key !== "string" ||
+    typeof value.destination_reference !== "string"
+  ) {
+    return failure("DURABLE_STATE_INVALID", "The pending terminal action is malformed.");
+  }
+  return {
+    ok: true,
+    action: {
+      actionId: value.action_id,
+      idempotencyKey: value.idempotency_key,
+      destinationReference: value.destination_reference,
+    },
+  };
+}
+
+function acknowledgePendingTerminalAction(
+  database: DatabaseSync,
+  actionId: string,
+  acknowledgedAt: string,
+): void {
+  database
+    .prepare(
+      `UPDATE recovery_outbox SET state = 'ACKNOWLEDGED', payload = NULL,
+       acknowledged_at = ? WHERE action_id = ? AND state = 'PENDING'`,
+    )
+    .run(acknowledgedAt, actionId);
 }
 
 function checkReplay(
