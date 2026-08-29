@@ -630,15 +630,14 @@ async function interruptConnectedEpisodes(
   const interruptedAt = now().toISOString();
   let interruptedEpisodes = 0;
   for (const episode of episodes) {
-    if (
-      await recordAndPresentInterruption(
-        database,
-        configuration,
-        episode,
-        errorClass,
-        interruptedAt,
-      )
-    ) {
+    const result = await recordAndPresentInterruption(
+      database,
+      configuration,
+      episode,
+      errorClass,
+      interruptedAt,
+    );
+    if (result.recorded) {
       interruptedEpisodes += 1;
     }
   }
@@ -713,7 +712,7 @@ async function recordAndPresentInterruption(
   episode: EpisodeRow,
   errorClass: ConnectedPathInterruptionClass,
   interruptedAt: string,
-): Promise<boolean> {
+): Promise<{ readonly recorded: boolean }> {
   const result = database
     .prepare(
       `INSERT OR IGNORE INTO episode_interruptions
@@ -725,7 +724,7 @@ async function recordAndPresentInterruption(
   if (interruption !== undefined) {
     await presentInterruption(database, configuration, episode, interruption);
   }
-  return result.changes === 1;
+  return { recorded: result.changes === 1 };
 }
 
 function findEpisodeInterruption(

@@ -1757,6 +1757,46 @@ describe("Discord Episode Agent conversation", () => {
     runtime.close();
   });
 
+  it("preserves the last acknowledged response after continuation rejection", async () => {
+    const agent = new RejectingContinuationEpisodeAgent();
+    const fixture = await openProposalFixture({ agent });
+
+    await expect(
+      fixture.runtime.handleDiscordMessage(
+        discordMessage("successful-event", "@Coloop answer first"),
+      ),
+    ).resolves.toEqual({ ok: true, status: "completed" });
+    await expect(
+      fixture.runtime.handleDiscordMessage(
+        discordMessage("rejected-continuation", "@Coloop continue"),
+      ),
+    ).resolves.toMatchObject({ ok: false, code: "AGENT_PROVIDER_FAILED" });
+    await expect(
+      fixture.runtime.handleDiscordMessage(
+        discordMessage("later-event", "@Coloop do not resume"),
+      ),
+    ).resolves.toMatchObject({ ok: false, code: "EPISODE_INTERRUPTED" });
+
+    expect(agent.messages).toEqual(["@Coloop answer first", "@Coloop continue"]);
+    const database = new DatabaseSync(fixture.databasePath);
+    expect(
+      database
+        .prepare(
+          `SELECT episodes.phase, episodes.agent_previous_response_id,
+                  episode_interruptions.error_class
+           FROM episodes JOIN episode_interruptions
+             ON episode_interruptions.episode_id = episodes.id`,
+        )
+        .get(),
+    ).toEqual({
+      phase: "ACTIVE",
+      agent_previous_response_id: "response-1",
+      error_class: "AGENT_CONTINUATION_REJECTED",
+    });
+    database.close();
+    fixture.runtime.close();
+  });
+
   it("does not acknowledge begin, append, or completion delivery failures", async () => {
     const boundaries = [
       { failure: "begin" as const, effects: [] },
@@ -3485,6 +3525,27 @@ class DeferredSecondProposalEpisodeAgent extends DeferredProposalEpisodeAgent {
 class FailingEpisodeAgent implements EpisodeAgentTransport {
   async streamResponse(): ReturnType<EpisodeAgentTransport["streamResponse"]> {
     return { ok: false, reason: "provider-failed" };
+  }
+
+  async synthesizeOutcomeProposal(): ReturnType<
+    EpisodeAgentTransport["synthesizeOutcomeProposal"]
+  > {
+    return { ok: false, reason: "provider-failed" };
+  }
+}
+
+class RejectingContinuationEpisodeAgent implements EpisodeAgentTransport {
+  readonly messages: string[] = [];
+
+  async streamResponse(
+    input: Parameters<EpisodeAgentTransport["streamResponse"]>[0],
+  ): ReturnType<EpisodeAgentTransport["streamResponse"]> {
+    this.messages.push(input.message);
+    if (this.messages.length > 1) {
+      return { ok: false, reason: "provider-failed" };
+    }
+    const delivery = await input.onTextDelta("First answer");
+    return delivery.ok ? { ok: true, responseId: "response-1" } : delivery;
   }
 
   async synthesizeOutcomeProposal(): ReturnType<
