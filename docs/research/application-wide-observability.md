@@ -511,6 +511,41 @@ PostHog's event model to data destinations, not a lossless round-trip OTel strea
 Fan-out before ingestion and retain the schema in code; never treat vendor export as
 the exit plan. [PostHog batch exports](https://posthog.com/docs/cdp/batch-exports)
 
+## User-reported experience
+
+User reviews are directional evidence, not capability proof. Review platforms may
+contain incentivized submissions and AI-generated summaries; community threads are
+self-selecting, tiny samples, and sometimes written by vendors or competing-tool
+builders. The broad Product Analytics review base and the sparse, beta-era Logs
+feedback must not be treated as equally mature evidence.
+
+| Surface | What users report liking | What users report struggling with | Consequence for Coloop |
+| --- | --- | --- | --- |
+| Product Analytics and the wider PostHog suite | G2 shows 4.5/5 across 1,045 reviews, with 81.1% from small businesses. Its summary emphasizes easy setup, developer friendliness, comprehensive analytics, useful insights, integration, and a generous entry tier; topic counts include 226 ease-of-use, 188 easy-setup, 176 analytics, and 149 insights mentions. | The same page shows substantial friction: 120 learning-curve, 95 steep-learning-curve, 70 complexity, and 69 confusion mentions. A separate practitioner discussion describes setup as engineering-friendly but everyday self-service as weaker than some alternatives, with manual jumps between analytics, code, and the application database. A PostHog community thread contains repeated new-user reports of overwhelming navigation and low nontechnical-team adoption; PostHog staff solicited workflow recordings in response. | Do not hand the Owner an empty dashboard builder. Ship the three named views, fixed event definitions, and a one-page question-to-view guide. Test task completion, not merely successful ingestion. |
+| PostHog Logs | In the small dedicated beta thread, one backend user reported very easy setup and no complaints, while another staging user found it helpful for troubleshooting. A separate small-application operator reported using Logs plus alerts and called setup easy and the free tier generous. | The same beta thread starts with confusion about when to use a product event versus a log, includes a user intending to move to Prometheus/Grafana, and does not establish production-scale experience. One [competing-tool builder](https://www.reddit.com/r/IMadeThis/comments/1tohjz4/i_made_a_easieri_hope_logging_solution_with_web/) characterized Logs as secondary rather than first-class; that source is explicitly promotional and carries little weight. | Treat Logs as promising convenience, not validated operations infrastructure. Teach the event/log boundary, retain local diagnostics, and keep the seven-day Grafana benchmark and split gate. |
+
+These patterns come from [G2's PostHog review corpus](https://www.g2.com/products/posthog/reviews),
+a [practitioner discussion of analytics workflow](https://www.reddit.com/r/analytics/comments/1rkyo1q/after_5_years_at_google_and_building_my_own_app_i/),
+the PostHog community's [new-user UX discussion](https://www.reddit.com/r/posthog/comments/1qg7n2n/the_ux_is_just_terrible_new_user_rant/),
+the dedicated [PostHog Logs beta discussion](https://www.reddit.com/r/posthog/comments/1qi5am3/anyone_using_the_new_logs_feature_in_beta/),
+and a small-team [monitoring discussion](https://www.reddit.com/r/microsaas/comments/1v05p74/ai_will_help_you_build_it_it_wont_tell_you_when/).
+They support the initial trial but are not strong enough to remove any maturity gate.
+
+There is also harder operational evidence behind that caution. PostHog's own
+postmortem says its US Logs product lost data older than three days during a February
+2026 incident because an experimental ClickHouse replication configuration deleted
+shared objects and cold-data integrity was not monitored. PostHog restored the recent
+Kafka window and documented corrective work, but the incident demonstrates why Logs
+must remain a disposable diagnostic copy rather than Coloop's audit or recovery
+record. [PostHog Logs data-loss postmortem](https://github.com/PostHog/post-mortems/blob/main/2026-02-20-posthog-us-logs-data-loss.md)
+
+The review evidence therefore sharpens rather than changes the backend verdict.
+Confidence in Product Analytics fit for this trial is moderate-to-high; confidence
+in Logs is low and unproven. Product Analytics has enough real-user adoption to
+justify a bounded trial, while Logs still needs direct Coloop usability and
+reliability evidence before it displaces a mature operational backend. The G2 rating
+is suite-wide evidence and is explicitly **not** evidence that Logs is mature.
+
 ## Minimum views
 
 ### Dashboard 1: product activation and value
@@ -765,7 +800,8 @@ shorten the ring without changing recovery.
 ### Access and deletion
 
 - Use one dedicated PostHog project for the private trial and the selected US/EU
-  region. Membership is the Owner and at most one named maintainer/reviewer.
+  region. Membership is the Owner and one named, consented maintainer/reviewer who
+  participates in the usability check.
 - Store only the project ingestion token on the Owner's machine, in the selected OS
   secret boundary. Do not install a PostHog personal API key in the runtime.
 - Do not batch-export or copy full Agent traces into a warehouse.
@@ -918,6 +954,9 @@ full-trace disclosure in every affected Episode.
 ### Before real use
 
 - Schema tests enumerate every accepted/rejected event and attribute.
+- Give the Owner and named reviewer a one-page guide that distinguishes product
+  events, operational logs, application metrics/spans, and full Agent traces, then
+  names the exact view for each supported question.
 - Sentinel tests cover credentials, Context Package, Opening Brief, Discord text,
   Agent reply, tool data, Outcome Proposal, Episode Outcome, raw IDs, hashes, paths,
   provider errors, and serialized `RunState`.
@@ -928,6 +967,10 @@ full-trace disclosure in every affected Episode.
   and Outcome delivery with telemetry `off`, `local`, and failing `posthog` modes.
 - Synthetic operations exercise every dashboard and alert threshold, including alert
   firing, recovery, and broken evaluation visibility.
+- Send a known-count structured Logs fixture and verify attribute search, safe-ID
+  log-to-trace correlation, ingest delay, saved-query reproducibility, and alert
+  fire/resolve behavior. Compare received IDs with the local fixture manifest rather
+  than trusting an aggregate count.
 
 ### During the real trial
 
@@ -946,6 +989,11 @@ scorecard:
   monthly price did the installation generate?
 - Did any query require a raw identifier, content field, or unbounded label? If so,
   reject the query rather than expanding the schema silently.
+- After no more than a 30-minute walkthrough, could the Owner and the named reviewer
+  who did not author the views find the activation funnel, a terminal Outcome return,
+  an injected provider failure, and the matching content-safe log/trace without using
+  HogQL, PostHog AI, vendor support, or schema changes? Record time, wrong turns, and
+  abandoned tasks.
 
 ### Seven-day split benchmark
 
@@ -984,6 +1032,18 @@ Keep PostHog as the single remote v0 backend only if all are true:
    is recorded before promising trial teardown.
 9. The Collector can route the same sanitized operational fixture to Grafana without
    application code or schema changes.
+10. After one 30-minute walkthrough, the Owner and the named reviewer who did not
+    author the views each complete the four review tasks above in five minutes per
+    task on two separate trial days. A curated dashboard that only its author can
+    navigate does not pass.
+11. Under a healthy exporter, every safe correlation ID in the known-count Logs
+    fixture becomes queryable within five minutes, its saved query remains
+    reproducible seven days later, and every missing or duplicate record is explained
+    by an injected failure. This tests diagnostic usefulness, not durable storage.
+
+Record separate `keep`, `split`, or `stop` verdicts for Product/AI and operational
+telemetry. A Logs failure moves operational OTLP to Grafana—or ends remote operational
+export—without invalidating useful Product Analytics or AI Observability.
 
 Split operational telemetry to Grafana Cloud if any required PostHog metric/trace
 query or alert cannot be expressed, if alpha/beta changes break it twice during the
@@ -1062,10 +1122,14 @@ Phase remains unchanged.
    replaceable views.** Stable local JSON diagnostics and app-owned OTel schemas are
    the safety layer. Use Grafana Cloud as the measured split fallback, not an upfront
    dependency.
-6. **Keep every observability path lossy and outside recovery.** No telemetry outbox,
+6. **Validate each surface independently.** Broad Product Analytics reviews do not
+   establish Logs maturity. Prebuild the minimum views, require a fresh reviewer to
+   complete the diagnostic tasks, and let a Logs failure move only operational OTLP
+   to Grafana.
+7. **Keep every observability path lossy and outside recovery.** No telemetry outbox,
    replay, vendor-generated recovery decision, raw ID, content copy, or phase change
    on observability failure.
-7. **Bound privacy, cost, and time.** Dedicated project, named access, full-trace
+8. **Bound privacy, cost, and time.** Dedicated project, named access, full-trace
    trial consent, 30 Episodes/300 turns/30 days, project teardown, hard $10/month cap,
    and explicit keep/split/stop gates.
 
@@ -1077,6 +1141,10 @@ Phase remains unchanged.
 - PostHog application metrics is alpha and distributed tracing beta; endpoints,
   query behavior, and schemas may change. The Collector and versioned adapter are the
   exit mechanism.
+- Independent PostHog Logs experience evidence is still a handful of beta-era
+  anecdotes rather than a representative review base. The Coloop trial must produce
+  its own task-completion and diagnostic evidence before Logs is treated as a
+  durable backend choice.
 - OTel JavaScript logs and GenAI semantic conventions are still developing. The
   canonical Coloop application log/product schema must remain independent of
   library-specific types. If a portable Agent projection is later approved, its
