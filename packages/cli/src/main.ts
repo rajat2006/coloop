@@ -11,7 +11,7 @@ import { runCli } from "./run-cli.js";
 const dependencies = createProductionDependencies({
   args: [fileURLToPath(import.meta.url)],
   command: process.execPath,
-});
+}, process.env);
 
 const args = process.argv.slice(2);
 // Codex installs these two internal entry points; setup and run remain the Owner-facing CLI.
@@ -20,6 +20,9 @@ if (args[0] === "mcp") {
 } else if (args[0] === "codex-hook") {
   const promptReturner = createCodexPromptReturner({
     databasePath: getInstallationPaths(process.env).databaseFile,
+    ...(dependencies.telemetry === undefined
+      ? {}
+      : { telemetry: dependencies.telemetry }),
   });
   process.exitCode = await runCodexHook(
     args[1],

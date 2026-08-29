@@ -181,6 +181,7 @@ interface RuntimeConfiguration {
 interface CodexPromptReturnerConfiguration {
   readonly databasePath: string;
   readonly now?: () => Date;
+  readonly telemetry?: ApplicationTelemetry;
 }
 
 interface TrustedHook {
@@ -266,6 +267,7 @@ export function createCodexPromptReturner(
           hook.value,
           input.inject,
           configuration.now ?? (() => new Date()),
+          configuration.telemetry,
         );
       } finally {
         database.close();
@@ -445,13 +447,39 @@ export function createColoopRuntime(configuration: RuntimeConfiguration): CodexE
       if (result.ok && request.value.operation !== "get_episode") {
         recordCompletedOperation(database, hook.value, request.value, result.episode.id, now());
       }
+      if (result.ok) {
+        const row = findById(database, result.episode.id);
+        if (row !== undefined) {
+          emitTelemetry(configuration, {
+            schemaVersion: 1,
+            stream: "product",
+            name: "episode.control",
+            occurredAt: now().toISOString(),
+            telemetryEpisodeId: row.telemetry_id,
+            attributes: {
+              control: request.value.operation.replace("_episode", ""),
+              result:
+                request.value.operation === "open_episode" && result.created === false
+                  ? "duplicate"
+                  : "succeeded",
+              authorizationResult: "allowed",
+            },
+          });
+        }
+      }
       return result;
     },
 
     async handleCodexPromptSubmit(input): Promise<CodexPromptReturnResult> {
       const hook = parseTrustedPromptHook(input.hook);
       if (!hook.ok) return hook;
-      return await returnPendingOutcome(database, hook.value, input.inject, now);
+      return await returnPendingOutcome(
+        database,
+        hook.value,
+        input.inject,
+        now,
+        configuration.telemetry,
+      );
     },
     async handleDiscordMessage(input): Promise<DiscordMessageResult> {
       const event = parseDiscordMessageEvent(input);
@@ -755,6 +783,24 @@ async function recordAndPresentInterruption(
           : {}),
       },
     });
+    if (
+      errorClass === "AGENT_PROVIDER_FAILED" ||
+      errorClass === "AGENT_CONTINUATION_REJECTED"
+    ) {
+      emitTelemetry(configuration, {
+        schemaVersion: 1,
+        stream: "operational",
+        name: "provider.call",
+        occurredAt: interruptedAt,
+        telemetryEpisodeId: episode.telemetry_id,
+        attributes: {
+          provider: "openai",
+          operation: "stream",
+          result: "failed",
+          errorClass,
+        },
+      });
+    }
   }
   if (interruption !== undefined) {
     await presentInterruption(database, configuration, episode, interruption);
@@ -1059,7 +1105,7 @@ async function processDiscordMessage(
       )
       .run(completedAt, `agent-response:${input.eventId}`);
   });
-  emitSuccessfulAgentRun(configuration, episode, completedAt);
+  emitSuccessfulAgentRun(configuration, episode, completedAt, "stream");
   const current = findActiveByDiscord(database, input.guildId, input.threadId);
   if (
     episode.proposal_revision_id !== null &&
@@ -1325,7 +1371,7 @@ async function synthesizeOutcomeProposal(
       )
       .run(completedAt, `proposal:${input.eventId}`);
   });
-  emitSuccessfulAgentRun(configuration, episode, completedAt);
+  emitSuccessfulAgentRun(configuration, episode, completedAt, "synthesize");
   return { ok: true, status: "completed" };
 }
 
@@ -1541,6 +1587,8 @@ async function openEpisode(
     telemetryEpisodeId: row.telemetry_id,
     attributes: { phase: "ACTIVE", result: "succeeded" },
   });
+  emitSuccessfulWrite(configuration, row, activatedAt);
+  emitSuccessfulDelivery(configuration, row, activatedAt);
   return { ok: true, created: true, episode: toView(row) };
 }
 
@@ -1626,6 +1674,7 @@ async function cancelEpisode(
     telemetryEpisodeId: row.telemetry_id,
     attributes: { phase: "CANCELLED", result: "succeeded" },
   });
+  emitSuccessfulWrite(configuration, row, cancelledAt);
   const cancelled = findById(database, row.id);
   if (cancelled === undefined) throw new Error("Cancelled Episode was not found.");
   const delivery = await deliverPendingCancellation(database, configuration, cancelled, now);
@@ -1802,6 +1851,7 @@ async function finalizeEpisode(
     telemetryEpisodeId: episode.telemetry_id,
     attributes: { phase: "FINALIZED", result: "succeeded" },
   });
+  emitSuccessfulWrite(configuration, episode, finalizedAt);
 
   const delivery = await deliverPendingFinalization(
     database,
@@ -2046,6 +2096,7 @@ async function returnPendingOutcome(
   hook: TrustedPromptHook,
   inject: (additionalContext: string) => Promise<void>,
   now: () => Date,
+  telemetry?: ApplicationTelemetry,
 ): Promise<CodexPromptReturnResult> {
   let episode: EpisodeRow | undefined;
   try {
@@ -2114,6 +2165,14 @@ async function returnPendingOutcome(
       "The Episode Outcome return could not be acknowledged safely.",
     );
   }
+  emitTelemetry({ telemetry }, {
+    schemaVersion: 1,
+    stream: "product",
+    name: "episode.return",
+    occurredAt: returnedAt,
+    telemetryEpisodeId: episode.telemetry_id,
+    attributes: { result: "succeeded" },
+  });
   return { ok: true, status: "returned" };
 }
 
@@ -2301,7 +2360,7 @@ function failure(code: string, reason: string): { readonly ok: false; readonly c
 }
 
 function emitTelemetry(
-  configuration: RuntimeConfiguration,
+  configuration: { readonly telemetry?: ApplicationTelemetry },
   envelope: TelemetryEnvelope,
 ): void {
   try {
@@ -2315,6 +2374,7 @@ function emitSuccessfulAgentRun(
   configuration: RuntimeConfiguration,
   episode: EpisodeRow,
   occurredAt: string,
+  operation: "stream" | "synthesize",
 ): void {
   emitTelemetry(configuration, {
     schemaVersion: 1,
@@ -2323,6 +2383,45 @@ function emitSuccessfulAgentRun(
     occurredAt,
     telemetryEpisodeId: episode.telemetry_id,
     attributes: { result: "succeeded", acceptedTurns: 1 },
+  });
+  emitTelemetry(configuration, {
+    schemaVersion: 1,
+    stream: "operational",
+    name: "provider.call",
+    occurredAt,
+    telemetryEpisodeId: episode.telemetry_id,
+    attributes: { provider: "openai", operation, result: "succeeded" },
+  });
+  emitSuccessfulDelivery(configuration, episode, occurredAt);
+}
+
+function emitSuccessfulDelivery(
+  configuration: RuntimeConfiguration,
+  episode: EpisodeRow,
+  occurredAt: string,
+): void {
+  emitTelemetry(configuration, {
+    schemaVersion: 1,
+    stream: "operational",
+    name: "delivery",
+    occurredAt,
+    telemetryEpisodeId: episode.telemetry_id,
+    attributes: { destination: "discord", result: "succeeded" },
+  });
+}
+
+function emitSuccessfulWrite(
+  configuration: RuntimeConfiguration,
+  episode: EpisodeRow,
+  occurredAt: string,
+): void {
+  emitTelemetry(configuration, {
+    schemaVersion: 1,
+    stream: "operational",
+    name: "sqlite.operation",
+    occurredAt,
+    telemetryEpisodeId: episode.telemetry_id,
+    attributes: { operation: "write", result: "succeeded" },
   });
 }
 

@@ -21,6 +21,7 @@
     "@coloop/core": "workspace:*",
     "@coloop/discord": "workspace:*",
     "@coloop/local-storage": "workspace:*",
-    "@coloop/openai-agents": "workspace:*"
+    "@coloop/openai-agents": "workspace:*",
+    "@coloop/observability": "workspace:*"
   }
 }

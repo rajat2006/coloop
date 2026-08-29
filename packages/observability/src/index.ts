@@ -131,13 +131,14 @@ export function createApplicationTelemetry(
     record(value): TelemetryRecordResult {
       const parsed = parseEnvelope(value);
       if (!parsed.ok) return parsed;
-      configuration.localDiagnostic?.(parsed.envelope);
+      reportLocalDiagnostic(configuration, parsed.envelope);
       const exporter = parsed.envelope.stream === "product"
         ? configuration.productExporter
         : configuration.operationalExporter;
       if (exporter === undefined) return { ok: true };
       if (buffer.length >= configuration.capacity) {
         dropped += 1;
+        reportExporterHealth(configuration, parsed.envelope, "dropped", "buffer-full");
         return { ok: false, reason: "buffer-full" };
       }
       buffer.push(parsed.envelope);
@@ -169,6 +170,7 @@ export function createApplicationTelemetry(
                 exported += 1;
               } catch {
                 failed += 1;
+                reportExporterHealth(configuration, envelope, "failed", "export-failed");
               }
             }
           }
@@ -184,6 +186,40 @@ export function createApplicationTelemetry(
     },
   };
   return telemetry;
+}
+
+function reportExporterHealth(
+  configuration: ApplicationTelemetryConfiguration,
+  source: TelemetryEnvelope,
+  result: "failed" | "dropped",
+  errorClass: "export-failed" | "buffer-full",
+): void {
+  reportLocalDiagnostic(configuration, {
+    schemaVersion: 1,
+    stream: "operational",
+    name: "exporter.health",
+    occurredAt: new Date().toISOString(),
+    ...(source.telemetryEpisodeId === undefined
+      ? {}
+      : { telemetryEpisodeId: source.telemetryEpisodeId }),
+    attributes: {
+      destination: source.stream === "product" ? "posthog" : "otlp",
+      result,
+      errorClass,
+      ...(result === "dropped" ? { droppedCount: 1 } : {}),
+    },
+  });
+}
+
+function reportLocalDiagnostic(
+  configuration: ApplicationTelemetryConfiguration,
+  envelope: TelemetryEnvelope,
+): void {
+  try {
+    configuration.localDiagnostic?.(envelope);
+  } catch {
+    // Local diagnostic adapters are observational and cannot affect callers.
+  }
 }
 
 export function createPrivateTrialTelemetry(configuration: {

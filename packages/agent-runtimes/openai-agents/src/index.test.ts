@@ -173,7 +173,7 @@ describe("Episode Agent contract", () => {
       retentionAndDeletionVerified: true,
       trialStartedAt: "2026-08-01T00:00:00.000Z",
       consentingEpisodes: 1,
-      acceptedAgentTurns: 1,
+      acceptedAgentTurns: 299,
       billingEnabled: false,
       monthlyObservabilitySpendUsd: 0,
       killSwitch: () => false,
@@ -192,7 +192,10 @@ describe("Episode Agent contract", () => {
     });
 
     expect(exported).toEqual([]);
-    expect(policy.decide("Another safe turn.")).toEqual({ enabled: true });
+    expect(policy.decide("Another safe turn.")).toEqual({
+      enabled: false,
+      reason: "trial-ended",
+    });
   });
 
   test("filters complete SDK trace lifecycles containing credentials", async () => {

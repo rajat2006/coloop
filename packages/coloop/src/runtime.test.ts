@@ -58,7 +58,7 @@ describe("Codex Episode operations", () => {
       discordMessage("agent-event-1", "@Coloop compare the rollout options."),
     );
 
-    expect(envelopes).toEqual([
+    expect(envelopes.slice(0, 2)).toEqual([
       {
         schemaVersion: 1,
         stream: "product",
@@ -75,15 +75,25 @@ describe("Codex Episode operations", () => {
         telemetryEpisodeId: "correlation-a",
         attributes: { phase: "ACTIVE", result: "succeeded" },
       },
-      {
-        schemaVersion: 1,
-        stream: "operational",
-        name: "agent.run",
-        occurredAt: "2026-08-29T12:00:00.000Z",
-        telemetryEpisodeId: "correlation-a",
-        attributes: { result: "succeeded", acceptedTurns: 1 },
-      },
     ]);
+    expect(envelopes.map(({ name }) => name)).toEqual([
+      "episode.lifecycle",
+      "episode.lifecycle",
+      "sqlite.operation",
+      "delivery",
+      "episode.control",
+      "agent.run",
+      "provider.call",
+      "delivery",
+    ]);
+    expect(envelopes.find(({ name }) => name === "agent.run")).toEqual({
+      schemaVersion: 1,
+      stream: "operational",
+      name: "agent.run",
+      occurredAt: "2026-08-29T12:00:00.000Z",
+      telemetryEpisodeId: "correlation-a",
+      attributes: { result: "succeeded", acceptedTurns: 1 },
+    });
     expect(JSON.stringify(envelopes)).not.toContain("episode-1");
     expect(JSON.stringify(envelopes)).not.toContain("Choose a rollout plan");
     const database = new DatabaseSync(fixture.databasePath);
@@ -149,6 +159,10 @@ describe("Codex Episode operations", () => {
     const finalization = finalizationInteraction("proposal-revision-1");
     await finalizedFixture.runtime.handleDiscordFinalization(finalization);
     await finalizedFixture.runtime.handleDiscordFinalization(finalization);
+    await finalizedFixture.runtime.handleCodexPromptSubmit({
+      hook: trustedPromptHook("origin-1", "return-turn"),
+      inject: async () => {},
+    });
     finalizedFixture.runtime.close();
 
     const cancelledFixture = await openProposalFixture({ telemetry });
@@ -202,6 +216,53 @@ describe("Codex Episode operations", () => {
     expect(
       envelopes.filter((envelope) => envelope.name === "discord.gateway"),
     ).toHaveLength(1);
+    expect(
+      envelopes.filter((envelope) => envelope.name === "episode.return"),
+    ).toHaveLength(1);
+  });
+
+  it("backfills a random telemetry identity when reopening legacy Episode state", async () => {
+    const fixture = await openProposalFixture({});
+    fixture.runtime.close();
+    const legacy = new DatabaseSync(fixture.databasePath);
+    const columns = legacy
+      .prepare("PRAGMA table_info(episodes)")
+      .all()
+      .map((column) => (column as { name: string }).name)
+      .filter((name) => name !== "telemetry_id")
+      .join(", ");
+    legacy.exec(
+      `CREATE TABLE legacy_episodes AS SELECT ${columns} FROM episodes;
+       DROP TABLE episodes;
+       ALTER TABLE legacy_episodes RENAME TO episodes;`,
+    );
+    legacy.close();
+
+    const reopened = createColoopRuntime({
+      databasePath: fixture.databasePath,
+      artifactDirectory: join(fixture.directory, "episodes"),
+      ownerDiscordUserId: "1001",
+      guildId: "2002",
+      parentChannelId: "3003",
+      discord: new RecordingDiscordTransport(),
+    });
+
+    await expect(
+      reopened.handleCodexOperation({
+        hook: trustedHook(
+          "origin-1",
+          join(fixture.directory, "rollout.jsonl"),
+          "get_episode",
+        ),
+        request: { operation: "get_episode", arguments: { episodeId: "episode-1" } },
+      }),
+    ).resolves.toMatchObject({ ok: true, episode: { phase: "ACTIVE" } });
+    reopened.close();
+    const migrated = new DatabaseSync(fixture.databasePath);
+    const row = migrated.prepare("SELECT telemetry_id FROM episodes").get();
+    expect(row).toEqual({ telemetry_id: expect.any(String) });
+    expect((row as { telemetry_id: string }).telemetry_id).not.toBe("episode-1");
+    migrated.close();
   });
 
   it("returns a finalized Outcome on the Origin Session's next prompt", async () => {

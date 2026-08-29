@@ -105,10 +105,14 @@ describe("content-safe application telemetry", () => {
   });
 
   test("drops bounded overflow and exporter failures without throwing", async () => {
+    const diagnostics: TelemetryEnvelope[] = [];
     const telemetry = createApplicationTelemetry({
       capacity: 1,
       productExporter: async () => {
         throw new Error("remote unavailable");
+      },
+      localDiagnostic: (envelope) => {
+        diagnostics.push(envelope);
       },
     });
     const event = {
@@ -126,6 +130,11 @@ describe("content-safe application telemetry", () => {
       failed: 1,
       dropped: 1,
     });
+    expect(
+      diagnostics
+        .filter(({ name }) => name === "exporter.health")
+        .map(({ attributes }) => attributes.result),
+    ).toEqual(["dropped", "failed"]);
   });
 
   test("configures PostHog as the automatically drained product destination", async () => {

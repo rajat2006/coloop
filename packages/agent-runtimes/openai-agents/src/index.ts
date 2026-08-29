@@ -119,7 +119,6 @@ Synthesize the requested public Outcome Proposal from the authorized context and
     async streamResponse(input) {
       try {
         const trace = selectRunner(`${input.contextPackage}\n${input.message}`);
-        let completedText = "";
         const stream = await trace.runner.run(manager, input.message, {
           context: { contextPackage: input.contextPackage },
           maxTurns: 1,
@@ -129,7 +128,6 @@ Synthesize the requested public Outcome Proposal from the authorized context and
           stream: true,
         });
         for await (const delta of stream.toTextStream()) {
-          completedText += delta;
           const delivery = await input.onTextDelta(delta);
           if (!delivery.ok) return delivery;
         }
@@ -137,10 +135,7 @@ Synthesize the requested public Outcome Proposal from the authorized context and
         if (stream.lastResponseId === undefined) {
           return { ok: false, reason: "provider-failed" };
         }
-        if (
-          trace.sensitiveTraceEnabled &&
-          configuration.privateAgentTracePolicy?.decide(completedText).enabled === true
-        ) {
+        if (trace.sensitiveTraceEnabled) {
           configuration.privateAgentTracePolicy?.recordAcceptedAgentTurn();
         }
         return { ok: true, responseId: stream.lastResponseId };
@@ -161,12 +156,7 @@ Synthesize the requested public Outcome Proposal from the authorized context and
         if (result.lastResponseId === undefined || result.finalOutput === undefined) {
           return { ok: false, reason: "provider-failed" };
         }
-        if (
-          trace.sensitiveTraceEnabled &&
-          configuration.privateAgentTracePolicy?.decide(
-            JSON.stringify(result.finalOutput),
-          ).enabled === true
-        ) {
+        if (trace.sensitiveTraceEnabled) {
           configuration.privateAgentTracePolicy?.recordAcceptedAgentTurn();
         }
         return {
