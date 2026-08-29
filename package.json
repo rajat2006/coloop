@@ -8,6 +8,7 @@
   },
   "scripts": {
     "ci:product": "pnpm run typecheck && pnpm run test",
+    "prototype:owner-setup": "node prototypes/owner-installation-discord-pairing/server.mjs",
     "test": "pnpm --dir .sandcastle test",
     "typecheck": "pnpm --dir .sandcastle typecheck"
   }
