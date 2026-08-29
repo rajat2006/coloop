@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type {
@@ -7,6 +7,8 @@ import type {
   EpisodeToolArguments,
 } from "./codex-episode-contract";
 
+// PRD #41 fixes terminal Context Package retention at 72 hours; changing this
+// alters the Owner-approved disclosure lifecycle.
 const contextPackageRetentionMs = 72 * 60 * 60 * 1_000;
 
 export type EpisodePhase = "OPENING" | "ACTIVE" | "FINALIZED" | "CANCELLED";
@@ -214,7 +216,7 @@ export function createColoopRuntime(configuration: RuntimeConfiguration): CodexE
               input.approval,
               hook.value.toolUseId,
               "cancel_episode",
-              digest(JSON.stringify(request.value.arguments)),
+              cancellationApprovalDigest(request.value.arguments),
             )
           ) {
             result = failure(
@@ -280,39 +282,50 @@ async function openEpisode(
   const contextDigest = digest(input.contextMarkdown);
   const createdAt = now().toISOString();
 
-  inTransaction(database, () => {
-    database
-      .prepare(
-        `INSERT INTO episodes (
-          id, origin_session_id, origin_turn_id, owner_discord_user_id, guild_id,
-          parent_channel_id, phase, phase_version, original_question, opening_brief,
-          context_reference, context_digest, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'OPENING', 1, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
+  try {
+    inTransaction(database, () => {
+      database
+        .prepare(
+          `INSERT INTO episodes (
+            id, origin_session_id, origin_turn_id, owner_discord_user_id, guild_id,
+            parent_channel_id, phase, phase_version, original_question, opening_brief,
+            context_reference, context_digest, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, 'OPENING', 1, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          episodeId,
+          input.originSessionId,
+          input.originTurnId,
+          configuration.ownerDiscordUserId,
+          configuration.guildId,
+          configuration.parentChannelId,
+          input.originalQuestion,
+          input.openingBrief,
+          contextReference,
+          contextDigest,
+          createdAt,
+          createdAt,
+        );
+      addAudit(database, episodeId, 1, "EPISODE_OPENING", "owner", createdAt);
+      addPendingOpeningOutbox(
+        database,
         episodeId,
-        input.originSessionId,
-        input.originTurnId,
-        configuration.ownerDiscordUserId,
-        configuration.guildId,
         configuration.parentChannelId,
-        input.originalQuestion,
-        input.openingBrief,
-        contextReference,
-        contextDigest,
-        createdAt,
         createdAt,
       );
-    addAudit(database, episodeId, 1, "EPISODE_OPENING", "owner", createdAt);
-    addPendingOpeningOutbox(
-      database,
-      episodeId,
-      configuration.parentChannelId,
-      createdAt,
-    );
-  });
+    });
+  } catch (error) {
+    const winner = findByOrigin(database, input.originSessionId);
+    if (winner === undefined) throw error;
+    if (winner.id !== episodeId) {
+      await rm(episodeDirectory, { recursive: true, force: true });
+    }
+    return { ok: true, created: false, episode: toView(winner) };
+  }
 
-  let provisioned: { readonly threadId: string; readonly threadUrl: string };
+  let provisioned: Awaited<
+    ReturnType<DiscordEpisodeTransport["provisionEpisode"]>
+  >;
   try {
     provisioned = await configuration.discord.provisionEpisode({
       idempotencyKey: `episode-opened:${episodeId}`,
@@ -682,50 +695,43 @@ function parseCodexRequest(
   return invalidOperation();
 }
 
-export function createOwnerApproval(input: {
+type OpenEpisodeApprovalInput = {
   readonly toolUseId: string;
   readonly operation: "open_episode";
-  readonly openingBrief: EpisodeToolArguments["open_episode"]["openingBrief"];
-  readonly originalRequest: EpisodeToolArguments["open_episode"]["originalRequest"];
   readonly contextMarkdown: string;
-}): object;
-export function createOwnerApproval(input: {
+} & EpisodeToolArguments["open_episode"];
+
+type CancelEpisodeApprovalInput = {
   readonly toolUseId: string;
   readonly operation: "cancel_episode";
-  readonly episodeId: EpisodeToolArguments["cancel_episode"]["episodeId"];
-  readonly reason?: EpisodeToolArguments["cancel_episode"]["reason"];
-}): object;
+} & EpisodeToolArguments["cancel_episode"];
+
+export function createOwnerApproval(input: OpenEpisodeApprovalInput): object;
+export function createOwnerApproval(input: CancelEpisodeApprovalInput): object;
 export function createOwnerApproval(
-  input:
-    | {
-        readonly toolUseId: string;
-        readonly operation: "open_episode";
-        readonly openingBrief: string;
-        readonly originalRequest: string;
-        readonly contextMarkdown: string;
-      }
-    | {
-        readonly toolUseId: string;
-        readonly operation: "cancel_episode";
-        readonly episodeId: string;
-        readonly reason?: string;
-      },
+  input: OpenEpisodeApprovalInput | CancelEpisodeApprovalInput,
 ): object {
   const inputDigest =
     input.operation === "open_episode"
       ? openApprovalDigest(input, input.contextMarkdown)
-      : digest(
-          JSON.stringify({
-            episodeId: input.episodeId,
-            ...(input.reason === undefined ? {} : { reason: input.reason }),
-          }),
-        );
+      : cancellationApprovalDigest(input);
   return {
     source: "trusted_owner_approval",
     toolUseId: input.toolUseId,
     operation: input.operation,
     inputDigest,
   };
+}
+
+function cancellationApprovalDigest(
+  input: EpisodeToolArguments["cancel_episode"],
+): string {
+  return digest(
+    JSON.stringify({
+      episodeId: input.episodeId,
+      ...(input.reason === undefined ? {} : { reason: input.reason }),
+    }),
+  );
 }
 
 function openApprovalDigest(

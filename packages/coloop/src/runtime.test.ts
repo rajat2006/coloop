@@ -635,6 +635,70 @@ describe("Codex Episode operations", () => {
     runtime.close();
   });
 
+  it("returns one durable winner for overlapping opens from an Origin Session", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "coloop-concurrent-open-"));
+    temporaryDirectories.push(directory);
+    const transcriptPath = join(directory, "rollout.jsonl");
+    const secondToolCall = {
+      type: "response_item",
+      payload: {
+        type: "function_call",
+        call_id: "tool-use-2",
+        name: "mcp__coloop__open_episode",
+        arguments: "{}",
+      },
+    };
+    await writeFile(
+      transcriptPath,
+      `${fixtureTranscript("origin-1", [ownerMessage("Ask for input.")])}\n${JSON.stringify(secondToolCall)}`,
+    );
+    const discord = new RecordingDiscordTransport();
+    let nextId = 1;
+    const runtime = createColoopRuntime({
+      databasePath: join(directory, "coloop.sqlite"),
+      artifactDirectory: join(directory, "episodes"),
+      ownerDiscordUserId: "1001",
+      guildId: "2002",
+      parentChannelId: "3003",
+      discord,
+      createId: () => `episode-${nextId++}`,
+    });
+    const request = {
+      operation: "open_episode",
+      arguments: { openingBrief: "# Input", originalRequest: "Ask for input." },
+    };
+    const secondHook = trustedHook("origin-1", transcriptPath);
+    const operations = [
+      runtime.handleCodexOperation({
+        hook: trustedHook("origin-1", transcriptPath),
+        approval: approveOwnerOnlyOpen("tool-use-1", "# Input", "Ask for input."),
+        request,
+      }),
+      runtime.handleCodexOperation({
+        hook: {
+          ...secondHook,
+          payload: { ...secondHook.payload, tool_use_id: "tool-use-2" },
+        },
+        approval: approveOwnerOnlyOpen("tool-use-2", "# Input", "Ask for input."),
+        request,
+      }),
+    ];
+
+    const results = await Promise.all(operations);
+    expect(results.map((result) => result.ok && result.created).sort()).toEqual([
+      false,
+      true,
+    ]);
+    expect([
+      ["episode-1", "episode-1"],
+      ["episode-2", "episode-2"],
+    ]).toContainEqual(
+      results.map((result) => (result.ok ? result.episode.id : undefined)),
+    );
+    expect(discord.effects).toHaveLength(3);
+    runtime.close();
+  });
+
   it("blocks high-confidence credentials before creating Discord effects", async () => {
     const directory = await mkdtemp(join(tmpdir(), "coloop-secret-"));
     temporaryDirectories.push(directory);
@@ -901,7 +965,7 @@ class DeferredDiscordTransport implements DiscordEpisodeTransport {
 
   async provisionEpisode(
     input: Parameters<DiscordEpisodeTransport["provisionEpisode"]>[0],
-  ): Promise<{ readonly threadId: string; readonly threadUrl: string }> {
+  ): ReturnType<DiscordEpisodeTransport["provisionEpisode"]> {
     this.effects.push({ kind: "create_private_thread", episodeId: input.episodeId });
     this.resolveProvisionStarted();
     await this.finishProvisioningPromise;
