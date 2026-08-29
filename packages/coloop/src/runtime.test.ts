@@ -198,6 +198,81 @@ describe("Codex Episode operations", () => {
     fixture.runtime.close();
   });
 
+  it("lets only one overlapping next-prompt hook claim the pending Outcome", async () => {
+    const fixture = await openProposalFixture({});
+    await fixture.runtime.handleDiscordMessage({
+      ...discordMessage("proposal-event-1", "@Coloop create an Outcome Proposal."),
+      authorDiscordUserId: "1001",
+    });
+    await fixture.runtime.handleDiscordFinalization(
+      finalizationInteraction("proposal-revision-1"),
+    );
+    let releaseInjection: (() => void) | undefined;
+    let markInjectionStarted: (() => void) | undefined;
+    const injectionStarted = new Promise<void>((resolve) => {
+      markInjectionStarted = resolve;
+    });
+    const injectionGate = new Promise<void>((resolve) => {
+      releaseInjection = resolve;
+    });
+    const injected: string[] = [];
+
+    const first = fixture.runtime.handleCodexPromptSubmit({
+      hook: trustedPromptHook("origin-1", "first-turn"),
+      inject: async (context) => {
+        injected.push(context);
+        markInjectionStarted?.();
+        await injectionGate;
+      },
+    });
+    await injectionStarted;
+    await expect(
+      fixture.runtime.handleCodexPromptSubmit({
+        hook: trustedPromptHook("origin-1", "overlapping-turn"),
+        inject: async (context) => {
+          injected.push(context);
+        },
+      }),
+    ).resolves.toEqual({ ok: true, status: "nothing-pending" });
+    releaseInjection?.();
+    await expect(first).resolves.toEqual({ ok: true, status: "returned" });
+    expect(injected).toHaveLength(1);
+    fixture.runtime.close();
+  });
+
+  it("does not clear pending state when return acknowledgement loses its claim", async () => {
+    const fixture = await openProposalFixture({});
+    await fixture.runtime.handleDiscordMessage({
+      ...discordMessage("proposal-event-1", "@Coloop create an Outcome Proposal."),
+      authorDiscordUserId: "1001",
+    });
+    await fixture.runtime.handleDiscordFinalization(
+      finalizationInteraction("proposal-revision-1"),
+    );
+
+    await expect(
+      fixture.runtime.handleCodexPromptSubmit({
+        hook: trustedPromptHook("origin-1", "lost-claim-turn"),
+        inject: async () => {
+          const database = new DatabaseSync(fixture.databasePath);
+          database.prepare("UPDATE episodes SET return_claim_turn_id = NULL").run();
+          database.close();
+        },
+      }),
+    ).resolves.toMatchObject({
+      ok: false,
+      code: "RETURN_ACKNOWLEDGEMENT_FAILED",
+    });
+    const database = new DatabaseSync(fixture.databasePath);
+    expect(
+      database
+        .prepare("SELECT phase, return_pending, returned_at FROM episodes")
+        .get(),
+    ).toEqual({ phase: "FINALIZED", return_pending: 1, returned_at: null });
+    database.close();
+    fixture.runtime.close();
+  });
+
   it("fails closed for unsupported next-prompt identity", async () => {
     const fixture = await openProposalFixture({});
     const injected: string[] = [];
@@ -227,24 +302,48 @@ describe("Codex Episode operations", () => {
       finalizationInteraction("proposal-revision-1"),
     );
     fixture.runtime.close();
-    const database = new DatabaseSync(fixture.databasePath);
-    database
-      .prepare("UPDATE episodes SET outcome_unresolved_points = ?")
-      .run('{"not":"an ordered list"}');
-    database.close();
     const returner = createCodexPromptReturner({
       databasePath: fixture.databasePath,
     });
     const injected: string[] = [];
-
-    await expect(
-      returner.handleCodexPromptSubmit({
-        hook: trustedPromptHook("origin-1", "next-turn"),
-        inject: async (context) => {
-          injected.push(context);
-        },
-      }),
-    ).resolves.toMatchObject({ ok: false, code: "MALFORMED_EPISODE_OUTCOME" });
+    const malformedValues = [
+      ["original_question", ""],
+      ["outcome_revision_id", ""],
+      ["outcome_result_markdown", ""],
+      ["finalized_at", "not-a-timestamp"],
+      ["outcome_unresolved_points", '{"not":"an ordered list"}'],
+    ] as const;
+    for (const [column, value] of malformedValues) {
+      const database = new DatabaseSync(fixture.databasePath);
+      database.prepare(`UPDATE episodes SET ${column} = ?`).run(value);
+      database.close();
+      await expect(
+        returner.handleCodexPromptSubmit({
+          hook: trustedPromptHook("origin-1", `malformed-${column}`),
+          inject: async (context) => {
+            injected.push(context);
+          },
+        }),
+      ).resolves.toMatchObject({
+        ok: false,
+        code: "MALFORMED_EPISODE_OUTCOME",
+      });
+      const restore = new DatabaseSync(fixture.databasePath);
+      restore
+        .prepare(`UPDATE episodes SET ${column} = ?`)
+        .run(
+          column === "original_question"
+            ? "Choose a rollout plan."
+            : column === "outcome_revision_id"
+              ? "proposal-revision-1"
+              : column === "outcome_result_markdown"
+                ? "Use a canary rollout."
+                : column === "finalized_at"
+                  ? "2026-08-29T12:00:00.000Z"
+                  : "[]",
+        );
+      restore.close();
+    }
     expect(injected).toEqual([]);
     const retained = new DatabaseSync(fixture.databasePath);
     expect(

@@ -1655,6 +1655,8 @@ async function returnPendingOutcome(
     );
   }
 
+  // The claim must be durable before hook output begins. Only that turn may
+  // acknowledge it; a known injection failure releases it for a later prompt.
   const claim = database
     .prepare(
       `UPDATE episodes SET return_claim_turn_id = ?
@@ -1696,6 +1698,15 @@ async function returnPendingOutcome(
 }
 
 function renderReturnedOutcome(row: EpisodeRow): string {
+  if (
+    !isNonEmptyString(row.id) ||
+    !isNonEmptyString(row.original_question) ||
+    !isNonEmptyString(row.outcome_revision_id) ||
+    !isNonEmptyString(row.outcome_result_markdown) ||
+    !isIsoTimestamp(row.finalized_at)
+  ) {
+    throw new Error("The finalized Episode Outcome is malformed.");
+  }
   const view = toView(row);
   if (view.phase !== "FINALIZED") {
     throw new Error("Only finalized Outcomes can be returned.");
@@ -1997,6 +2008,12 @@ function isEpisodePhase(value: unknown): value is EpisodePhase {
 
 function isNullableString(value: unknown): value is string | null {
   return value === null || typeof value === "string";
+}
+
+function isIsoTimestamp(value: unknown): value is string {
+  if (!isNonEmptyString(value)) return false;
+  const parsed = new Date(value);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
 }
 
 function toView(row: EpisodeRow): EpisodeView {

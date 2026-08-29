@@ -21,10 +21,7 @@ export interface CodexPromptReturner {
   handleCodexPromptSubmit(input: {
     readonly hook: unknown;
     readonly inject: (additionalContext: string) => Promise<void>;
-  }): Promise<
-    | { readonly ok: true; readonly status: "returned" | "nothing-pending" }
-    | { readonly ok: false; readonly reason: string; readonly code: string }
-  >;
+  }): Promise<{ readonly ok: boolean }>;
 }
 
 const writeOutput = async (output: Writable, value: object): Promise<void> =>
@@ -75,7 +72,7 @@ export const runCodexHook = async (
             });
           },
         });
-        if (!result.ok) throw new Error(result.code);
+        if (!result.ok) throw new Error("outcome_return_failed");
       }
       return 0;
     }

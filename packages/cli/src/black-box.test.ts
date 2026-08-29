@@ -11,6 +11,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, test } from "vitest";
 
@@ -152,7 +153,125 @@ const readFiles = async (directory: string): Promise<Buffer[]> => {
   return files;
 };
 
+const seedPendingOutcome = async (harness: Harness): Promise<string> => {
+  const stateDirectory = join(harness.installation, "state", "coloop");
+  await mkdir(stateDirectory, { recursive: true });
+  const databasePath = join(stateDirectory, "coloop.sqlite");
+  const database = new DatabaseSync(databasePath);
+  database.exec(`
+    CREATE TABLE episodes (
+      id TEXT PRIMARY KEY, origin_session_id TEXT NOT NULL UNIQUE, origin_turn_id TEXT NOT NULL,
+      owner_discord_user_id TEXT NOT NULL, guild_id TEXT NOT NULL, parent_channel_id TEXT NOT NULL,
+      thread_id TEXT, thread_url TEXT, phase TEXT NOT NULL, phase_version INTEGER NOT NULL,
+      original_question TEXT NOT NULL, opening_brief TEXT NOT NULL, context_reference TEXT NOT NULL,
+      context_digest TEXT NOT NULL, context_retention_deadline TEXT,
+      cancelled_at TEXT, cancellation_reason TEXT, agent_previous_response_id TEXT,
+      proposal_message_id TEXT, proposal_revision_id TEXT, proposal_digest TEXT,
+      outcome_revision_id TEXT, outcome_result_markdown TEXT,
+      outcome_unresolved_points TEXT, finalized_at TEXT, return_pending INTEGER NOT NULL DEFAULT 0,
+      return_claim_turn_id TEXT, returned_at TEXT, returned_turn_id TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+  `);
+  database
+    .prepare(
+      `INSERT INTO episodes (
+        id, origin_session_id, origin_turn_id, owner_discord_user_id, guild_id,
+        parent_channel_id, phase, phase_version, original_question, opening_brief,
+        context_reference, context_digest, outcome_revision_id, outcome_result_markdown,
+        outcome_unresolved_points, finalized_at, return_pending, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, 'FINALIZED', 3, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+    )
+    .run(
+      "episode-1",
+      "origin-1",
+      "opening-turn",
+      ownerId,
+      providerFixture.guildId,
+      providerFixture.channelId,
+      "Choose a rollout plan.",
+      "# Public brief",
+      "/private/context.md",
+      "context-digest",
+      "proposal-revision-1",
+      "Use a canary rollout.",
+      JSON.stringify(["Choose traffic percentage."]),
+      "2026-08-29T12:00:00.000Z",
+      "2026-08-29T11:00:00.000Z",
+      "2026-08-29T12:00:00.000Z",
+    );
+  database.close();
+  return databasePath;
+};
+
 describe("built coloop CLI", () => {
+  test("returns a dormant pending Outcome through the next prompt hook only once", async () => {
+    const harness = await createHarness();
+    const databasePath = await seedPendingOutcome(harness);
+    const dormant = new DatabaseSync(databasePath, { readOnly: true });
+    expect(dormant.prepare("SELECT return_pending FROM episodes").get()).toEqual({
+      return_pending: 1,
+    });
+    dormant.close();
+    const hookInput = JSON.stringify({
+      hook_event_name: "UserPromptSubmit",
+      session_id: "origin-1",
+      turn_id: "next-turn",
+      prompt: "Continue with the rollout work.",
+    });
+    const replacementSession = await runBuiltCli(
+      harness,
+      ["codex-hook", "user-prompt-submit"],
+      JSON.stringify({
+        hook_event_name: "UserPromptSubmit",
+        session_id: "replacement-origin",
+        turn_id: "replacement-turn",
+        prompt: "Try to retrieve another conversation's Outcome.",
+      }),
+    );
+    expect(replacementSession).toEqual({ code: 0, stderr: "", stdout: "" });
+
+    const returned = await runBuiltCli(
+      harness,
+      ["codex-hook", "user-prompt-submit"],
+      hookInput,
+    );
+
+    expect(returned.code, returned.stderr).toBe(0);
+    expect(JSON.parse(returned.stdout)).toEqual({
+      hookSpecificOutput: {
+        hookEventName: "UserPromptSubmit",
+        additionalContext:
+          "# Returned Collaboration Episode Outcome\n\n" +
+          "Present the exact accepted result and ordered unresolved points before continuing with the Owner's newly submitted request.\n\n" +
+          "Episode identity: episode-1\n\n" +
+          "## Original question\n\nChoose a rollout plan.\n\n" +
+          "## Accepted result\n\nUse a canary rollout.\n\n" +
+          "## Ordered unresolved points\n\n1. Choose traffic percentage.\n",
+      },
+    });
+    const duplicate = await runBuiltCli(
+      harness,
+      ["codex-hook", "user-prompt-submit"],
+      hookInput,
+    );
+    expect(duplicate).toEqual({ code: 0, stderr: "", stdout: "" });
+    const retained = new DatabaseSync(databasePath, { readOnly: true });
+    expect(
+      retained
+        .prepare(
+          "SELECT phase, return_pending, outcome_result_markdown, returned_turn_id FROM episodes",
+        )
+        .get(),
+    ).toEqual({
+      phase: "FINALIZED",
+      return_pending: 0,
+      outcome_result_markdown: "Use a canary rollout.",
+      returned_turn_id: "next-turn",
+    });
+    retained.close();
+  });
+
   test("serves the installed Codex entry points and public usage", async () => {
     const harness = await createHarness();
     const mcp = await runBuiltCli(
