@@ -29,7 +29,50 @@ export interface DiscordEpisodeTransport {
     readonly episodeId: string;
     readonly reason?: string;
   }): Promise<void>;
+  beginAgentResponse(input: {
+    readonly eventId: string;
+    readonly guildId: string;
+    readonly threadId: string;
+  }): Promise<{
+    appendText(delta: string): Promise<void>;
+    complete(): Promise<void>;
+  }>;
 }
+
+export interface EpisodeAgentTransport {
+  streamResponse(input: {
+    readonly contextPackage: string;
+    readonly message: string;
+    readonly previousResponseId?: string;
+    readonly onTextDelta: (
+      delta: string,
+    ) =>
+      | Promise<
+          { readonly ok: true } | { readonly ok: false; readonly reason: "delivery-failed" }
+        >
+      | { readonly ok: true }
+      | { readonly ok: false; readonly reason: "delivery-failed" };
+  }): Promise<
+    | { readonly ok: true; readonly responseId: string }
+    | {
+        readonly ok: false;
+        readonly reason: "delivery-failed" | "provider-failed";
+      }
+  >;
+}
+
+export interface DiscordMessageEvent {
+  readonly eventId: string;
+  readonly guildId: string;
+  readonly threadId: string;
+  readonly authorKind: "human" | "external-bot" | "webhook" | "coloop";
+  readonly content: string;
+  readonly mentionsApplication: boolean;
+}
+
+export type DiscordMessageResult =
+  | { readonly ok: true; readonly status: "completed" | "duplicate" | "ignored" }
+  | { readonly ok: false; readonly reason: string; readonly code: string };
 
 export type EpisodeView =
   | {
@@ -59,6 +102,7 @@ interface RuntimeConfiguration {
   readonly guildId: string;
   readonly parentChannelId: string;
   readonly discord: DiscordEpisodeTransport;
+  readonly agent?: EpisodeAgentTransport;
   readonly now?: () => Date;
   readonly createId?: () => string;
 }
@@ -103,6 +147,7 @@ export interface CodexEpisodeRuntime {
     readonly request: unknown;
     readonly approval?: unknown;
   }): Promise<EpisodeOperationResult>;
+  handleDiscordMessage(input: DiscordMessageEvent): Promise<DiscordMessageResult>;
   close(): void;
 }
 
@@ -122,6 +167,7 @@ interface EpisodeRow {
   readonly context_retention_deadline: string | null;
   readonly cancelled_at: string | null;
   readonly cancellation_reason: string | null;
+  readonly agent_previous_response_id: string | null;
 }
 
 export function createColoopRuntime(configuration: RuntimeConfiguration): CodexEpisodeRuntime {
@@ -132,6 +178,7 @@ export function createColoopRuntime(configuration: RuntimeConfiguration): CodexE
   const now = configuration.now ?? (() => new Date());
   const createId = configuration.createId ?? randomUUID;
   const episodes = createEpisodeModule(database, configuration, now, createId);
+  const discordTurnQueues = new Map<string, Promise<void>>();
 
   return {
     async handleCodexOperation(input: {
@@ -240,10 +287,171 @@ export function createColoopRuntime(configuration: RuntimeConfiguration): CodexE
       }
       return result;
     },
+    async handleDiscordMessage(input): Promise<DiscordMessageResult> {
+      return await serializeDiscordTurn(
+        discordTurnQueues,
+        `${input.guildId}:${input.threadId}`,
+        async () => await processDiscordMessage(database, configuration, input, now),
+      );
+    },
     close(): void {
       database.close();
     },
   };
+}
+
+async function serializeDiscordTurn<Value>(
+  queues: Map<string, Promise<void>>,
+  key: string,
+  operation: () => Promise<Value>,
+): Promise<Value> {
+  const previous = queues.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const queued = previous.then(() => current);
+  queues.set(key, queued);
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (queues.get(key) === queued) queues.delete(key);
+  }
+}
+
+async function processDiscordMessage(
+  database: DatabaseSync,
+  configuration: RuntimeConfiguration,
+  input: DiscordMessageEvent,
+  now: () => Date,
+): Promise<DiscordMessageResult> {
+  if (!input.mentionsApplication || input.authorKind === "coloop") {
+    return { ok: true, status: "ignored" };
+  }
+  const episode = findActiveByDiscord(database, input.guildId, input.threadId);
+  if (episode === undefined) return { ok: true, status: "ignored" };
+
+  const inputDigest = digest(JSON.stringify(input));
+  const existing = findProviderInput(database, input.eventId);
+  if (existing !== undefined) {
+    if (existing !== inputDigest) {
+      return failure(
+        "DISCORD_EVENT_REUSE",
+        "The Discord event identity was reused with different input.",
+      );
+    }
+    return { ok: true, status: "duplicate" };
+  }
+  const receivedAt = now().toISOString();
+  inTransaction(database, () => {
+    database
+      .prepare(
+        `INSERT INTO provider_inbox (
+          provider_event_id, episode_id, input_digest, effect_kind, status, received_at
+        ) VALUES (?, ?, ?, 'agent_turn', 'PROCESSING', ?)`,
+      )
+      .run(input.eventId, episode.id, inputDigest, receivedAt);
+    database
+      .prepare(
+        `INSERT INTO recovery_outbox (
+          action_id, episode_id, sequence, action_kind, idempotency_key,
+          destination_reference, state, payload, created_at
+        ) VALUES (?, ?, (
+          SELECT COALESCE(MAX(sequence), 0) + 1 FROM recovery_outbox WHERE episode_id = ?
+        ), 'DISCORD_AGENT_RESPONSE', ?, ?, 'PENDING', NULL, ?)`,
+      )
+      .run(
+        randomUUID(),
+        episode.id,
+        episode.id,
+        `agent-response:${input.eventId}`,
+        input.threadId,
+        receivedAt,
+      );
+  });
+
+  if (configuration.agent === undefined) {
+    abandonAgentTurn(database, input.eventId);
+    return failure("AGENT_UNAVAILABLE", "The Episode Agent is not configured.");
+  }
+
+  let response: Awaited<ReturnType<DiscordEpisodeTransport["beginAgentResponse"]>>;
+  try {
+    response = await configuration.discord.beginAgentResponse({
+      eventId: input.eventId,
+      guildId: input.guildId,
+      threadId: input.threadId,
+    });
+  } catch {
+    abandonAgentTurn(database, input.eventId);
+    return failure("DISCORD_DELIVERY_FAILED", "Discord response delivery failed.");
+  }
+
+  const contextPackage = await readFile(episode.context_reference, "utf8");
+  const agentResult = await configuration.agent.streamResponse({
+    contextPackage,
+    message: input.content,
+    ...(episode.agent_previous_response_id === null
+      ? {}
+      : { previousResponseId: episode.agent_previous_response_id }),
+    onTextDelta: async (delta) => {
+      try {
+        await response.appendText(delta);
+        return { ok: true };
+      } catch {
+        return { ok: false, reason: "delivery-failed" };
+      }
+    },
+  });
+  if (!agentResult.ok) {
+    abandonAgentTurn(database, input.eventId);
+    return agentResult.reason === "delivery-failed"
+      ? failure("DISCORD_DELIVERY_FAILED", "Discord response delivery failed.")
+      : failure("AGENT_PROVIDER_FAILED", "The Episode Agent provider call failed.");
+  }
+  try {
+    await response.complete();
+  } catch {
+    abandonAgentTurn(database, input.eventId);
+    return failure("DISCORD_DELIVERY_FAILED", "Discord response delivery failed.");
+  }
+
+  const completedAt = now().toISOString();
+  inTransaction(database, () => {
+    database
+      .prepare(
+        "UPDATE episodes SET agent_previous_response_id = ?, updated_at = ? WHERE id = ?",
+      )
+      .run(agentResult.responseId, completedAt, episode.id);
+    database
+      .prepare(
+        `UPDATE provider_inbox SET status = 'COMPLETED', completed_at = ?
+         WHERE provider_event_id = ?`,
+      )
+      .run(completedAt, input.eventId);
+    database
+      .prepare(
+        `UPDATE recovery_outbox SET state = 'ACKNOWLEDGED', acknowledged_at = ?
+         WHERE idempotency_key = ?`,
+      )
+      .run(completedAt, `agent-response:${input.eventId}`);
+  });
+  return { ok: true, status: "completed" };
+}
+
+function abandonAgentTurn(database: DatabaseSync, eventId: string): void {
+  inTransaction(database, () => {
+    database
+      .prepare("UPDATE provider_inbox SET status = 'FAILED' WHERE provider_event_id = ?")
+      .run(eventId);
+    database
+      .prepare(
+        "UPDATE recovery_outbox SET state = 'ABANDONED' WHERE idempotency_key = ?",
+      )
+      .run(`agent-response:${eventId}`);
+  });
 }
 
 function createEpisodeModule(
@@ -805,6 +1013,34 @@ function findById(database: DatabaseSync, episodeId: string): EpisodeRow | undef
   );
 }
 
+function findActiveByDiscord(
+  database: DatabaseSync,
+  guildId: string,
+  threadId: string,
+): EpisodeRow | undefined {
+  return parseEpisodeRow(
+    database
+      .prepare(
+        "SELECT * FROM episodes WHERE guild_id = ? AND thread_id = ? AND phase = 'ACTIVE'",
+      )
+      .get(guildId, threadId),
+  );
+}
+
+function findProviderInput(
+  database: DatabaseSync,
+  providerEventId: string,
+): string | undefined {
+  const value = database
+    .prepare("SELECT input_digest FROM provider_inbox WHERE provider_event_id = ?")
+    .get(providerEventId);
+  if (value === undefined) return undefined;
+  if (!isRecord(value) || typeof value.input_digest !== "string") {
+    throw new Error("Stored provider input is malformed.");
+  }
+  return value.input_digest;
+}
+
 function parseEpisodeRow(value: unknown): EpisodeRow | undefined {
   if (value === undefined) return undefined;
   if (
@@ -819,7 +1055,8 @@ function parseEpisodeRow(value: unknown): EpisodeRow | undefined {
     typeof value.context_digest !== "string" ||
     !isNullableString(value.context_retention_deadline) ||
     !isNullableString(value.cancelled_at) ||
-    !isNullableString(value.cancellation_reason)
+    !isNullableString(value.cancellation_reason) ||
+    !isNullableString(value.agent_previous_response_id)
   ) {
     throw new Error("Stored Episode state is malformed.");
   }
@@ -835,6 +1072,7 @@ function parseEpisodeRow(value: unknown): EpisodeRow | undefined {
     context_retention_deadline: value.context_retention_deadline,
     cancelled_at: value.cancelled_at,
     cancellation_reason: value.cancellation_reason,
+    agent_previous_response_id: value.agent_previous_response_id,
   };
 }
 
@@ -884,7 +1122,7 @@ function migrate(database: DatabaseSync): void {
       thread_id TEXT, thread_url TEXT, phase TEXT NOT NULL, phase_version INTEGER NOT NULL,
       original_question TEXT NOT NULL, opening_brief TEXT NOT NULL, context_reference TEXT NOT NULL,
       context_digest TEXT NOT NULL, context_retention_deadline TEXT,
-      cancelled_at TEXT, cancellation_reason TEXT,
+      cancelled_at TEXT, cancellation_reason TEXT, agent_previous_response_id TEXT,
       created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS provider_inbox (
@@ -902,6 +1140,14 @@ function migrate(database: DatabaseSync): void {
       occurred_at TEXT NOT NULL
     );
   `);
+  const episodeColumns = database
+    .prepare("PRAGMA table_info(episodes)")
+    .all()
+    .filter(isRecord)
+    .map((column) => column.name);
+  if (!episodeColumns.includes("agent_previous_response_id")) {
+    database.exec("ALTER TABLE episodes ADD COLUMN agent_previous_response_id TEXT");
+  }
 }
 
 function addAudit(

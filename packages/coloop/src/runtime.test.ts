@@ -12,7 +12,9 @@ import {
 import {
   createOwnerApproval,
   createColoopRuntime,
+  type DiscordMessageEvent,
   type DiscordEpisodeTransport,
+  type EpisodeAgentTransport,
 } from "./runtime";
 
 const temporaryDirectories: string[] = [];
@@ -837,6 +839,367 @@ describe("Codex Episode operations", () => {
   });
 });
 
+describe("Discord Episode Agent conversation", () => {
+  it("streams exact-thread mentions and continues from the prior response", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "coloop-agent-turn-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "coloop.sqlite");
+    const transcriptPath = join(directory, "rollout.jsonl");
+    await writeFile(
+      transcriptPath,
+      fixtureTranscript("origin-1", [ownerMessage("Review the rollout plan.")]),
+    );
+    const discord = new RecordingDiscordTransport();
+    const agent = new RecordingEpisodeAgent([
+      { deltas: ["Start with ", "a canary."], responseId: "response-1" },
+      { deltas: ["Keep the rollback gate."], responseId: "response-2" },
+    ]);
+    const runtime = createColoopRuntime({
+      databasePath,
+      artifactDirectory: join(directory, "episodes"),
+      ownerDiscordUserId: "1001",
+      guildId: "2002",
+      parentChannelId: "3003",
+      discord,
+      agent,
+    });
+    const opened = await runtime.handleCodexOperation({
+      hook: trustedHook("origin-1", transcriptPath),
+      approval: approveOwnerOnlyOpen(
+        "tool-use-1",
+        "# Review\n\nIdentify rollout risks.",
+        "Review the rollout plan.",
+      ),
+      request: {
+        operation: "open_episode",
+        arguments: {
+          openingBrief: "# Review\n\nIdentify rollout risks.",
+          originalRequest: "Review the rollout plan.",
+        },
+      },
+    });
+    if (!opened.ok) throw new Error(opened.reason);
+
+    await expect(
+      runtime.handleDiscordMessage(
+        discordMessage("discord-event-1", "@Coloop Which rollout is safer?"),
+      ),
+    ).resolves.toEqual({ ok: true, status: "completed" });
+    await expect(
+      runtime.handleDiscordMessage(
+        discordMessage("discord-event-2", "@Coloop What gate should we keep?"),
+      ),
+    ).resolves.toEqual({ ok: true, status: "completed" });
+
+    expect(agent.inputs).toEqual([
+      {
+        contextPackage:
+          "# Collaboration Episode Context\n\n" +
+          "## Owner\n\nReview the rollout plan.\n",
+        message: "@Coloop Which rollout is safer?",
+      },
+      {
+        contextPackage:
+          "# Collaboration Episode Context\n\n" +
+          "## Owner\n\nReview the rollout plan.\n",
+        message: "@Coloop What gate should we keep?",
+        previousResponseId: "response-1",
+      },
+    ]);
+    expect(discord.agentResponseEffects).toEqual([
+      { kind: "begin", eventId: "discord-event-1", threadId: "thread-1" },
+      { kind: "delta", text: "Start with " },
+      { kind: "delta", text: "a canary." },
+      { kind: "complete" },
+      { kind: "begin", eventId: "discord-event-2", threadId: "thread-1" },
+      { kind: "delta", text: "Keep the rollback gate." },
+      { kind: "complete" },
+    ]);
+
+    const database = new DatabaseSync(databasePath);
+    expect(
+      database
+        .prepare(
+          "SELECT provider_event_id, status FROM provider_inbox WHERE effect_kind = 'agent_turn' ORDER BY received_at",
+        )
+        .all(),
+    ).toEqual([
+      { provider_event_id: "discord-event-1", status: "COMPLETED" },
+      { provider_event_id: "discord-event-2", status: "COMPLETED" },
+    ]);
+    expect(
+      database
+        .prepare("SELECT agent_previous_response_id FROM episodes")
+        .get(),
+    ).toEqual({ agent_previous_response_id: "response-2" });
+    const localState = JSON.stringify({
+      episodes: database.prepare("SELECT * FROM episodes").all(),
+      inbox: database.prepare("SELECT * FROM provider_inbox").all(),
+      outbox: database.prepare("SELECT * FROM recovery_outbox").all(),
+      audit: database.prepare("SELECT * FROM episode_audit").all(),
+    });
+    expect(localState).not.toContain("@Coloop Which rollout is safer?");
+    expect(localState).not.toContain("Start with a canary.");
+    expect(localState).not.toContain("# Collaboration Episode Context");
+    database.close();
+    runtime.close();
+  });
+
+  it("serializes overlapping Agent turns onto one continuation chain", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "coloop-agent-queue-"));
+    temporaryDirectories.push(directory);
+    const transcriptPath = join(directory, "rollout.jsonl");
+    await writeFile(
+      transcriptPath,
+      fixtureTranscript("origin-1", [ownerMessage("Review the rollout plan.")]),
+    );
+    const discord = new RecordingDiscordTransport();
+    const agent = new DeferredEpisodeAgent();
+    const runtime = createColoopRuntime({
+      databasePath: join(directory, "coloop.sqlite"),
+      artifactDirectory: join(directory, "episodes"),
+      ownerDiscordUserId: "1001",
+      guildId: "2002",
+      parentChannelId: "3003",
+      discord,
+      agent,
+    });
+    const opened = await runtime.handleCodexOperation({
+      hook: trustedHook("origin-1", transcriptPath),
+      approval: approveOwnerOnlyOpen(
+        "tool-use-1",
+        "# Review",
+        "Review the rollout plan.",
+      ),
+      request: {
+        operation: "open_episode",
+        arguments: {
+          openingBrief: "# Review",
+          originalRequest: "Review the rollout plan.",
+        },
+      },
+    });
+    if (!opened.ok) throw new Error(opened.reason);
+
+    const first = runtime.handleDiscordMessage(
+      discordMessage("discord-event-1", "@Coloop First question"),
+    );
+    await agent.firstTurnStarted;
+    const second = runtime.handleDiscordMessage(
+      discordMessage("discord-event-2", "@Coloop Follow-up question"),
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(agent.inputs).toHaveLength(1);
+
+    agent.finishFirstTurn();
+    await expect(Promise.all([first, second])).resolves.toEqual([
+      { ok: true, status: "completed" },
+      { ok: true, status: "completed" },
+    ]);
+    expect(agent.inputs.at(1)).toMatchObject({
+      message: "@Coloop Follow-up question",
+      previousResponseId: "response-1",
+    });
+    runtime.close();
+  });
+
+  it("stays quiet outside eligible exact-thread participant mentions", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "coloop-agent-routing-"));
+    temporaryDirectories.push(directory);
+    const transcriptPath = join(directory, "rollout.jsonl");
+    await writeFile(
+      transcriptPath,
+      fixtureTranscript("origin-1", [ownerMessage("Review the rollout plan.")]),
+    );
+    const discord = new RecordingDiscordTransport();
+    const agent = new RecordingEpisodeAgent([
+      { deltas: ["Bot answer"], responseId: "response-1" },
+      { deltas: ["Webhook answer"], responseId: "response-2" },
+    ]);
+    const runtime = createColoopRuntime({
+      databasePath: join(directory, "coloop.sqlite"),
+      artifactDirectory: join(directory, "episodes"),
+      ownerDiscordUserId: "1001",
+      guildId: "2002",
+      parentChannelId: "3003",
+      discord,
+      agent,
+    });
+    const opened = await runtime.handleCodexOperation({
+      hook: trustedHook("origin-1", transcriptPath),
+      approval: approveOwnerOnlyOpen(
+        "tool-use-1",
+        "# Review",
+        "Review the rollout plan.",
+      ),
+      request: {
+        operation: "open_episode",
+        arguments: {
+          openingBrief: "# Review",
+          originalRequest: "Review the rollout plan.",
+        },
+      },
+    });
+    if (!opened.ok) throw new Error(opened.reason);
+
+    const ignoredEvents: DiscordMessageEvent[] = [
+      {
+        ...discordMessage("not-mentioned", "Ordinary participant discussion"),
+        mentionsApplication: false,
+      },
+      { ...discordMessage("wrong-guild", "@Coloop hello"), guildId: "other" },
+      { ...discordMessage("wrong-thread", "@Coloop hello"), threadId: "other" },
+      {
+        ...discordMessage("self-message", "@Coloop outbound"),
+        authorKind: "coloop",
+      },
+    ];
+    for (const event of ignoredEvents) {
+      await expect(runtime.handleDiscordMessage(event)).resolves.toEqual({
+        ok: true,
+        status: "ignored",
+      });
+    }
+    await expect(
+      runtime.handleDiscordMessage({
+        ...discordMessage("external-bot", "@Coloop compare these"),
+        authorKind: "external-bot",
+      }),
+    ).resolves.toEqual({ ok: true, status: "completed" });
+    await expect(
+      runtime.handleDiscordMessage({
+        ...discordMessage("webhook", "@Coloop summarize this"),
+        authorKind: "webhook",
+      }),
+    ).resolves.toEqual({ ok: true, status: "completed" });
+
+    expect(agent.inputs.map((input) => input.message)).toEqual([
+      "@Coloop compare these",
+      "@Coloop summarize this",
+    ]);
+    runtime.close();
+  });
+
+  it("suppresses duplicate inputs and rejects changed reuse before another Agent call", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "coloop-agent-duplicate-"));
+    temporaryDirectories.push(directory);
+    const transcriptPath = join(directory, "rollout.jsonl");
+    await writeFile(
+      transcriptPath,
+      fixtureTranscript("origin-1", [ownerMessage("Review the rollout plan.")]),
+    );
+    const discord = new RecordingDiscordTransport();
+    const agent = new RecordingEpisodeAgent([
+      { deltas: ["One answer"], responseId: "response-1" },
+    ]);
+    const runtime = createColoopRuntime({
+      databasePath: join(directory, "coloop.sqlite"),
+      artifactDirectory: join(directory, "episodes"),
+      ownerDiscordUserId: "1001",
+      guildId: "2002",
+      parentChannelId: "3003",
+      discord,
+      agent,
+    });
+    const opened = await runtime.handleCodexOperation({
+      hook: trustedHook("origin-1", transcriptPath),
+      approval: approveOwnerOnlyOpen(
+        "tool-use-1",
+        "# Review",
+        "Review the rollout plan.",
+      ),
+      request: {
+        operation: "open_episode",
+        arguments: {
+          openingBrief: "# Review",
+          originalRequest: "Review the rollout plan.",
+        },
+      },
+    });
+    if (!opened.ok) throw new Error(opened.reason);
+    const event = discordMessage("discord-event-1", "@Coloop answer once");
+
+    await expect(runtime.handleDiscordMessage(event)).resolves.toEqual({
+      ok: true,
+      status: "completed",
+    });
+    await expect(runtime.handleDiscordMessage(event)).resolves.toEqual({
+      ok: true,
+      status: "duplicate",
+    });
+    await expect(
+      runtime.handleDiscordMessage({ ...event, content: "@Coloop changed input" }),
+    ).resolves.toMatchObject({ ok: false, code: "DISCORD_EVENT_REUSE" });
+    expect(agent.inputs).toHaveLength(1);
+    runtime.close();
+  });
+
+  it("does not complete input or advance continuation after provider failure", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "coloop-agent-failure-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "coloop.sqlite");
+    const transcriptPath = join(directory, "rollout.jsonl");
+    await writeFile(
+      transcriptPath,
+      fixtureTranscript("origin-1", [ownerMessage("Review the rollout plan.")]),
+    );
+    const runtime = createColoopRuntime({
+      databasePath,
+      artifactDirectory: join(directory, "episodes"),
+      ownerDiscordUserId: "1001",
+      guildId: "2002",
+      parentChannelId: "3003",
+      discord: new RecordingDiscordTransport(),
+      agent: new FailingEpisodeAgent(),
+    });
+    const opened = await runtime.handleCodexOperation({
+      hook: trustedHook("origin-1", transcriptPath),
+      approval: approveOwnerOnlyOpen(
+        "tool-use-1",
+        "# Review",
+        "Review the rollout plan.",
+      ),
+      request: {
+        operation: "open_episode",
+        arguments: {
+          openingBrief: "# Review",
+          originalRequest: "Review the rollout plan.",
+        },
+      },
+    });
+    if (!opened.ok) throw new Error(opened.reason);
+
+    await expect(
+      runtime.handleDiscordMessage(
+        discordMessage("failed-event", "@Coloop provider failure input"),
+      ),
+    ).resolves.toMatchObject({ ok: false, code: "AGENT_PROVIDER_FAILED" });
+
+    const database = new DatabaseSync(databasePath);
+    expect(
+      database
+        .prepare(
+          "SELECT status, completed_at FROM provider_inbox WHERE provider_event_id = 'failed-event'",
+        )
+        .get(),
+    ).toEqual({ status: "FAILED", completed_at: null });
+    expect(
+      database
+        .prepare("SELECT agent_previous_response_id FROM episodes")
+        .get(),
+    ).toEqual({ agent_previous_response_id: null });
+    expect(
+      database
+        .prepare(
+          "SELECT state, payload FROM recovery_outbox WHERE idempotency_key = 'agent-response:failed-event'",
+        )
+        .get(),
+    ).toEqual({ state: "ABANDONED", payload: null });
+    database.close();
+    runtime.close();
+  });
+});
+
 function trustedHook(
   sessionId: string,
   transcriptPath: string,
@@ -880,6 +1243,17 @@ function ownerMessage(text: string): object {
   return { type: "event_msg", payload: { type: "user_message", message: text } };
 }
 
+function discordMessage(eventId: string, content: string): DiscordMessageEvent {
+  return {
+    eventId,
+    guildId: "2002",
+    threadId: "thread-1",
+    authorKind: "human",
+    content,
+    mentionsApplication: true,
+  };
+}
+
 function approveOwnerOnlyOpen(
   toolUseId: string,
   openingBrief: string,
@@ -897,6 +1271,7 @@ function approveOwnerOnlyOpen(
 
 class RecordingDiscordTransport implements DiscordEpisodeTransport {
   readonly effects: object[] = [];
+  readonly agentResponseEffects: object[] = [];
 
   constructor(
     private readonly failProvisioning = false,
@@ -945,6 +1320,109 @@ class RecordingDiscordTransport implements DiscordEpisodeTransport {
       threadWritable: true,
     });
   }
+
+  async beginAgentResponse(input: {
+    readonly eventId: string;
+    readonly guildId: string;
+    readonly threadId: string;
+  }) {
+    this.agentResponseEffects.push({
+      kind: "begin",
+      eventId: input.eventId,
+      threadId: input.threadId,
+    });
+    return {
+      appendText: async (text: string) => {
+        this.agentResponseEffects.push({ kind: "delta", text });
+      },
+      complete: async () => {
+        this.agentResponseEffects.push({ kind: "complete" });
+      },
+    };
+  }
+}
+
+class RecordingEpisodeAgent implements EpisodeAgentTransport {
+  readonly inputs: Array<{
+    readonly contextPackage: string;
+    readonly message: string;
+    readonly previousResponseId?: string;
+  }> = [];
+
+  constructor(
+    private readonly responses: Array<{
+      readonly deltas: readonly string[];
+      readonly responseId: string;
+    }>,
+  ) {}
+
+  async streamResponse(
+    input: Parameters<EpisodeAgentTransport["streamResponse"]>[0],
+  ): ReturnType<EpisodeAgentTransport["streamResponse"]> {
+    this.inputs.push({
+      contextPackage: input.contextPackage,
+      message: input.message,
+      ...(input.previousResponseId === undefined
+        ? {}
+        : { previousResponseId: input.previousResponseId }),
+    });
+    const response = this.responses.shift();
+    if (response === undefined) throw new Error("No Agent response configured.");
+    for (const delta of response.deltas) {
+      const delivery = await input.onTextDelta(delta);
+      if (!delivery.ok) return delivery;
+    }
+    return { ok: true, responseId: response.responseId };
+  }
+}
+
+class DeferredEpisodeAgent implements EpisodeAgentTransport {
+  readonly inputs: Array<{
+    readonly message: string;
+    readonly previousResponseId?: string;
+  }> = [];
+  readonly firstTurnStarted: Promise<void>;
+  private resolveFirstTurnStarted!: () => void;
+  private readonly firstTurnFinished: Promise<void>;
+  private resolveFirstTurnFinished!: () => void;
+
+  constructor() {
+    this.firstTurnStarted = new Promise((resolve) => {
+      this.resolveFirstTurnStarted = resolve;
+    });
+    this.firstTurnFinished = new Promise((resolve) => {
+      this.resolveFirstTurnFinished = resolve;
+    });
+  }
+
+  async streamResponse(
+    input: Parameters<EpisodeAgentTransport["streamResponse"]>[0],
+  ): ReturnType<EpisodeAgentTransport["streamResponse"]> {
+    const turn = this.inputs.length + 1;
+    this.inputs.push({
+      message: input.message,
+      ...(input.previousResponseId === undefined
+        ? {}
+        : { previousResponseId: input.previousResponseId }),
+    });
+    if (turn === 1) {
+      this.resolveFirstTurnStarted();
+      await this.firstTurnFinished;
+    }
+    const delivery = await input.onTextDelta(`Answer ${turn}`);
+    if (!delivery.ok) return delivery;
+    return { ok: true, responseId: `response-${turn}` };
+  }
+
+  finishFirstTurn(): void {
+    this.resolveFirstTurnFinished();
+  }
+}
+
+class FailingEpisodeAgent implements EpisodeAgentTransport {
+  async streamResponse(): ReturnType<EpisodeAgentTransport["streamResponse"]> {
+    return { ok: false, reason: "provider-failed" };
+  }
 }
 
 class DeferredDiscordTransport implements DiscordEpisodeTransport {
@@ -983,6 +1461,12 @@ class DeferredDiscordTransport implements DiscordEpisodeTransport {
     input: Parameters<DiscordEpisodeTransport["presentCancellation"]>[0],
   ): Promise<void> {
     this.effects.push({ kind: "present_cancellation", ...input });
+  }
+
+  async beginAgentResponse(): ReturnType<
+    DiscordEpisodeTransport["beginAgentResponse"]
+  > {
+    throw new Error("Agent responses are not used by this fixture.");
   }
 }
 
