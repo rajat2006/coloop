@@ -9,7 +9,35 @@ import {
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type { InstallationConfig } from "@coloop/core";
+import {
+  parseDiscordApplicationId,
+  parseDiscordChannelId,
+  parseDiscordGuildId,
+  parseDiscordUserId,
+  type EmptyResult,
+  type InstallationConfig,
+  type Result,
+} from "@coloop/core";
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+const hasErrorCode = (
+  value: unknown,
+  code: string,
+): boolean => isRecord(value) && value.code === code;
+
+const parseOptionalId = <Value>(
+  value: unknown,
+  parse: (candidate: unknown) =>
+    | { readonly ok: true; readonly value: Value }
+    | { readonly ok: false; readonly reason: string },
+): Value | undefined => {
+  if (value === undefined) return undefined;
+  const result = parse(value);
+  if (!result.ok) throw new Error("invalid configuration identity");
+  return result.value;
+};
 
 export interface InstallationPaths {
   artifactsDirectory: string;
@@ -38,33 +66,40 @@ export const getInstallationPaths = (
 
 export const loadConfig = async (
   configFile: string,
-): Promise<InstallationConfig> => {
+): Promise<Result<InstallationConfig, "configuration-unreadable">> => {
   try {
-    const parsed = JSON.parse(await readFile(configFile, "utf8")) as Record<
-      string,
-      unknown
-    >;
+    const parsed: unknown = JSON.parse(await readFile(configFile, "utf8"));
+    if (!isRecord(parsed)) {
+      throw new Error("invalid configuration document");
+    }
     if (parsed.schemaVersion !== 1) {
       throw new Error("unsupported configuration schema");
     }
+    const discordApplicationId = parseOptionalId(
+      parsed.discordApplicationId,
+      parseDiscordApplicationId,
+    );
+    const guildId = parseOptionalId(parsed.guildId, parseDiscordGuildId);
+    const ownerUserId = parseOptionalId(parsed.ownerUserId, parseDiscordUserId);
+    const parentChannelId = parseOptionalId(
+      parsed.parentChannelId,
+      parseDiscordChannelId,
+    );
     return {
-      schemaVersion: 1,
-      ...(typeof parsed.discordApplicationId === "string"
-        ? { discordApplicationId: parsed.discordApplicationId }
-        : {}),
-      ...(typeof parsed.guildId === "string" ? { guildId: parsed.guildId } : {}),
-      ...(typeof parsed.ownerUserId === "string"
-        ? { ownerUserId: parsed.ownerUserId }
-        : {}),
-      ...(typeof parsed.parentChannelId === "string"
-        ? { parentChannelId: parsed.parentChannelId }
-        : {}),
+      ok: true,
+      value: {
+        schemaVersion: 1,
+        ...(discordApplicationId ? { discordApplicationId } : {}),
+        ...(guildId ? { guildId } : {}),
+        ...(ownerUserId ? { ownerUserId } : {}),
+        ...(parentChannelId ? { parentChannelId } : {}),
+      },
     };
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return { schemaVersion: 1 };
+    if (hasErrorCode(error, "ENOENT")) {
+      return { ok: true, value: { schemaVersion: 1 } };
     }
-    throw new Error("Saved Coloop configuration is unreadable or unsupported.");
+    return { ok: false, reason: "configuration-unreadable" };
   }
 };
 
@@ -112,7 +147,7 @@ export const initializePrivateStorage = async (
 
 export const verifyPrivateStorage = async (
   paths: InstallationPaths,
-): Promise<void> => {
+): Promise<EmptyResult<"storage-invalid">> => {
   try {
     // Readiness covers path types, privacy bits, and the initialized schema marker.
     const [state, artifacts, databaseFile] = await Promise.all([
@@ -132,18 +167,17 @@ export const verifyPrivateStorage = async (
     }
     const database = new DatabaseSync(paths.databaseFile, { readOnly: true });
     try {
-      const row = database
+      const row: unknown = database
         .prepare("SELECT version FROM schema_metadata WHERE version = 1")
-        .get() as { version?: number } | undefined;
-      if (row?.version !== 1) {
+        .get();
+      if (!isRecord(row) || row.version !== 1) {
         throw new Error("storage schema is not initialized");
       }
     } finally {
       database.close();
     }
+    return { ok: true };
   } catch {
-    throw new Error(
-      "Owner-private SQLite and Episode-artifact storage are not ready; rerun `coloop setup`.",
-    );
+    return { ok: false, reason: "storage-invalid" };
   }
 };

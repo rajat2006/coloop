@@ -67,7 +67,11 @@ importers:
         specifier: workspace:*
         version: link:../agent-runtimes/openai-agents
 
-  packages/coding-agents/codex: {}
+  packages/coding-agents/codex:
+    dependencies:
+      '@coloop/core':
+        specifier: workspace:*
+        version: link:../../core
 
   packages/coding-agents/protocol: {}
 

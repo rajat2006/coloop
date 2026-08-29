@@ -1,9 +1,13 @@
-import { isCredentialRejectedError, type InstallationConfig } from "@coloop/core";
+import {
+  parseDiscordUserId,
+  type InstallationConfig,
+} from "@coloop/core";
 import { installAndVerifyCodexIntegration } from "@coloop/coding-agent-codex";
 import {
   requiredDiscordPermissions,
   type DiscordChannel,
   type DiscordGuild,
+  type DiscordMember,
   verifyChannelIsolation,
   verifyPermissions,
 } from "@coloop/discord";
@@ -15,8 +19,6 @@ import {
 } from "@coloop/local-storage";
 import type { ColoopDependencies } from "../dependencies.js";
 import { Terminal } from "../terminal/terminal.js";
-
-const isNumericDiscordId = (value: string): boolean => /^\d{17,20}$/.test(value);
 
 const openForOwnerAction = async (
   dependencies: ColoopDependencies,
@@ -75,25 +77,6 @@ const selectChannel = async (
   return channel;
 };
 
-const resolveOwnerMember = async (
-  dependencies: ColoopDependencies,
-  discordToken: string,
-  guildId: string,
-  ownerId: string,
-) => {
-  try {
-    return await dependencies.discord.resolveMember(
-      discordToken,
-      guildId,
-      ownerId,
-    );
-  } catch {
-    throw new Error(
-      "Discord Owner Pairing validation is temporarily unavailable; saved pairing was not changed.",
-    );
-  }
-};
-
 export const runSetup = async (
   dependencies: ColoopDependencies,
   terminal: Terminal,
@@ -114,14 +97,17 @@ export const runSetup = async (
   }
 
   const paths = getInstallationPaths(environment);
-  const config: InstallationConfig = await loadConfig(paths.configFile);
+  const loadedConfig = await loadConfig(paths.configFile);
+  if (!loadedConfig.ok) {
+    throw new Error("Saved Coloop configuration is unreadable or unsupported.");
+  }
+  const config: InstallationConfig = loadedConfig.value;
 
   terminal.line("Discord application");
-  let application;
-  try {
-    application = await dependencies.discord.getApplication(discordToken);
-  } catch (error) {
-    if (isCredentialRejectedError(error)) {
+  const applicationResult =
+    await dependencies.discord.getApplication(discordToken);
+  if (!applicationResult.ok) {
+    if (applicationResult.reason === "credential-rejected") {
       await openForOwnerAction(
         dependencies,
         "https://discord.com/developers/applications",
@@ -132,6 +118,7 @@ export const runSetup = async (
       "Discord application validation is temporarily unavailable; rerun setup without changing credentials.",
     );
   }
+  const application = applicationResult.value;
   terminal.line(`Discord application: ${application.name}`);
   terminal.line("Required intents: Guilds, Guild Messages, Message Content.");
   terminal.line(
@@ -158,12 +145,11 @@ export const runSetup = async (
 
   terminal.line();
   terminal.line("Allowed Discord server");
-  let guilds: DiscordGuild[];
-  try {
-    guilds = await dependencies.discord.listGuilds(discordToken);
-  } catch {
+  const guildsResult = await dependencies.discord.listGuilds(discordToken);
+  if (!guildsResult.ok) {
     throw new Error("Discord server validation failed.");
   }
+  const guilds = guildsResult.value;
   if (guilds.length === 0) {
     const installer = new URL("https://discord.com/oauth2/authorize");
     installer.searchParams.set("client_id", application.id);
@@ -192,12 +178,14 @@ export const runSetup = async (
 
   terminal.line();
   terminal.line("Parent channel and least-privilege permissions");
-  let channels: DiscordChannel[];
-  try {
-    channels = await dependencies.discord.listChannels(discordToken, guild.id);
-  } catch {
+  const channelsResult = await dependencies.discord.listChannels(
+    discordToken,
+    guild.id,
+  );
+  if (!channelsResult.ok) {
     throw new Error("Discord parent-channel validation failed.");
   }
+  const channels = channelsResult.value;
   let channel = channels.find(
     (candidate) => candidate.id === config.parentChannelId,
   );
@@ -206,8 +194,10 @@ export const runSetup = async (
   } else {
     channel = await selectChannel(terminal, channels);
   }
-  verifyPermissions(channel);
-  verifyChannelIsolation(channels, channel);
+  const permissions = verifyPermissions(channel);
+  if (!permissions.ok) throw new Error(permissions.message);
+  const isolation = verifyChannelIsolation(channels, channel);
+  if (!isolation.ok) throw new Error(isolation.message);
   config.parentChannelId = channel.id;
   await saveConfig(paths.configFile, config);
   terminal.line(`Parent channel: #${channel.name}`);
@@ -217,36 +207,55 @@ export const runSetup = async (
   terminal.line("Owner Pairing");
   // A transient lookup failure must not erase a pairing that may still be valid.
   let ownerId = config.ownerUserId;
-  let member = ownerId
-    ? await resolveOwnerMember(dependencies, discordToken, guild.id, ownerId)
-    : null;
-  if (ownerId && member) {
-    terminal.line("Saved Owner Pairing is valid; skipping pairing.");
-  }
-  if (ownerId && !member) {
-    terminal.line(
-      "Saved Owner Pairing no longer resolves; pairing a replacement.",
+  let member: DiscordMember | undefined;
+  if (ownerId) {
+    const savedMember = await dependencies.discord.resolveMember(
+      discordToken,
+      guild.id,
+      ownerId,
     );
-    delete config.ownerUserId;
-    await saveConfig(paths.configFile, config);
-    ownerId = undefined;
+    if (savedMember.ok) {
+      member = savedMember.value;
+      terminal.line("Saved Owner Pairing is valid; skipping pairing.");
+    } else if (savedMember.reason === "resource-not-found") {
+      terminal.line(
+        "Saved Owner Pairing no longer resolves; pairing a replacement.",
+      );
+      delete config.ownerUserId;
+      await saveConfig(paths.configFile, config);
+      ownerId = undefined;
+    } else {
+      throw new Error(
+        "Discord Owner Pairing validation is temporarily unavailable; saved pairing was not changed.",
+      );
+    }
   }
   if (!ownerId) {
-    ownerId = await terminal.ask("Enter the Owner's numeric Discord user ID: ");
-  }
-  if (!isNumericDiscordId(ownerId)) {
-    throw new Error("Owner Pairing requires a numeric Discord user ID.");
-  }
-  member ??= await resolveOwnerMember(
-    dependencies,
-    discordToken,
-    guild.id,
-    ownerId,
-  );
-  if (!member) {
-    throw new Error(
-      `Discord user ${ownerId} could not be resolved in the configured server.`,
+    const parsedOwnerId = parseDiscordUserId(
+      await terminal.ask("Enter the Owner's numeric Discord user ID: "),
     );
+    if (!parsedOwnerId.ok) {
+      throw new Error("Owner Pairing requires a numeric Discord user ID.");
+    }
+    ownerId = parsedOwnerId.value;
+  }
+  if (!member) {
+    const resolvedMember = await dependencies.discord.resolveMember(
+      discordToken,
+      guild.id,
+      ownerId,
+    );
+    if (!resolvedMember.ok) {
+      if (resolvedMember.reason === "resource-not-found") {
+        throw new Error(
+          `Discord user ${ownerId} could not be resolved in the configured server.`,
+        );
+      }
+      throw new Error(
+        "Discord Owner Pairing validation is temporarily unavailable; saved pairing was not changed.",
+      );
+    }
+    member = resolvedMember.value;
   }
   terminal.line(
     `Resolved Owner: ${member.displayName} (@${member.username}, ${member.id})`,
@@ -277,10 +286,10 @@ export const runSetup = async (
     );
     throw new Error("OPENAI_API_KEY is required in the process environment.");
   }
-  try {
+  const openaiCredential =
     await dependencies.openai.validateCredential(openaiApiKey);
-  } catch (error) {
-    if (isCredentialRejectedError(error)) {
+  if (!openaiCredential.ok) {
+    if (openaiCredential.reason === "credential-rejected") {
       await openForOwnerAction(
         dependencies,
         "https://platform.openai.com/api-keys",
@@ -307,6 +316,7 @@ export const runSetup = async (
   terminal.line("Codex CLI hook and MCP entry points verified for CLI 0.150.1.");
 
   terminal.line();
+  // Every prerequisite above was verified as it was saved, so avoid repeating provider calls.
   terminal.line("Readiness check passed.");
   terminal.line("Ready. Run `coloop run` to start Coloop.");
 };

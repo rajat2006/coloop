@@ -153,18 +153,17 @@ const readFiles = async (directory: string): Promise<Buffer[]> => {
 };
 
 describe("built coloop CLI", () => {
-  test("covers setup, recovery, provider failures, readiness, privacy, and runtime across the process boundary", async () => {
-    // Internal Codex entry points must work through the built executable.
-    const freshHarness = await createHarness();
+  test("serves the installed Codex entry points and public usage", async () => {
+    const harness = await createHarness();
     const mcp = await runBuiltCli(
-      freshHarness,
+      harness,
       ["mcp"],
       `${JSON.stringify({ id: 1, jsonrpc: "2.0", method: "tools/list" })}\n`,
     );
     expect(mcp.code, mcp.stderr).toBe(0);
     expect(mcp.stdout).toContain('"name":"open_episode"');
     const hook = await runBuiltCli(
-      freshHarness,
+      harness,
       ["codex-hook", "pre-tool-use"],
       JSON.stringify({
         hook_event_name: "PreToolUse",
@@ -177,13 +176,16 @@ describe("built coloop CLI", () => {
     );
     expect(hook.code, hook.stderr).toBe(0);
     expect(hook.stdout).toContain('"_origin_session_id":"trusted-session"');
-    const usage = await runBuiltCli(freshHarness, [], "");
+    const usage = await runBuiltCli(harness, [], "");
     expect(usage, `cli=${cliPath}`).toEqual({
       code: 2,
       stderr: "Usage: coloop <setup|run>\n",
       stdout: "",
     });
-    // A fresh installation must complete without persisting either provider secret.
+  });
+
+  test("completes a private setup and starts the ready foreground runtime", async () => {
+    const freshHarness = await createHarness();
     const fresh = await runBuiltCli(
       freshHarness,
       ["setup"],
@@ -203,7 +205,6 @@ describe("built coloop CLI", () => {
       false,
     );
 
-    // A ready installation opens and cleanly closes the foreground Gateway runtime.
     const runtime = await runBuiltCli(
       freshHarness,
       ["run"],
@@ -226,8 +227,9 @@ describe("built coloop CLI", () => {
     expect(invalidRuntime.stderr).toContain(
       "OPENAI_API_KEY was rejected by OpenAI Platform.",
     );
+  }, 30_000);
 
-    // Interrupted setup resumes from saved non-secret progress and repairs stale state.
+  test("resumes setup while preserving a valid Owner Pairing on provider failure", async () => {
     const recoveryHarness = await createHarness();
     const permissionFailure = await runBuiltCli(
       recoveryHarness,
@@ -268,8 +270,9 @@ describe("built coloop CLI", () => {
       "utf8",
     );
     expect(JSON.parse(recoveredConfig)).toMatchObject({ ownerUserId: ownerId });
+  }, 30_000);
 
-    // Provider and identity failures remain actionable without exposing credentials.
+  test("reports credential and Owner identity failures without exposing secrets", async () => {
     const invalidCredentialHarness = await createHarness();
     const invalidCredential = await runBuiltCli(
       invalidCredentialHarness,
@@ -294,5 +297,5 @@ describe("built coloop CLI", () => {
     expect(unresolvedOwner.stderr).toContain(
       `Discord user ${ownerId} could not be resolved`,
     );
-  }, 60_000);
+  }, 30_000);
 });

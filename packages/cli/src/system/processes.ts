@@ -8,6 +8,9 @@ import { sanitizedSubprocessEnvironment } from "./environment.js";
 
 const execFileAsync = promisify(execFile);
 
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
 export const runCodex = async (args: string[]): Promise<CommandResult> => {
   try {
     const result = await execFileAsync("codex", args, {
@@ -15,16 +18,14 @@ export const runCodex = async (args: string[]): Promise<CommandResult> => {
       env: sanitizedSubprocessEnvironment(),
       timeout: 15_000,
     });
-    return { exitCode: 0, stderr: result.stderr, stdout: result.stdout };
+    return { ok: true, stderr: result.stderr, stdout: result.stdout };
   } catch (error) {
     // Normalize spawn failures and non-zero exits into the same result shape.
-    const failure = error as {
-      code?: unknown;
-      stderr?: unknown;
-      stdout?: unknown;
-    };
+    const failure = isRecord(error) ? error : {};
     return {
       exitCode: typeof failure.code === "number" ? failure.code : 1,
+      ok: false,
+      reason: "command-failed",
       stderr: typeof failure.stderr === "string" ? failure.stderr : "",
       stdout: typeof failure.stdout === "string" ? failure.stdout : "",
     };
@@ -46,15 +47,16 @@ export const runColoop = async (
         timeout: 15_000,
       },
       (error, stdout, stderr) => {
-        resolve({
-          exitCode: error
-            ? typeof error.code === "number"
-              ? error.code
-              : 1
-            : 0,
-          stderr,
-          stdout,
-        });
+        const result: CommandResult = error
+          ? {
+              exitCode: typeof error.code === "number" ? error.code : 1,
+              ok: false,
+              reason: "command-failed",
+              stderr,
+              stdout,
+            }
+          : { ok: true, stderr, stdout };
+        resolve(result);
       },
     );
     child.stdin?.end(input);

@@ -35,7 +35,7 @@ describe("coding-agent protocol", () => {
     const responses = output.value
       .trim()
       .split("\n")
-      .map((line) => JSON.parse(line) as Record<string, unknown>);
+      .map((line): unknown => JSON.parse(line));
     expect(responses).toEqual([
       {
         id: 1,
@@ -54,5 +54,18 @@ describe("coding-agent protocol", () => {
         },
       },
     ]);
+  });
+
+  test("rejects a non-object JSON request without crashing the server", async () => {
+    const output = new StringWriter();
+
+    const exitCode = await runMcpServer(Readable.from(["null\n"]), output);
+
+    expect(exitCode).toBe(0);
+    expect(JSON.parse(output.value)).toEqual({
+      error: { code: -32700, message: "Parse error" },
+      id: null,
+      jsonrpc: "2.0",
+    });
   });
 });

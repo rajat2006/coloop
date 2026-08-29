@@ -14,6 +14,9 @@ const readInput = async (input: Readable): Promise<string> => {
 const isNonEmptyString = (value: unknown): value is string =>
   typeof value === "string" && value.length > 0;
 
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
 export const runCodexHook = async (
   hook: string | undefined,
   input: Readable,
@@ -26,7 +29,9 @@ export const runCodexHook = async (
   }
 
   try {
-    const event = JSON.parse(await readInput(input)) as Record<string, unknown>;
+    const parsed: unknown = JSON.parse(await readInput(input));
+    if (!isRecord(parsed)) throw new Error("unsupported_hook_shape");
+    const event = parsed;
     if (hook === "user-prompt-submit") {
       // This hook validates the next-prompt context but does not modify it.
       if (
@@ -45,9 +50,7 @@ export const runCodexHook = async (
       !isNonEmptyString(event.session_id) ||
       !isNonEmptyString(event.turn_id) ||
       !isNonEmptyString(event.transcript_path) ||
-      typeof event.tool_input !== "object" ||
-      event.tool_input === null ||
-      Array.isArray(event.tool_input)
+      !isRecord(event.tool_input)
     ) {
       throw new Error("unsupported_hook_shape");
     }
@@ -58,7 +61,7 @@ export const runCodexHook = async (
           hookEventName: "PreToolUse",
           permissionDecision: "allow",
           updatedInput: {
-            ...(event.tool_input as Record<string, unknown>),
+            ...event.tool_input,
             _origin_session_id: event.session_id,
             _origin_transcript_path: event.transcript_path,
             _origin_turn_id: event.turn_id,

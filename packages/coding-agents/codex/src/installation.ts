@@ -1,11 +1,16 @@
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import type { EmptyResult } from "@coloop/core";
 
-export interface CommandResult {
-  exitCode: number;
-  stderr: string;
-  stdout: string;
-}
+export type CommandResult =
+  | { readonly ok: true; readonly stderr: string; readonly stdout: string }
+  | {
+      readonly exitCode: number;
+      readonly ok: false;
+      readonly reason: "command-failed";
+      readonly stderr: string;
+      readonly stdout: string;
+    };
 
 export interface CommandInvocation {
   args: string[];
@@ -25,6 +30,12 @@ interface HooksFile {
   hooks?: Record<string, unknown>;
   [key: string]: unknown;
 }
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+const hasErrorCode = (value: unknown, code: string): boolean =>
+  isRecord(value) && value.code === code;
 
 const quoteShellArgument = (value: string): string =>
   /^[A-Za-z0-9_./:@%+=,-]+$/.test(value)
@@ -97,7 +108,7 @@ const verifyCodexVersion = async (
   dependencies: CodexIntegrationDependencies,
 ): Promise<void> => {
   const version = await dependencies.runCodex(["--version"]);
-  if (version.exitCode !== 0 || version.stdout.trim() !== supportedCodexVersion) {
+  if (!version.ok || version.stdout.trim() !== supportedCodexVersion) {
     throw new Error(
       `Supported Codex CLI ${supportedCodexVersion.replace("codex-cli ", "")} is required.`,
     );
@@ -109,19 +120,18 @@ const isExpectedMcpConfiguration = (
   dependencies: CodexIntegrationDependencies,
 ): boolean => {
   try {
-    const configuration = JSON.parse(stdout) as {
-      enabled?: unknown;
-      name?: unknown;
-      transport?: { args?: unknown; command?: unknown; type?: unknown };
-    };
+    const configuration: unknown = JSON.parse(stdout);
+    if (!isRecord(configuration) || !isRecord(configuration.transport)) {
+      return false;
+    }
+    const transport = configuration.transport;
     return (
       configuration.name === "coloop" &&
       configuration.enabled === true &&
-      configuration.transport?.type === "stdio" &&
-      configuration.transport.command ===
-        dependencies.coloopEntrypoint.command &&
-      Array.isArray(configuration.transport.args) &&
-      JSON.stringify(configuration.transport.args) ===
+      transport.type === "stdio" &&
+      transport.command === dependencies.coloopEntrypoint.command &&
+      Array.isArray(transport.args) &&
+      JSON.stringify(transport.args) ===
         JSON.stringify([...dependencies.coloopEntrypoint.args, "mcp"])
     );
   } catch {
@@ -133,10 +143,7 @@ const verifyMcpEntryPoint = async (
   dependencies: CodexIntegrationDependencies,
 ): Promise<void> => {
   const mcp = await dependencies.runCodex(["mcp", "get", "--json", "coloop"]);
-  if (
-    mcp.exitCode !== 0 ||
-    !isExpectedMcpConfiguration(mcp.stdout, dependencies)
-  ) {
+  if (!mcp.ok || !isExpectedMcpConfiguration(mcp.stdout, dependencies)) {
     throw new Error("Codex MCP entry point could not be verified.");
   }
 };
@@ -147,10 +154,13 @@ const verifyHookEntryPoint = async (
 ): Promise<void> => {
   try {
     const hooksPath = join(codexHome, "hooks.json");
-    const verified = JSON.parse(await readFile(hooksPath, "utf8")) as HooksFile;
+    const parsed: unknown = JSON.parse(await readFile(hooksPath, "utf8"));
+    if (!isRecord(parsed)) throw new Error("invalid hooks document");
+    const verified: HooksFile = parsed;
+    const hooks = isRecord(verified.hooks) ? verified.hooks : undefined;
     if (
-      !containsColoopHook(verified.hooks?.PreToolUse, dependencies) ||
-      !containsPromptHook(verified.hooks?.UserPromptSubmit, dependencies)
+      !containsColoopHook(hooks?.PreToolUse, dependencies) ||
+      !containsPromptHook(hooks?.UserPromptSubmit, dependencies)
     ) {
       throw new Error("missing Coloop hook");
     }
@@ -163,7 +173,7 @@ const verifyRunnableEntrypoint = async (
   dependencies: CodexIntegrationDependencies,
 ): Promise<void> => {
   const result = await dependencies.runColoop(["verify-entrypoint"], "");
-  if (result.exitCode !== 0) {
+  if (!result.ok) {
     throw new Error("Coloop executable entry point could not be verified.");
   }
 };
@@ -171,12 +181,17 @@ const verifyRunnableEntrypoint = async (
 export const verifyCodexIntegration = async (
   codexHome: string,
   dependencies: CodexIntegrationDependencies,
-): Promise<void> => {
-  // Runtime verification is intentionally read-only; setup owns all repairs.
-  await verifyCodexVersion(dependencies);
-  await verifyMcpEntryPoint(dependencies);
-  await verifyHookEntryPoint(codexHome, dependencies);
-  await verifyRunnableEntrypoint(dependencies);
+): Promise<EmptyResult<"codex-integration-invalid">> => {
+  try {
+    // Runtime verification is intentionally read-only; setup owns all repairs.
+    await verifyCodexVersion(dependencies);
+    await verifyMcpEntryPoint(dependencies);
+    await verifyHookEntryPoint(codexHome, dependencies);
+    await verifyRunnableEntrypoint(dependencies);
+    return { ok: true };
+  } catch {
+    return { ok: false, reason: "codex-integration-invalid" };
+  }
 };
 
 export const installAndVerifyCodexIntegration = async (
@@ -188,12 +203,12 @@ export const installAndVerifyCodexIntegration = async (
   // Replace a stale Coloop MCP registration, then re-read it before continuing.
   let mcp = await dependencies.runCodex(["mcp", "get", "--json", "coloop"]);
   if (
-    mcp.exitCode !== 0 ||
+    !mcp.ok ||
     !isExpectedMcpConfiguration(mcp.stdout, dependencies)
   ) {
-    if (mcp.exitCode === 0) {
+    if (mcp.ok) {
       const removed = await dependencies.runCodex(["mcp", "remove", "coloop"]);
-      if (removed.exitCode !== 0) {
+      if (!removed.ok) {
         throw new Error("Stale Codex MCP entry point could not be replaced.");
       }
     }
@@ -206,13 +221,13 @@ export const installAndVerifyCodexIntegration = async (
       ...dependencies.coloopEntrypoint.args,
       "mcp",
     ]);
-    if (added.exitCode !== 0) {
+    if (!added.ok) {
       throw new Error("Codex MCP entry point could not be installed.");
     }
     mcp = await dependencies.runCodex(["mcp", "get", "--json", "coloop"]);
   }
   if (
-    mcp.exitCode !== 0 ||
+    !mcp.ok ||
     !isExpectedMcpConfiguration(mcp.stdout, dependencies)
   ) {
     throw new Error("Codex MCP entry point could not be verified.");
@@ -223,13 +238,13 @@ export const installAndVerifyCodexIntegration = async (
   const hooksPath = join(codexHome, "hooks.json");
   let document: HooksFile = {};
   try {
-    const parsed = JSON.parse(await readFile(hooksPath, "utf8")) as unknown;
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    const parsed: unknown = JSON.parse(await readFile(hooksPath, "utf8"));
+    if (!isRecord(parsed)) {
       throw new Error("invalid hooks document");
     }
-    document = parsed as HooksFile;
+    document = parsed;
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+    if (!hasErrorCode(error, "ENOENT")) {
       throw new Error("Existing Codex hooks.json is not valid JSON.");
     }
   }
@@ -268,5 +283,8 @@ export const installAndVerifyCodexIntegration = async (
   });
   await chmod(hooksPath, 0o600);
 
-  await verifyCodexIntegration(codexHome, dependencies);
+  const verification = await verifyCodexIntegration(codexHome, dependencies);
+  if (!verification.ok) {
+    throw new Error("Codex integration could not be verified after installation.");
+  }
 };

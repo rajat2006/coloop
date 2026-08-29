@@ -4,34 +4,55 @@ import { join } from "node:path";
 import { Readable, Writable } from "node:stream";
 import { describe, expect, test } from "vitest";
 import type { CommandResult } from "@coloop/coding-agent-codex";
-import { CredentialRejectedError } from "@coloop/core";
+import {
+  parseDiscordApplicationId,
+  parseDiscordChannelId,
+  parseDiscordGuildId,
+  parseDiscordUserId,
+  type DiscordGuildId,
+  type Result,
+} from "@coloop/core";
 import type {
   DiscordApplication,
   DiscordChannel,
   DiscordGuild,
   DiscordMember,
 } from "@coloop/discord";
-import type { ColoopDependencies } from "./dependencies.js";
-import { runCli as runCliApplication } from "./run-cli.js";
+import type { ColoopDependencies } from "../dependencies.js";
+import { runCli as runCliApplication } from "../run-cli.js";
 
-const ownerId = "123456789012345678";
-const replacementOwnerId = "987654321098765432";
+const valueOf = <Value>(
+  result: Result<Value, "invalid-discord-id">,
+): Value => {
+  if (!result.ok) throw new Error("invalid test fixture");
+  return result.value;
+};
 
-const readyFixture = {
+const applicationId = valueOf(
+  parseDiscordApplicationId("100000000000000001"),
+);
+const guildId = valueOf(parseDiscordGuildId("200000000000000002"));
+const channelId = valueOf(parseDiscordChannelId("300000000000000003"));
+const ownerId = valueOf(parseDiscordUserId("123456789012345678"));
+const replacementOwnerId = valueOf(
+  parseDiscordUserId("987654321098765432"),
+);
+
+const readyFixture: Fixture = {
   discord: {
     expectedCredential: "discord-test-secret",
     credentialValid: true,
     providerUnavailable: false,
     application: {
-      id: "100000000000000001",
+      id: applicationId,
       name: "Coloop Test",
       messageContentIntentEnabled: true,
     },
-    guilds: [{ id: "200000000000000002", name: "Test Guild" }],
+    guilds: [{ id: guildId, name: "Test Guild" }],
     channels: [
       {
-        id: "300000000000000003",
-        guildId: "200000000000000002",
+        id: channelId,
+        guildId,
         name: "collaboration",
         type: "GUILD_TEXT",
         permissions: "345744935936",
@@ -39,7 +60,7 @@ const readyFixture = {
     ],
     members: [
       {
-        guildId: "200000000000000002",
+        guildId,
         id: ownerId,
         username: "owner",
         displayName: "Owner Example",
@@ -75,7 +96,7 @@ interface Fixture {
     credentialValid: boolean;
     expectedCredential: string;
     guilds: DiscordGuild[];
-    members: Array<DiscordMember & { guildId: string }>;
+    members: Array<DiscordMember & { guildId: DiscordGuildId }>;
     providerUnavailable?: boolean;
   };
   openai: {
@@ -121,41 +142,48 @@ const createDependencies = (
     discord: {
       async connectGateway(token) {
         if (!fixture.discord.credentialValid || token !== fixture.discord.expectedCredential) {
-          throw new CredentialRejectedError();
+          return { ok: false, reason: "credential-rejected" };
         }
         state.runtimeStarts += 1;
-        return { close: async () => {} };
+        return { ok: true, value: { close: async () => {} } };
       },
       async getApplication(token) {
         if (fixture.discord.providerUnavailable) {
-          throw new Error("provider_unavailable");
+          return { ok: false, reason: "provider-unavailable" };
         }
         if (!fixture.discord.credentialValid || token !== fixture.discord.expectedCredential) {
-          throw new CredentialRejectedError();
+          return { ok: false, reason: "credential-rejected" };
         }
-        return fixture.discord.application;
+        return { ok: true, value: fixture.discord.application };
       },
       async listChannels(token, guildId) {
         if (!fixture.discord.credentialValid || token !== fixture.discord.expectedCredential) {
-          throw new CredentialRejectedError();
+          return { ok: false, reason: "credential-rejected" };
         }
-        return fixture.discord.channels.filter((channel) => channel.guildId === guildId);
+        return {
+          ok: true,
+          value: fixture.discord.channels.filter(
+            (channel) => channel.guildId === guildId,
+          ),
+        };
       },
       async listGuilds(token) {
         if (!fixture.discord.credentialValid || token !== fixture.discord.expectedCredential) {
-          throw new CredentialRejectedError();
+          return { ok: false, reason: "credential-rejected" };
         }
-        return fixture.discord.guilds;
+        return { ok: true, value: fixture.discord.guilds };
       },
       async resolveMember(token, guildId, userId) {
         if (!fixture.discord.credentialValid || token !== fixture.discord.expectedCredential) {
-          throw new CredentialRejectedError();
+          return { ok: false, reason: "credential-rejected" };
         }
-        return (
-          fixture.discord.members.find(
-            (member) => member.guildId === guildId && member.id === userId,
-          ) ?? null
+        const member = fixture.discord.members.find(
+          (candidate) =>
+            candidate.guildId === guildId && candidate.id === userId,
         );
+        return member
+          ? { ok: true, value: member }
+          : { ok: false, reason: "resource-not-found" };
       },
     },
     openExternal: async (url) => {
@@ -164,31 +192,32 @@ const createDependencies = (
     openai: {
       async validateCredential(apiKey) {
         if (fixture.openai.providerUnavailable) {
-          throw new Error("provider_unavailable");
+          return { ok: false, reason: "provider-unavailable" };
         }
         if (!fixture.openai.credentialValid || apiKey !== fixture.openai.expectedCredential) {
-          throw new CredentialRejectedError();
+          return { ok: false, reason: "credential-rejected" };
         }
+        return { ok: true };
       },
     },
     runCodex: async (args): Promise<CommandResult> => {
       if (args[0] === "--version") {
-        return { exitCode: 0, stderr: "", stdout: `${fixture.codex.version}\n` };
+        return { ok: true, stderr: "", stdout: `${fixture.codex.version}\n` };
       }
       if (args[0] === "mcp" && args[1] === "add") {
         state.mcpCommandValid = true;
         state.mcpInstalled = true;
-        return { exitCode: 0, stderr: "", stdout: "Added MCP server\n" };
+        return { ok: true, stderr: "", stdout: "Added MCP server\n" };
       }
       if (args[0] === "mcp" && args[1] === "remove") {
         state.codexRepairs += 1;
         state.mcpInstalled = false;
-        return { exitCode: 0, stderr: "", stdout: "Removed MCP server\n" };
+        return { ok: true, stderr: "", stdout: "Removed MCP server\n" };
       }
       if (args[0] === "mcp" && args[1] === "get") {
         return state.mcpInstalled
           ? {
-              exitCode: 0,
+              ok: true,
               stderr: "",
               stdout: JSON.stringify({
                 enabled: true,
@@ -202,16 +231,34 @@ const createDependencies = (
                 },
               }),
             }
-          : { exitCode: 1, stderr: "not found\n", stdout: "" };
+          : {
+              exitCode: 1,
+              ok: false,
+              reason: "command-failed",
+              stderr: "not found\n",
+              stdout: "",
+            };
       }
-      return { exitCode: 1, stderr: "unsupported command\n", stdout: "" };
+      return {
+        exitCode: 1,
+        ok: false,
+        reason: "command-failed",
+        stderr: "unsupported command\n",
+        stdout: "",
+      };
     },
     runColoop: async (args) => {
       if (args[0] !== "verify-entrypoint") {
-        return { exitCode: 1, stderr: "unsupported command\n", stdout: "" };
+        return {
+          exitCode: 1,
+          ok: false,
+          reason: "command-failed",
+          stderr: "unsupported command\n",
+          stdout: "",
+        };
       }
       return {
-        exitCode: 0,
+        ok: true,
         stderr: "",
         stdout: `${JSON.stringify({
           id: 2,
@@ -227,7 +274,7 @@ const createDependencies = (
 const runCli = async (
   args: string[],
   input: string,
-  fixture: object = readyFixture,
+  fixture: Fixture = readyFixture,
   environment: Record<string, string | undefined> = {},
   existingRoot?: string,
 ): Promise<CliResult> => {
@@ -244,7 +291,7 @@ const runCli = async (
   installationStates.set(root, state);
   const code = await runCliApplication(
     args,
-    createDependencies(fixture as Fixture, openedUrls, state),
+    createDependencies(fixture, openedUrls, state),
     {
       HOME: join(root, "home"),
       XDG_CONFIG_HOME: join(root, "config"),
@@ -322,7 +369,7 @@ describe("coloop CLI", () => {
     expect(result.mcpInstalled).toBe(true);
 
     const configPath = join(result.root, "config", "coloop", "config.json");
-    const config = JSON.parse(await readFile(configPath, "utf8")) as object;
+    const config: unknown = JSON.parse(await readFile(configPath, "utf8"));
     expect(config).toEqual({
       schemaVersion: 1,
       discordApplicationId: "100000000000000001",
@@ -335,18 +382,17 @@ describe("coloop CLI", () => {
     const artifactsPath = join(result.root, "state", "coloop", "episodes");
     expect((await stat(databasePath)).mode & 0o777).toBe(0o600);
     expect((await stat(artifactsPath)).mode & 0o777).toBe(0o700);
-    const hooks = JSON.parse(
+    const hooks: unknown = JSON.parse(
       await readFile(join(result.root, "home", ".codex", "hooks.json"), "utf8"),
-    ) as {
-      hooks: {
-        PreToolUse: Array<{ matcher: string }>;
-        UserPromptSubmit: unknown[];
-      };
-    };
-    expect(hooks.hooks.PreToolUse).toContainEqual(
-      expect.objectContaining({ matcher: "^mcp__coloop__open_episode$" }),
     );
-    expect(hooks.hooks.UserPromptSubmit).toHaveLength(1);
+    expect(hooks).toMatchObject({
+      hooks: {
+        PreToolUse: [
+          expect.objectContaining({ matcher: "^mcp__coloop__open_episode$" }),
+        ],
+        UserPromptSubmit: [expect.any(Object)],
+      },
+    });
   });
 
   test("plain setup resumes at the first failed saved step", async () => {
@@ -414,10 +460,10 @@ describe("coloop CLI", () => {
     expect(repaired.stdout).toContain(
       `Resolved Owner: Replacement Owner (@replacement-owner, ${replacementOwnerId})`,
     );
-    const config = JSON.parse(
+    const config: unknown = JSON.parse(
       await readFile(join(repaired.root, "config", "coloop", "config.json"), "utf8"),
-    ) as { ownerUserId: string };
-    expect(config.ownerUserId).toBe(replacementOwnerId);
+    );
+    expect(config).toMatchObject({ ownerUserId: replacementOwnerId });
   });
 
   test("plain setup repairs a stale Codex MCP entry point", async () => {
@@ -506,7 +552,7 @@ describe("coloop CLI", () => {
   test("setup rejects a dedicated application installed in more than one server", async () => {
     const installedTwice = structuredClone(readyFixture);
     installedTwice.discord.guilds.push({
-      id: "200000000000000099",
+      id: valueOf(parseDiscordGuildId("200000000000000099")),
       name: "Unexpected Guild",
     });
 
@@ -533,9 +579,9 @@ describe("coloop CLI", () => {
       `Discord user ${ownerId} could not be resolved in the configured server.`,
     );
     expect(result.stdout).not.toContain("Resolved Owner:");
-    const config = JSON.parse(
+    const config: unknown = JSON.parse(
       await readFile(join(result.root, "config", "coloop", "config.json"), "utf8"),
-    ) as Record<string, unknown>;
+    );
     expect(config).not.toHaveProperty("ownerUserId");
   });
 
@@ -579,7 +625,7 @@ describe("coloop CLI", () => {
     const unrelatedChannelAccess = structuredClone(readyFixture);
     unrelatedChannelAccess.discord.channels.push({
       guildId: readyFixture.discord.guilds[0]!.id,
-      id: "300000000000000099",
+      id: valueOf(parseDiscordChannelId("300000000000000099")),
       name: "general",
       permissions: "1024",
       type: "GUILD_TEXT",
@@ -642,54 +688,4 @@ describe("coloop CLI", () => {
     expect(result.stdout).not.toContain(readyFixture.openai.expectedCredential);
   });
 
-  test("run starts the configured runtime in the foreground and gates on credentials", async () => {
-    const setup = await runCli(
-      ["setup"],
-      `y\ny\ny\n${ownerId}\ny\n`,
-    );
-    expect(setup.code).toBe(0);
-
-    const started = await runCli(
-      ["run"],
-      "",
-      readyFixture,
-      {},
-      setup.root,
-    );
-
-    expect(started.code).toBe(0);
-    expect(started.runtimeStarts).toBe(1);
-    expect(started.stdout).toContain("Readiness check passed.");
-    expect(started.stdout).toContain(
-      "Coloop is running in the foreground for Test Guild/#collaboration.",
-    );
-
-    const missingCredential = await runCli(
-      ["run"],
-      "",
-      readyFixture,
-      { OPENAI_API_KEY: undefined },
-      setup.root,
-    );
-    expect(missingCredential.code).toBe(1);
-    expect(missingCredential.stderr).toContain(
-      "OPENAI_API_KEY is required to start Coloop.",
-    );
-    expect(missingCredential.runtimeStarts).toBe(1);
-
-    const invalidProvider = structuredClone(readyFixture);
-    invalidProvider.openai.credentialValid = false;
-    const rejectedCredential = await runCli(
-      ["run"],
-      "",
-      invalidProvider,
-      {},
-      setup.root,
-    );
-    expect(rejectedCredential.code).toBe(1);
-    expect(rejectedCredential.stderr).toContain(
-      "OPENAI_API_KEY was rejected by OpenAI Platform.",
-    );
-    expect(rejectedCredential.runtimeStarts).toBe(1);
-  });
 });

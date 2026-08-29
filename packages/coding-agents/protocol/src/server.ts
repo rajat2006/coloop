@@ -8,6 +8,28 @@ interface JsonRpcRequest {
   params?: unknown;
 }
 
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+const parseRequest = (line: string): JsonRpcRequest | null => {
+  const parsed: unknown = JSON.parse(line);
+  if (!isRecord(parsed)) return null;
+  const id = parsed.id;
+  if (
+    id !== undefined &&
+    typeof id !== "string" &&
+    typeof id !== "number"
+  ) {
+    return null;
+  }
+  return {
+    ...(id === undefined ? {} : { id }),
+    jsonrpc: parsed.jsonrpc,
+    method: parsed.method,
+    params: parsed.params,
+  };
+};
+
 const writeMessage = (output: Writable, value: object): void => {
   output.write(`${JSON.stringify(value)}\n`);
 };
@@ -35,7 +57,9 @@ export const runMcpServer = async (
   for await (const line of lines) {
     let request: JsonRpcRequest;
     try {
-      request = JSON.parse(line) as JsonRpcRequest;
+      const parsed = parseRequest(line);
+      if (!parsed) throw new Error("invalid request");
+      request = parsed;
     } catch {
       writeMessage(output, {
         error: { code: -32700, message: "Parse error" },
@@ -49,7 +73,7 @@ export const runMcpServer = async (
       continue;
     }
     if (request.method === "initialize") {
-      const params = request.params as { protocolVersion?: unknown } | undefined;
+      const params = isRecord(request.params) ? request.params : undefined;
       writeMessage(output, {
         id: request.id,
         jsonrpc: "2.0",
@@ -73,7 +97,7 @@ export const runMcpServer = async (
       continue;
     }
     if (request.method === "tools/call") {
-      const params = request.params as { name?: unknown } | undefined;
+      const params = isRecord(request.params) ? request.params : undefined;
       if (params?.name !== "open_episode") {
         writeMessage(output, {
           error: { code: -32602, message: "Unknown tool" },

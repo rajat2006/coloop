@@ -42,14 +42,16 @@ describe("Codex CLI integration entry points", () => {
 
     expect(exitCode).toBe(0);
     expect(error.value).toBe("");
-    const response = JSON.parse(output.value) as {
-      hookSpecificOutput: { updatedInput: Record<string, unknown> };
-    };
-    expect(response.hookSpecificOutput.updatedInput).toEqual({
-      _origin_session_id: "trusted-session",
-      _origin_transcript_path: "/trusted/transcript.jsonl",
-      _origin_turn_id: "trusted-turn",
-      opening_brief: "Please review this bounded question.",
+    const response: unknown = JSON.parse(output.value);
+    expect(response).toMatchObject({
+      hookSpecificOutput: {
+        updatedInput: {
+          _origin_session_id: "trusted-session",
+          _origin_transcript_path: "/trusted/transcript.jsonl",
+          _origin_turn_id: "trusted-turn",
+          opening_brief: "Please review this bounded question.",
+        },
+      },
     });
   });
 

@@ -9,13 +9,16 @@ packages/
 │   └── src/
 │       ├── main.ts                           # Dispatches public and integration entry points
 │       ├── run-cli.ts                        # Parses CLI commands and reports failures
-│       ├── run-cli.test.ts                   # Exercises setup and runtime through the CLI boundary
 │       ├── black-box.test.ts                 # Exercises the built executable as a child process
 │       ├── dependencies.ts                   # Defines the services required by CLI flows
 │       ├── production-dependencies.ts        # Wires production implementations together
+│       ├── readiness.ts                      # Performs the shared startup/readiness inspection
+│       ├── readiness.test.ts                 # Verifies complete and failed readiness results
 │       ├── commands/
 │       │   ├── setup.ts                      # Runs the interactive installation flow
-│       │   └── run.ts                        # Verifies readiness and starts the foreground runtime
+│       │   ├── setup.test.ts                 # Verifies setup, recovery, privacy, and permissions
+│       │   ├── run.ts                        # Starts the ready foreground runtime
+│       │   └── run.test.ts                   # Verifies runtime gating and Gateway cleanup
 │       ├── system/
 │       │   ├── environment.ts                # Removes secrets from child-process environments
 │       │   ├── open-browser.ts               # Opens Owner-action URLs with the host OS
@@ -30,9 +33,12 @@ packages/
 ├── core/                                     # Shared Coloop policy and domain types
 │   └── src/
 │       ├── index.ts                          # Exposes the core package's public API
-│       ├── credential-error.ts               # Represents rejected provider credentials
+│       ├── result.ts                         # Defines shared discriminated result shapes
+│       ├── discord-ids.ts                    # Validates and distinguishes Discord identities
+│       ├── discord-ids.test.ts               # Verifies Discord snowflake validation
 │       └── installation/
-│           └── installation-config.ts        # Defines configuration and readiness invariants
+│           ├── installation-config.ts        # Defines configuration and readiness invariants
+│           └── installation-config.test.ts   # Verifies complete and incomplete configuration
 ├── coding-agents/                            # Coding-agent protocols and client integrations
 │   ├── protocol/
 │   │   └── src/
@@ -44,18 +50,24 @@ packages/
 │           ├── index.ts                      # Exposes the Codex package's public API
 │           ├── hooks.ts                      # Validates Codex hook events and trusted context
 │           ├── hooks.test.ts                 # Verifies hook identity and fail-closed behavior
-│           └── installation.ts               # Installs and verifies Codex CLI integration
+│           ├── installation.ts               # Installs and verifies Codex CLI integration
+│           └── installation.test.ts          # Verifies installation and external JSON validation
 ├── agent-runtimes/                           # SDK-backed runtimes used by Episode agents
 │   └── openai-agents/
-│       └── src/index.ts                      # Owns OpenAI runtime credentials and future SDK setup
+│       └── src/
+│           ├── index.ts                      # Owns OpenAI runtime credentials and future SDK setup
+│           └── index.test.ts                 # Verifies credential outcome classification
 ├── collaboration-channels/                   # External collaboration transports
 │   └── discord/
-│       └── src/index.ts                      # Owns Discord API, Gateway, and permission policy
+│       └── src/
+│           ├── index.ts                      # Owns Discord API, Gateway, and permission policy
+│           └── index.test.ts                 # Verifies payload and least-privilege validation
 └── storage/                                  # Persistence implementations
     └── local/
         └── src/
             ├── index.ts                      # Exposes the local-storage package's public API
-            └── local-storage.ts              # Owns local config, SQLite, and artifact paths
+            ├── local-storage.ts              # Owns local config, SQLite, and artifact paths
+            └── local-storage.test.ts         # Verifies private config and storage readiness
 ```
 
 Additional coding clients such as Claude Code or Cursor belong beside `codex`.
