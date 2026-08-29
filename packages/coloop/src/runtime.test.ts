@@ -1217,12 +1217,8 @@ describe("Discord Episode Agent conversation", () => {
     ).resolves.toEqual({ ok: true, interruptedEpisodes: 1 });
     expect(fixture.discord.interruptionEffects).toEqual([]);
     await expect(
-      fixture.runtime.handleDiscordMessage(
-        discordMessage("missed-event", "@Coloop continue after reconnect"),
-      ),
-    ).resolves.toMatchObject({ ok: false, code: "EPISODE_INTERRUPTED" });
-
-    expect(fixture.recordingAgent.inputs).toEqual([]);
+      fixture.runtime.handleConnectedPathAvailable(),
+    ).resolves.toEqual({ ok: true, presentedEpisodes: 1 });
     expect(fixture.discord.interruptionEffects).toEqual([
       {
         kind: "present_interruption",
@@ -1233,6 +1229,14 @@ describe("Discord Episode Agent conversation", () => {
         finalizationDisabled: true,
       },
     ]);
+    await expect(
+      fixture.runtime.handleDiscordMessage(
+        discordMessage("missed-event", "@Coloop continue after reconnect"),
+      ),
+    ).resolves.toMatchObject({ ok: false, code: "EPISODE_INTERRUPTED" });
+
+    expect(fixture.recordingAgent.inputs).toEqual([]);
+    expect(fixture.discord.interruptionEffects).toHaveLength(1);
     const database = new DatabaseSync(fixture.databasePath);
     expect(
       database
@@ -1754,77 +1758,51 @@ describe("Discord Episode Agent conversation", () => {
   });
 
   it("does not acknowledge begin, append, or completion delivery failures", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "coloop-delivery-failure-"));
-    temporaryDirectories.push(directory);
-    const databasePath = join(directory, "coloop.sqlite");
-    const transcriptPath = join(directory, "rollout.jsonl");
-    await writeFile(
-      transcriptPath,
-      fixtureTranscript("origin-1", [ownerMessage("Review the rollout plan.")]),
-    );
-    const discord = new RecordingDiscordTransport(false, false, [
-      "begin",
-      "append",
-      "complete",
-    ]);
-    const agent = new RecordingEpisodeAgent([
-      { deltas: ["Undeliverable append"], responseId: "response-1" },
-      { deltas: ["Undeliverable completion"], responseId: "response-2" },
-    ]);
-    const runtime = createColoopRuntime({
-      databasePath,
-      artifactDirectory: join(directory, "episodes"),
-      ownerDiscordUserId: "1001",
-      guildId: "2002",
-      parentChannelId: "3003",
-      discord,
-      agent,
-    });
-    const opened = await runtime.handleCodexOperation({
-      hook: trustedHook("origin-1", transcriptPath),
-      approval: approveOwnerOnlyOpen(
-        "tool-use-1",
-        "# Review",
-        "Review the rollout plan.",
-      ),
-      request: {
-        operation: "open_episode",
-        arguments: {
-          openingBrief: "# Review",
-          originalRequest: "Review the rollout plan.",
-        },
-      },
-    });
-    if (!opened.ok) throw new Error(opened.reason);
-
-    await expect(
-      runtime.handleDiscordMessage(
-        discordMessage("begin-failure", "@Coloop begin-failure"),
-      ),
-    ).resolves.toMatchObject({ ok: false, code: "DISCORD_DELIVERY_FAILED" });
-    for (const eventId of ["append-failure", "complete-failure"]) {
+    const boundaries = [
+      { failure: "begin" as const, effects: [] },
+      { failure: "append" as const, effects: ["begin"] },
+      { failure: "complete" as const, effects: ["begin", "delta"] },
+    ];
+    for (const boundary of boundaries) {
+      const discord = new RecordingDiscordTransport(false, false, [
+        boundary.failure,
+      ]);
+      const fixture = await openProposalFixture({
+        discord,
+        agent: new RecordingEpisodeAgent([
+          { deltas: ["Undeliverable response"], responseId: "response-1" },
+        ]),
+      });
+      const eventId = `${boundary.failure}-failure`;
       await expect(
-        runtime.handleDiscordMessage(
+        fixture.runtime.handleDiscordMessage(
           discordMessage(eventId, `@Coloop ${eventId}`),
         ),
-      ).resolves.toMatchObject({ ok: false, code: "EPISODE_INTERRUPTED" });
+      ).resolves.toMatchObject({ ok: false, code: "DISCORD_DELIVERY_FAILED" });
+      expect(
+        discord.agentResponseEffects.map((effect) =>
+          "kind" in effect ? effect.kind : undefined,
+        ),
+      ).toEqual(boundary.effects);
+      const database = new DatabaseSync(fixture.databasePath);
+      expect(
+        database
+          .prepare(
+            `SELECT provider_inbox.status, provider_inbox.completed_at,
+                    episodes.agent_previous_response_id
+             FROM provider_inbox JOIN episodes
+               ON episodes.id = provider_inbox.episode_id
+             WHERE provider_inbox.provider_event_id = ?`,
+          )
+          .get(eventId),
+      ).toEqual({
+        status: "FAILED",
+        completed_at: null,
+        agent_previous_response_id: null,
+      });
+      database.close();
+      fixture.runtime.close();
     }
-
-    const database = new DatabaseSync(databasePath);
-    expect(
-      database
-        .prepare(
-          "SELECT status, completed_at FROM provider_inbox WHERE effect_kind = 'agent_turn' ORDER BY received_at",
-        )
-        .all(),
-    ).toEqual([{ status: "FAILED", completed_at: null }]);
-    expect(
-      database
-        .prepare("SELECT agent_previous_response_id FROM episodes")
-        .get(),
-    ).toEqual({ agent_previous_response_id: null });
-    database.close();
-    runtime.close();
   });
 
   it("presents selective Context Package answers and explicit missing context", async () => {
@@ -2375,6 +2353,12 @@ describe("Outcome Proposal collaboration", () => {
       ]),
       createId: () => "proposal-revision-after-restart",
     });
+
+    await expect(runtime.handleConnectedPathAvailable()).resolves.toEqual({
+      ok: true,
+      presentedEpisodes: 1,
+    });
+    expect(discord.interruptionEffects).toHaveLength(1);
 
     await expect(
       runtime.handleDiscordMessage({

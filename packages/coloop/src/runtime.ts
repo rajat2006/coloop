@@ -234,6 +234,10 @@ export interface CodexEpisodeRuntime {
   handleConnectedPathInterruption(input: {
     readonly kind: "RUNTIME_INTERRUPTED" | "DISCORD_GATEWAY_INTERRUPTED";
   }): Promise<{ readonly ok: true; readonly interruptedEpisodes: number }>;
+  handleConnectedPathAvailable(): Promise<{
+    readonly ok: true;
+    readonly presentedEpisodes: number;
+  }>;
   handleCodexPromptSubmit(input: {
     readonly hook: unknown;
     readonly inject: (additionalContext: string) => Promise<void>;
@@ -464,6 +468,9 @@ export function createColoopRuntime(configuration: RuntimeConfiguration): CodexE
     async handleConnectedPathInterruption(input) {
       return await interruptConnectedEpisodes(database, configuration, input.kind, now);
     },
+    async handleConnectedPathAvailable() {
+      return await presentPendingInterruptions(database, configuration);
+    },
     close(): void {
       database.close();
     },
@@ -623,20 +630,50 @@ async function interruptConnectedEpisodes(
   const interruptedAt = now().toISOString();
   let interruptedEpisodes = 0;
   for (const episode of episodes) {
-    const result = database
-      .prepare(
-        `INSERT OR IGNORE INTO episode_interruptions
-         (episode_id, error_class, interrupted_at, presented_at)
-         VALUES (?, ?, ?, NULL)`,
+    if (
+      await recordAndPresentInterruption(
+        database,
+        configuration,
+        episode,
+        errorClass,
+        interruptedAt,
       )
-      .run(episode.id, errorClass, interruptedAt);
-    interruptedEpisodes += Number(result.changes);
-    const interruption = findEpisodeInterruption(database, episode.id);
-    if (interruption !== undefined) {
-      await presentInterruption(database, configuration, episode, interruption);
+    ) {
+      interruptedEpisodes += 1;
     }
   }
   return { ok: true, interruptedEpisodes };
+}
+
+async function presentPendingInterruptions(
+  database: DatabaseSync,
+  configuration: RuntimeConfiguration,
+): Promise<{ readonly ok: true; readonly presentedEpisodes: number }> {
+  const episodes = database
+    .prepare(
+      `SELECT episodes.* FROM episodes JOIN episode_interruptions
+         ON episode_interruptions.episode_id = episodes.id
+       WHERE episodes.phase IN ('OPENING', 'ACTIVE')
+         AND episodes.thread_id IS NOT NULL
+         AND episode_interruptions.presented_at IS NULL`,
+    )
+    .all()
+    .map((value) => {
+      const episode = parseEpisodeRow(value);
+      if (episode === undefined) throw new Error("Episode state is malformed.");
+      return episode;
+    });
+  let presentedEpisodes = 0;
+  for (const episode of episodes) {
+    const interruption = findEpisodeInterruption(database, episode.id);
+    if (
+      interruption !== undefined &&
+      (await presentInterruption(database, configuration, episode, interruption))
+    ) {
+      presentedEpisodes += 1;
+    }
+  }
+  return { ok: true, presentedEpisodes };
 }
 
 function recordRuntimeRestartInterruptions(
@@ -661,17 +698,34 @@ async function interruptEpisode(
   errorClass: ConnectedPathInterruptionClass,
   now: () => Date,
 ): Promise<void> {
-  database
+  await recordAndPresentInterruption(
+    database,
+    configuration,
+    episode,
+    errorClass,
+    now().toISOString(),
+  );
+}
+
+async function recordAndPresentInterruption(
+  database: DatabaseSync,
+  configuration: RuntimeConfiguration,
+  episode: EpisodeRow,
+  errorClass: ConnectedPathInterruptionClass,
+  interruptedAt: string,
+): Promise<boolean> {
+  const result = database
     .prepare(
       `INSERT OR IGNORE INTO episode_interruptions
        (episode_id, error_class, interrupted_at, presented_at)
        VALUES (?, ?, ?, NULL)`,
     )
-    .run(episode.id, errorClass, now().toISOString());
+    .run(episode.id, errorClass, interruptedAt);
   const interruption = findEpisodeInterruption(database, episode.id);
   if (interruption !== undefined) {
     await presentInterruption(database, configuration, episode, interruption);
   }
+  return result.changes === 1;
 }
 
 function findEpisodeInterruption(
@@ -704,8 +758,8 @@ async function presentInterruption(
   configuration: RuntimeConfiguration,
   episode: EpisodeRow,
   interruption: EpisodeInterruptionRow,
-): Promise<void> {
-  if (episode.thread_id === null || interruption.presented_at !== null) return;
+): Promise<boolean> {
+  if (episode.thread_id === null || interruption.presented_at !== null) return false;
   try {
     await configuration.discord.presentInterruption({
       guildId: episode.guild_id,
@@ -714,7 +768,9 @@ async function presentInterruption(
       finalizationDisabled: true,
     });
   } catch {
-    return;
+    // Keep presentation unacknowledged so the next connected-path input retries
+    // the one actionable status after Discord becomes available again.
+    return false;
   }
   database
     .prepare(
@@ -722,6 +778,7 @@ async function presentInterruption(
        WHERE episode_id = ? AND presented_at IS NULL`,
     )
     .run(new Date().toISOString(), episode.id);
+  return true;
 }
 
 function isConnectedPathInterruptionClass(
