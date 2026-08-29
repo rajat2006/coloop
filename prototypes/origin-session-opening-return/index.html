@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Try the Coloop handoff</title>
+  <style>
+    :root { --ink:#202521; --muted:#68716b; --paper:#f6f5f0; --card:#fff; --line:#d9ddd7; --accent:#176b52; --soft:#e9f3ee; --warn:#9a442e; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--paper); color:var(--ink); font:16px/1.55 ui-sans-serif,system-ui,-apple-system,sans-serif; }
+    main { width:min(720px,calc(100% - 32px)); margin:48px auto 80px; }
+    h1 { margin:12px 0; font-size:clamp(32px,7vw,52px); line-height:1.04; letter-spacing:-.04em; }
+    h2,h3,p { margin-top:0; }
+    .eyebrow { color:var(--accent); font-size:13px; font-weight:800; letter-spacing:.08em; text-transform:uppercase; }
+    .lede { color:var(--muted); font-size:19px; max-width:620px; }
+    .progress { height:6px; background:#dfe3df; border-radius:99px; overflow:hidden; margin:28px 0 10px; }
+    .progress span { display:block; height:100%; width:25%; background:var(--accent); transition:width .2s ease; }
+    .progress-label { color:var(--muted); font-size:14px; }
+    .card { margin-top:20px; padding:26px; border:1px solid var(--line); border-radius:16px; background:var(--card); box-shadow:0 8px 28px rgba(35,45,38,.06); }
+    .callout { padding:14px 16px; background:var(--soft); border-radius:10px; margin:18px 0; }
+    .private { border-left:4px solid var(--accent); }
+    textarea,input { width:100%; border:1px solid var(--line); border-radius:10px; background:#fcfcfa; color:var(--ink); font:inherit; padding:12px; }
+    textarea { min-height:155px; resize:vertical; }
+    label { display:block; margin:18px 0 7px; font-weight:700; }
+    button { display:block; width:100%; margin-top:20px; border:0; border-radius:11px; padding:13px 16px; background:var(--accent); color:white; font:inherit; font-weight:800; cursor:pointer; }
+    button:hover { filter:brightness(.94); }
+    button.secondary { background:white; color:var(--ink); border:1px solid var(--line); }
+    button.small { display:inline-block; width:auto; margin:6px 6px 0 0; padding:8px 10px; font-weight:650; font-size:14px; }
+    .hidden { display:none; }
+    .discord { border-left:4px solid #5865f2; }
+    .message { padding:14px 16px; border:1px solid var(--line); border-radius:11px; margin:12px 0; }
+    .message strong { display:block; margin-bottom:4px; }
+    .outcome { border-color:#94bea9; background:#f7fbf8; }
+    .success { color:var(--accent); font-weight:800; }
+    details { margin-top:20px; border-top:1px solid var(--line); padding-top:16px; color:var(--muted); }
+    summary { cursor:pointer; font-weight:700; color:var(--ink); }
+    dl { display:grid; grid-template-columns:150px 1fr; gap:7px 14px; font-size:14px; }
+    dt { font-weight:700; color:var(--ink); } dd { margin:0; overflow-wrap:anywhere; }
+    .toast { min-height:24px; margin:12px 0 0; color:var(--warn); font-weight:700; }
+    code { background:#edf0ec; padding:2px 5px; border-radius:5px; }
+    @media (max-width:560px) { .card { padding:20px; } dl { grid-template-columns:1fr; gap:2px; } dd { margin-bottom:8px; } }
+  </style>
+</head>
+<body>
+<main>
+  <div class="eyebrow">30-second prototype</div>
+  <h1>Try sending part of this Codex conversation to collaborators.</h1>
+  <p class="lede">There is one action at each step. Keep clicking the green button and notice whether the handoff and return feel natural.</p>
+
+  <div class="progress"><span id="progress"></span></div>
+  <div class="progress-label" id="progressLabel">Step 1 of 4 · Review before sharing</div>
+
+  <section class="card" id="step1">
+    <h2>Review before sharing</h2>
+    <div class="callout private">
+      <strong>Privately shared with the Episode Agent</strong><br>
+      The visible text from this Codex conversation so far. Hidden instructions,
+      reasoning, tool activity, files, and attachments are not included.
+    </div>
+
+    <label for="brief">What collaborators will see in Discord</label>
+    <textarea id="brief">**Objective:** Challenge whether a two-week beta with five maintainers is the right launch.
+
+**Background:** We are choosing between a narrow beta and a broad launch.
+
+**Requested input:** Identify missing exit criteria, operational risks, and who should own support.</textarea>
+
+    <button id="open">Approve and open collaboration</button>
+  </section>
+
+  <section class="card hidden" id="step2">
+    <h2>The collaboration is active in Discord</h2>
+    <div class="callout discord">
+      <strong>Coloop opened a private Discord thread</strong><br>
+      Collaborators can discuss the question with the Episode Agent. You can
+      return to Codex while they work.
+    </div>
+    <p><span class="success">Active</span> · Episode <code>ep_7b10d8c2fa</code></p>
+    <p>For this prototype, press the button to simulate the Owner accepting the final proposal in Discord.</p>
+    <button id="finalize">Simulate “Finalize and Return” in Discord</button>
+  </section>
+
+  <section class="card hidden" id="step3">
+    <h2>The outcome is ready—but Codex does not interrupt you</h2>
+    <p>Nothing pops up while this conversation is idle. The outcome will appear automatically when you next talk to Codex.</p>
+    <label for="nextPrompt">Your next, unrelated Codex message</label>
+    <input id="nextPrompt" value="Now draft the launch checklist.">
+    <button id="sendPrompt">Send message to Codex</button>
+  </section>
+
+  <section class="card hidden" id="step4">
+    <h2>Codex receives the outcome before continuing</h2>
+    <div class="message outcome">
+      <strong>Codex · returned Collaboration Episode outcome</strong>
+      <b>Result:</b> Run a two-week beta with five maintainers.<br><br>
+      <b>Unresolved point:</b> Choose the support channel owner.
+    </div>
+    <div class="message">
+      <strong>You</strong>
+      <span id="shownPrompt">Now draft the launch checklist.</span>
+    </div>
+    <div class="message">
+      <strong>Codex</strong>
+      I’ll use the returned beta decision. Here is the launch checklist…
+    </div>
+    <p class="success">That is the complete happy path.</p>
+    <button id="restart" class="secondary">Start over</button>
+  </section>
+
+  <details>
+    <summary>Optional: technical state and edge cases</summary>
+    <dl id="state"></dl>
+    <p>These checks should not be needed to understand the main flow.</p>
+    <button class="small secondary" data-edge="duplicate">Repeat opening</button>
+    <button class="small secondary" data-edge="other">Try another Codex session</button>
+    <button class="small secondary" data-edge="cancel">Try late cancellation</button>
+    <p class="toast" id="edgeResult"></p>
+  </details>
+</main>
+
+<script>
+const initial = () => ({
+  step: 1,
+  originSession: "thr_owner_origin",
+  contextPackage: "Not yet authorized",
+  openingBrief: "Draft",
+  episode: "None",
+  phase: "NONE",
+  pendingReturn: false,
+  delivered: false
+});
+let state = initial();
+
+function showStep(step) {
+  state.step = step;
+  for (let index = 1; index <= 4; index++) {
+    document.querySelector(`#step${index}`).classList.toggle("hidden", index !== step);
+  }
+  const labels = ["Review before sharing", "Collaboration active", "Outcome waiting", "Outcome returned"];
+  document.querySelector("#progress").style.width = `${step * 25}%`;
+  document.querySelector("#progressLabel").textContent = `Step ${step} of 4 · ${labels[step - 1]}`;
+  renderState();
+}
+
+function renderState() {
+  const fields = [
+    ["Origin Session", state.originSession],
+    ["Context Package", state.contextPackage],
+    ["Opening Brief", state.openingBrief],
+    ["Episode", state.episode],
+    ["Phase", state.phase],
+    ["Outcome pending", String(state.pendingReturn)],
+    ["Outcome delivered", String(state.delivered)]
+  ];
+  document.querySelector("#state").innerHTML = fields
+    .map(([term, value]) => `<dt>${escapeHtml(term)}</dt><dd>${escapeHtml(value)}</dd>`)
+    .join("");
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, char => ({
+    "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#039;"
+  })[char]);
+}
+
+document.querySelector("#open").onclick = () => {
+  state.contextPackage = "Authorized immutable visible-text snapshot";
+  state.openingBrief = document.querySelector("#brief").value;
+  state.episode = "ep_7b10d8c2fa";
+  state.phase = "ACTIVE";
+  showStep(2);
+};
+
+document.querySelector("#finalize").onclick = () => {
+  state.phase = "FINALIZED";
+  state.contextPackage = "Deleted after finalization";
+  state.pendingReturn = true;
+  showStep(3);
+};
+
+document.querySelector("#sendPrompt").onclick = () => {
+  document.querySelector("#shownPrompt").textContent =
+    document.querySelector("#nextPrompt").value || "Continue.";
+  state.pendingReturn = false;
+  state.delivered = true;
+  showStep(4);
+};
+
+document.querySelector("#restart").onclick = () => {
+  state = initial();
+  document.querySelector("#edgeResult").textContent = "";
+  showStep(1);
+};
+
+document.querySelectorAll("[data-edge]").forEach(button => {
+  button.onclick = () => {
+    const messages = {
+      duplicate: state.episode === "None"
+        ? "Open a collaboration first."
+        : "The same Episode returns unchanged; no duplicate is created.",
+      other: state.pendingReturn
+        ? "A different Codex conversation receives nothing."
+        : "There is no pending outcome to retrieve.",
+      cancel: state.phase === "FINALIZED"
+        ? "Too late: FINALIZED remains unchanged."
+        : state.phase === "ACTIVE"
+          ? "Cancellation would require a separate Owner approval."
+          : "There is no active Episode to cancel."
+    };
+    document.querySelector("#edgeResult").textContent = messages[button.dataset.edge];
+  };
+});
+
+showStep(1);
+</script>
+</body>
+</html>

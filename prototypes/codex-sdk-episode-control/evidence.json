@@ -1,0 +1,58 @@
+{
+  "environment": {
+    "date": "2026-08-23",
+    "openai_codex": "0.147.0",
+    "openai_codex_cli_bin": "0.147.0",
+    "python": "3.11.15"
+  },
+  "surface": {
+    "approval_modes": [
+      "deny_all",
+      "auto_review"
+    ],
+    "codex_constructor": "(config: 'CodexConfig | None' = None) -> 'None'",
+    "owner_approval_callback_exposed": false
+  },
+  "start": {
+    "authentication": {
+      "plan_type": "pro",
+      "requires_openai_auth": true,
+      "type": "chatgpt"
+    },
+    "first_turn_status": "completed",
+    "marker_contents": "ORBIT-CEDAR-731",
+    "marker_exists": true,
+    "stream_event_counts": {
+      "item/agentMessage/delta": 36,
+      "item/completed": 8,
+      "item/started": 8,
+      "thread/tokenUsage/updated": 4,
+      "turn/completed": 1,
+      "turn/diff/updated": 5,
+      "turn/started": 1
+    },
+    "structured_outcome": {
+      "accepted_answer": "ORBIT-CEDAR-731",
+      "accepted_artifacts": [
+        "ORBIT-CEDAR-731"
+      ],
+      "unresolved_points": []
+    },
+    "structured_turn_status": "completed"
+  },
+  "resume": {
+    "matched": true,
+    "response": "ORBIT-CEDAR-731",
+    "status": "completed"
+  },
+  "read_only": {
+    "forbidden_marker_exists": false,
+    "status": "completed"
+  },
+  "interrupt": {
+    "final_response": null,
+    "interrupt_error": null,
+    "interrupt_requested": true,
+    "status": "interrupted"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "agents-sdk-episode-runtime-probe",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "offline": "node --experimental-strip-types probe.ts offline",
+    "owner": "node --env-file=../../.env --experimental-strip-types probe.ts owner",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@openai/agents": "0.17.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "typescript": "5.9.3"
+  }
+}

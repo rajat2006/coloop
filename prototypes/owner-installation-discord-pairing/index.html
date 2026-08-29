@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Coloop CLI setup prototype</title>
+  <style>
+    :root { --page:#e9ede9; --ink:#19211d; --muted:#68746e; --terminal:#0d1511; --panel:#142019; --line:#304239; --text:#dbe8e0; --dim:#8ba096; --green:#73d5a5; --amber:#f3bb68; --red:#ff8f8f; --blue:#89b4ff; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--page); color:var(--ink); font:15px/1.5 ui-sans-serif,system-ui,-apple-system,sans-serif; }
+    button { font:inherit; cursor:pointer; }
+    .review-banner { padding:10px 18px; background:#24342c; color:#fff; text-align:center; font-size:13px; font-weight:750; }
+    .review-banner strong { color:var(--green); }
+    .page { width:min(1180px,calc(100% - 32px)); margin:34px auto 110px; }
+    .intro { display:flex; justify-content:space-between; align-items:end; gap:28px; margin-bottom:22px; }
+    .intro h1 { margin:3px 0 8px; font-size:clamp(30px,4vw,48px); line-height:1.05; letter-spacing:-.04em; }
+    .intro p { max-width:670px; margin:0; color:var(--muted); font-size:17px; }
+    .eyebrow { color:#176b52; font-size:12px; font-weight:900; letter-spacing:.09em; text-transform:uppercase; }
+    .scenario { display:flex; align-items:center; gap:7px; flex-wrap:wrap; justify-content:flex-end; }
+    .scenario span { color:var(--muted); font-size:13px; font-weight:800; }
+    .scenario button { padding:7px 10px; border:1px solid #c9d2cd; border-radius:8px; background:#fff; color:var(--ink); }
+    .scenario button.active { color:#fff; border-color:#176b52; background:#176b52; }
+    .workspace { display:grid; grid-template-columns:minmax(0,1fr) 285px; min-height:660px; overflow:hidden; border:1px solid #aeb9b3; border-radius:16px; background:var(--terminal); box-shadow:0 18px 55px rgba(28,42,34,.18); }
+    .terminal { min-width:0; color:var(--text); font:14px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+    .chrome { display:flex; align-items:center; justify-content:space-between; padding:11px 15px; border-bottom:1px solid var(--line); background:#17231d; color:var(--dim); font:12px ui-sans-serif,system-ui,sans-serif; }
+    .dots { display:flex; gap:6px; } .dots i { width:10px; height:10px; border-radius:50%; background:#52645b; }
+    .screen { padding:28px; min-height:610px; white-space:pre-line; }
+    .screen p,.screen div { white-space:normal; }
+    .prompt { color:var(--green); } .command { color:#fff; font-weight:800; }
+    .dim { color:var(--dim); } .good { color:var(--green); } .warn { color:var(--amber); } .bad { color:var(--red); } .link { color:var(--blue); text-decoration:underline; }
+    .cli-title { margin:12px 0 4px; color:#fff; font-size:23px; font-weight:900; }
+    .rule { height:1px; margin:18px 0; background:var(--line); }
+    .callout { margin:15px 0; padding:12px 14px; border-left:3px solid var(--amber); background:#20281e; color:#e4e4cd; }
+    .secret { border-left-color:var(--green); color:#cee7d9; }
+    .choices { display:grid; gap:8px; margin-top:20px; max-width:670px; }
+    .terminal button { padding:10px 13px; border:1px solid #496256; border-radius:8px; background:#1d3027; color:#f0f6f2; text-align:left; font-family:inherit; }
+    .terminal button:hover { border-color:var(--green); }
+    .terminal button.primary { background:#286448; border-color:#3d966d; }
+    .terminal button:disabled { opacity:.38; cursor:not-allowed; }
+    .input-line { display:flex; align-items:center; gap:9px; margin:16px 0; }
+    .fake-input { flex:1; padding:8px 10px; border-bottom:1px solid #687c72; color:#fff; }
+    .plan { display:grid; gap:2px; margin:18px 0; }
+    .plan-row { display:grid; grid-template-columns:28px 105px 1fr auto; align-items:center; gap:10px; padding:9px 10px; border-radius:6px; }
+    .plan-row.current { background:#1b2b23; }
+    .plan-row .state { font-weight:850; }
+    .repair-group { margin:17px 0; border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+    .repair-head { padding:9px 12px; color:#fff; background:#1a2921; font-weight:900; }
+    .repair-row { display:flex; justify-content:space-between; align-items:center; gap:15px; padding:11px 12px; border-top:1px solid #26372f; }
+    .repair-row button { padding:6px 9px; white-space:nowrap; }
+    .side { padding:22px 19px; border-left:1px solid var(--line); background:#111c16; color:var(--text); }
+    .side h2 { margin:0 0 4px; font-size:17px; }
+    .side > p { margin:0 0 18px; color:var(--dim); font-size:12px; }
+    .state-list { margin:0; }
+    .state-list div { padding:9px 0; border-top:1px solid #26372f; }
+    .state-list dt { color:var(--dim); font-size:11px; text-transform:uppercase; letter-spacing:.05em; }
+    .state-list dd { margin:2px 0 0; overflow-wrap:anywhere; font:12px/1.35 ui-monospace,monospace; }
+    .safety { margin-top:20px; padding:11px; border:1px solid #365345; border-radius:9px; color:#bcdbc9; font-size:12px; }
+    .switcher { position:fixed; z-index:10; left:50%; bottom:18px; transform:translateX(-50%); display:flex; align-items:center; gap:10px; padding:8px; border-radius:99px; background:#fff; border:1px solid #c2cbc6; box-shadow:0 10px 35px rgba(0,0,0,.2); }
+    .switcher button { display:grid; place-items:center; width:38px; height:38px; border:0; border-radius:50%; background:#1a2821; color:#fff; font-size:19px; }
+    .switcher-label { min-width:230px; text-align:center; font-weight:900; }
+    @media(max-width:850px) { .intro { display:block; } .scenario { justify-content:flex-start; margin-top:16px; } .workspace { grid-template-columns:1fr; } .side { border-left:0; border-top:1px solid var(--line); } .screen { padding:20px 15px; } .plan-row { grid-template-columns:24px 90px 1fr; } .plan-row button { grid-column:3; } }
+  </style>
+</head>
+<body>
+  <div class="review-banner"><strong>REVIEW HARNESS ONLY</strong> · The proposed Owner experience is in the terminal below. Coloop does not need a setup website.</div>
+  <main class="page">
+    <section class="intro">
+      <div>
+        <div class="eyebrow">Throwaway CLI prototype</div>
+        <h1>How should <code>coloop setup</code> work?</h1>
+        <p>Compare three command-line approaches. Browser handoffs appear only for tasks that must happen on Discord or OpenAI websites.</p>
+      </div>
+      <div class="scenario">
+        <span>Starting state:</span>
+        <button data-scenario="fresh">Fresh</button>
+        <button data-scenario="partial">Partial</button>
+        <button data-scenario="invalid">Bad key</button>
+        <button data-scenario="ready">Ready</button>
+      </div>
+    </section>
+
+    <section class="workspace">
+      <div class="terminal">
+        <div class="chrome"><div class="dots"><i></i><i></i><i></i></div><span id="terminalLabel"></span><span>bash · prototype</span></div>
+        <div class="screen" id="screen"></div>
+      </div>
+      <aside class="side">
+        <h2>Relevant simulated state</h2>
+        <p>Visible for review. A real setup command would show a concise status summary.</p>
+        <dl class="state-list" id="stateList"></dl>
+        <div class="safety"><strong>No credential values.</strong><br>V0 reads DISCORD_TOKEN and OPENAI_API_KEY from the process environment. Coloop records only whether each value is available and valid.</div>
+      </aside>
+    </section>
+  </main>
+
+  <div class="switcher">
+    <button id="previous" aria-label="Previous CLI variant">←</button>
+    <div class="switcher-label" id="variantLabel"></div>
+    <button id="next" aria-label="Next CLI variant">→</button>
+  </div>
+
+  <script>
+    // Three CLI setup variants, switchable via ?variant=, inside a browser-only review harness.
+    const variants = ["A","B","C"];
+    const names = { A:"Interactive wizard", B:"Setup plan", C:"Doctor and repair" };
+    const steps = ["discord","pairing","platform","adapter","storage","runtime"];
+    const labels = { discord:"Discord application", pairing:"Owner Pairing", platform:"Platform credential", adapter:"Codex origin adapter", storage:"Private storage", runtime:"Readiness check" };
+
+    const blank = () => ({
+      discord:"missing", server:"not selected", parent:"not selected", discordToken:false,
+      pairing:"missing", ownerDiscordId:"not paired", platform:"missing", platformKey:false,
+      adapter:"missing", codexAuth:"existing and unchanged", storage:"missing",
+      sqlite:"not initialized", artifacts:"not initialized", runtime:"not checked",
+      message:"No checks have run", scenario:"fresh"
+    });
+    let state = blank();
+    let variant = new URLSearchParams(location.search).get("variant") || "A";
+    if (!variants.includes(variant)) variant = "A";
+
+    const done = key => key === "runtime" ? state.runtime === "ready to run" : state[key] === "ready";
+    const doneCount = () => steps.filter(done).length;
+    const nextStep = () => steps.find(key => !done(key));
+    const prerequisite = key => steps.slice(0,steps.indexOf(key)).every(done);
+    const stateWord = key => done(key) ? "PASS" : state[key] === "invalid" ? "FAIL" : "TODO";
+    const tone = key => done(key) ? "good" : state[key] === "invalid" ? "bad" : "dim";
+
+    function run(key, failure=false) {
+      if (!prerequisite(key) && key !== "platform") return;
+      if (key === "discord") Object.assign(state,{discord:"ready",server:"Coloop Lab",parent:"#agent-collaboration",discordToken:true,message:"Discord application installed; permissions verified"});
+      if (key === "pairing") Object.assign(state,{pairing:"ready",ownerDiscordId:"36767918",message:"Discord user 36767918 resolved in Coloop Lab and confirmed as the Owner"});
+      if (key === "platform") failure
+        ? Object.assign(state,{platform:"invalid",platformKey:false,message:"Platform rejected the credential; no value was saved"})
+        : Object.assign(state,{platform:"ready",platformKey:true,message:"Platform project reached using OPENAI_API_KEY; Coloop stored no credential value"});
+      if (key === "adapter") Object.assign(state,{adapter:"ready",message:"Codex CLI 0.150.1 hook and MCP adapter verified"});
+      if (key === "storage") Object.assign(state,{storage:"ready",sqlite:"~/.local/share/coloop/coloop.sqlite",artifacts:"~/.local/share/coloop/episodes",message:"Private SQLite and Episode-artifact locations initialized"});
+      if (key === "runtime") Object.assign(state,{runtime:"ready to run",message:"Setup complete; run coloop run to start the Owner-local runtime"});
+      render();
+    }
+
+    function loadScenario(name) {
+      state = blank(); state.scenario = name;
+      if (name === "partial") { run("discord"); run("pairing"); state.message="Existing Discord setup found; resume at Platform credential"; }
+      if (name === "invalid") { run("discord"); run("pairing"); run("platform",true); }
+      if (name === "ready") steps.forEach(key => run(key));
+      render();
+    }
+
+    function wizard() {
+      const key = nextStep();
+      if (!key) return `<span class="prompt">$</span> <span class="command">coloop setup</span>\n\n<div class="cli-title good">✓ Setup complete</div><p>All six checks passed. Setup now exits without starting a long-running process.</p><div class="callout secret"><span class="prompt">$</span> <span class="command">coloop run</span><br><span class="dim">Run this separately to start the Owner-local runtime in the foreground.</span></div><div class="choices"><button data-scenario="partial">Review recovery instead</button></div>`;
+      const content = {
+        discord:`<p><span class="dim">Step 1 of 6</span> · Discord application</p><div class="cli-title">Connect one Discord server</div><p>Coloop needs a dedicated Discord application bot. It will use Gateway and REST from this machine.</p><div class="callout">This command opens the Discord Developer Portal. Create the application, enable Message Content, install it in the allowed server, and set DISCORD_TOKEN in this terminal environment. Coloop validates but does not store the token.</div><div class="choices"><button class="primary" data-run="discord">Open Discord setup ↗, then verify</button><button>Show required permissions</button></div>`,
+        pairing:`<p><span class="dim">Step 2 of 6</span> · Owner Pairing</p><div class="cli-title">Select the Discord user who is the Owner</div><p>Paste the numeric Discord user ID. Coloop checks that it resolves to a member of <span class="link">Coloop Lab</span>, then shows the account for confirmation.</p><div class="input-line"><span>Discord user ID:</span><span class="fake-input">36767918</span></div><div class="callout secret">Resolved account: <span class="command">Rajat Gedam</span> · ID 36767918<br><span class="dim">Display names never authorize Episode Control; the confirmed numeric ID does.</span></div><div class="choices"><button class="primary" data-run="pairing">Confirm this Owner</button></div>`,
+        platform:`<p><span class="dim">Step 3 of 6</span> · OpenAI Platform credential</p><div class="cli-title">Connect the Episode Agent</div><p><span class="good">✓ Codex CLI authentication found.</span> It remains unchanged and does not pay for Episode Agent inference.</p><p>The Episode Agent needs a separate credential from your Owner-owned OpenAI Platform project.</p><div class="input-line"><span>OPENAI_API_KEY:</span><span class="fake-input">available in environment (value hidden)</span></div><div class="callout secret">V0 validates the environment variable but does not persist it. The Owner is responsible for supplying it to coloop setup and coloop run. It never enters SQLite, context-package.md, diagnostics, or logs.</div>${state.platform === "invalid" ? '<p class="bad">✗ Credential rejected. Replace or rotate it, then try again.</p>' : ""}<div class="choices"><button class="primary" data-run="platform">Check environment credential</button><button data-fail="platform">Simulate invalid credential</button></div>`,
+        adapter:`<p><span class="dim">Step 4 of 6</span> · Codex origin adapter</p><div class="cli-title">Connect supported Origin Sessions</div><p>Detected <span class="command">codex-cli 0.150.1</span>. Coloop will add its hook and MCP adapter to <span class="command">~/.codex/config.toml</span>.</p><div class="callout">The adapter captures the Owner-approved Context Package and returns the Episode Outcome to the same Origin Session. Unsupported clients fail closed.</div><div class="choices"><button class="primary" data-run="adapter">Show diff and activate</button></div>`,
+        storage:`<p><span class="dim">Step 5 of 6</span> · Private storage</p><div class="cli-title">Initialize local state</div><p>SQLite: <span class="command">~/.local/share/coloop/coloop.sqlite</span><br>Episode artifacts: <span class="command">~/.local/share/coloop/episodes</span></p><div class="callout secret">Coloop will verify Owner-only permissions. Active context-package.md files are read-only. Terminal files receive a 72-hour cleanup deadline.</div><div class="choices"><button class="primary" data-run="storage">Initialize private paths</button></div>`,
+        runtime:`<p><span class="dim">Step 6 of 6</span> · Readiness</p><div class="cli-title">Run the final setup check</div><p>Coloop will check Discord access, Owner Pairing, Platform connectivity, the Codex adapter, private paths, cleanup, and restart state.</p><div class="choices"><button class="primary" data-run="runtime">Check and finish setup</button></div>`
+      };
+      return `<span class="prompt">$</span> <span class="command">coloop setup</span>\n<div class="rule"></div>${content[key]}`;
+    }
+
+    function plan() {
+      const rows = steps.map((key,index) => `<div class="plan-row ${key === nextStep() ? "current" : ""}"><span>${index+1}.</span><span class="state ${tone(key)}">${stateWord(key)}</span><span>${labels[key]}</span><button data-run="${key}" ${!prerequisite(key) && key !== "platform" ? "disabled" : ""}>${done(key) ? "Check" : state[key] === "invalid" ? "Repair" : "Run"}</button></div>`).join("");
+      return `<span class="prompt">$</span> <span class="command">coloop setup --plan</span>\n\n<div class="cli-title">Owner-local setup plan</div><p class="dim">Nothing changes until you choose a numbered step. Completed steps survive restart.</p><div class="plan">${rows}</div><div class="rule"></div><p><span class="dim">Last result:</span> ${state.message}</p><div class="choices"><button class="primary" data-run="${nextStep() || "runtime"}" ${!nextStep() ? "disabled" : ""}>Run next incomplete step: ${nextStep() ? labels[nextStep()] : "none"}</button><button data-scenario="partial">Simulate: close terminal, then run coloop setup again</button></div>`;
+    }
+
+    function doctor() {
+      const groups = [
+        ["External providers",["discord","platform"]],
+        ["Identity and Origin Session",["pairing","adapter"]],
+        ["Local runtime",["storage","runtime"]]
+      ];
+      const body = groups.map(([title,keys]) => `<div class="repair-group"><div class="repair-head">${title}</div>${keys.map(key => `<div class="repair-row"><span><span class="${tone(key)}">${done(key) ? "✓" : state[key] === "invalid" ? "✗" : "○"}</span> ${labels[key]}<br><small class="dim">${done(key) ? "No change needed" : state[key] === "invalid" ? "Credential rejected safely" : "Missing or not checked"}</small></span><button data-run="${key}" ${!prerequisite(key) && key !== "platform" ? "disabled" : ""}>${done(key) ? "Recheck" : "Fix"}</button></div>`).join("")}</div>`).join("");
+      return `<span class="prompt">$</span> <span class="command">coloop doctor --fix</span>\n\n<div class="cli-title">${doneCount() === steps.length ? '<span class="good">All checks pass</span>' : `${steps.length-doneCount()} setup problems found`}</div><p class="dim">Doctor scans first. It asks before changing local configuration or opening a provider website.</p>${body}<p><span class="dim">Latest:</span> ${state.message}</p>`;
+    }
+
+    function renderState() {
+      const rows = [
+        ["Discord",state.discord],["Allowed server",state.server],["Parent channel",state.parent],
+        ["Discord token",state.discordToken ? "available (hidden)" : "absent"],["Owner Pairing",state.pairing],["Owner Discord ID",state.ownerDiscordId],
+        ["Codex auth",state.codexAuth],["Platform",state.platform],["Platform key",state.platformKey ? "available (hidden)" : "absent"],
+        ["Origin adapter",state.adapter],["SQLite",state.sqlite],["Episode artifacts",state.artifacts],["Runtime",state.runtime]
+      ];
+      document.querySelector("#stateList").innerHTML = rows.map(([term,value]) => `<div><dt>${term}</dt><dd>${value}</dd></div>`).join("");
+    }
+
+    function bind() {
+      document.querySelectorAll("[data-run]").forEach(button => button.onclick = () => run(button.dataset.run));
+      document.querySelectorAll("[data-fail]").forEach(button => button.onclick = () => run(button.dataset.fail,true));
+      document.querySelectorAll("[data-scenario]").forEach(button => button.onclick = () => loadScenario(button.dataset.scenario));
+    }
+
+    function render() {
+      document.querySelector("#screen").innerHTML = variant === "A" ? wizard() : variant === "B" ? plan() : doctor();
+      document.querySelector("#terminalLabel").textContent = `CLI variant ${variant} · ${names[variant]}`;
+      document.querySelector("#variantLabel").textContent = `${variant} · ${names[variant]}`;
+      document.querySelectorAll("[data-scenario]").forEach(button => button.classList.toggle("active",button.dataset.scenario === state.scenario));
+      renderState(); bind();
+    }
+
+    function setVariant(next) {
+      variant = next;
+      const url = new URL(location.href); url.searchParams.set("variant",variant); history.replaceState({},"",url);
+      render();
+    }
+    function cycle(offset) { setVariant(variants[(variants.indexOf(variant)+offset+variants.length)%variants.length]); }
+    document.querySelector("#previous").onclick = () => cycle(-1);
+    document.querySelector("#next").onclick = () => cycle(1);
+    addEventListener("keydown",event => {
+      if (["INPUT","TEXTAREA","SELECT"].includes(document.activeElement?.tagName) || document.activeElement?.isContentEditable) return;
+      if (event.key === "ArrowLeft") cycle(-1);
+      if (event.key === "ArrowRight") cycle(1);
+    });
+    setVariant(variant);
+  </script>
+</body>
+</html>

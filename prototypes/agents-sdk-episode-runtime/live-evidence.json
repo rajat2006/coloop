@@ -1,0 +1,30 @@
+{
+  "environment": {
+    "mode": "live-owner-interaction",
+    "date": "2026-08-29",
+    "runtime": "TypeScript",
+    "openai_agents_js": "0.17.0",
+    "model": "gpt-5.6-luna",
+    "conversation_content_retained": false,
+    "sdk_tracing_disabled": true
+  },
+  "exercise": {
+    "successful_streamed_turns": 2,
+    "runtime_restart_between_turns": true,
+    "continuation_id_reloaded_from_sqlite": true,
+    "post_restart_reference_resolved": true,
+    "structured_finalization_succeeded": true,
+    "context_retention_due_at": "2026-09-01T05:22:13.601Z"
+  },
+  "owner_feedback": {
+    "manager_interaction_sufficient_for_v0": true,
+    "restart_recovery_visible_by_default": false,
+    "show_minimal_status_or_error_when_user_impact_occurs": true
+  },
+  "episode_outcome": {
+    "conclusion": "For v0, keep restart recovery invisible by default. Expose only a minimal status or error if recovery affects the user. Validate that recovery does not appear as a hang or produce duplicate or missing visible events.",
+    "unresolved_points": [
+      "Whether v0 testing reveals user confusion from silent recovery."
+    ]
+  }
+}

@@ -1,0 +1,219 @@
+{
+  "agent_as_tool": {
+    "approval": {
+      "decision": "approved",
+      "decision_latency_ms": 1.39,
+      "decision_source": "explicit_probe_action",
+      "interruption_count": 1,
+      "paused": true,
+      "required": true,
+      "resumed_same_run": true
+    },
+    "latency_ms": {
+      "after_approval_resume": 4193.97,
+      "to_approval_pause": 4029.04,
+      "total": 8224.43
+    },
+    "ownership": {
+      "final_owner": "Sidecar manager",
+      "manager_retained_control": true
+    },
+    "pattern": "agent_as_tool",
+    "result": {
+      "episode_id": "episode-sidecar-agent_as_tool",
+      "error": null,
+      "finding": "Require explicit owner approval of the agent\u2019s exact action scope and outputs before execution; approval of only the question and synthetic constraints is insufficient.",
+      "return_to": "codex",
+      "specialist": "risk_reviewer",
+      "status": "completed",
+      "unresolved_points": [
+        "The episode question and synthetic constraints were not supplied."
+      ]
+    },
+    "trace": {
+      "export_enabled": true,
+      "sensitive_payloads_included": false,
+      "trace_id": "trace_a9ae24578a024e588a6747e69d62fdd7"
+    },
+    "usage": {
+      "api_model_calls": 3,
+      "estimate_basis": "gpt-5.6-luna: $0.2/M input and $1.2/M output; cache discounts omitted",
+      "estimated_usd": 0.0005876,
+      "input_tokens": 1354,
+      "output_tokens": 264,
+      "sdk_requests": 3
+    }
+  },
+  "assessment": {
+    "checks": {
+      "agent_as_tool_preserved_manager_ownership": true,
+      "approval_paused_and_resumed_same_run": true,
+      "both_routes_returned_structured_result_to_codex": true,
+      "handoff_transferred_to_specialist": true,
+      "latency_within_validation_budget": true,
+      "ordinary_turn_bypassed_sidecar": true,
+      "provider_failure_failed_closed_without_retry": true,
+      "synthetic_context_boundary_preserved": true,
+      "trace_ingest_accepted_without_sensitive_payloads": true,
+      "usage_within_validation_budget": true
+    },
+    "observed_totals": {
+      "api_model_calls": 5,
+      "estimated_usd": 0.000907,
+      "input_tokens": 1919,
+      "output_tokens": 436
+    },
+    "sidecar_architecture_classification": "sufficient",
+    "validation_budgets": {
+      "max_api_model_calls": 5,
+      "max_estimated_usd": 0.01,
+      "max_input_tokens": 5000,
+      "max_output_tokens": 1000,
+      "max_route_latency_ms": 30000
+    }
+  },
+  "context_transmitted": {
+    "agent_as_tool": {
+      "bytes": 404,
+      "context_items": [
+        "Owner approved only the episode question and two synthetic constraints.",
+        "The specialist must not call tools or access the workspace."
+      ],
+      "fields": [
+        "type",
+        "episode_id",
+        "requested_by",
+        "pattern",
+        "specialist",
+        "task",
+        "context",
+        "approval_required"
+      ],
+      "full_discord_history_transmitted": false,
+      "repository_transmitted": false,
+      "sha256": "99e49e40465c30e044b89123c881336abe95f6382686d34e43574c0e5c9a5871"
+    },
+    "handoff": {
+      "bytes": 393,
+      "context_items": [
+        "Owner approved only the episode question and two synthetic constraints.",
+        "The specialist must not call tools or access the workspace."
+      ],
+      "fields": [
+        "type",
+        "episode_id",
+        "requested_by",
+        "pattern",
+        "specialist",
+        "task",
+        "context",
+        "approval_required"
+      ],
+      "full_discord_history_transmitted": false,
+      "repository_transmitted": false,
+      "sha256": "bd6f6344df87bea85aeb087b6c8342cac0ef26eb028b47f91158979bf50bbae1"
+    }
+  },
+  "environment": {
+    "date": "2026-08-23",
+    "mode": "live-api",
+    "model": "gpt-5.6-luna",
+    "openai_agents": "0.22.0",
+    "python": "3.11.15"
+  },
+  "failure_handling": {
+    "automatic_retry": false,
+    "fallback_owner": "codex",
+    "latency_ms": 515.78,
+    "max_retries": 0,
+    "model": "coloop-intentional-missing-model",
+    "provider_failure": {
+      "episode_id": "episode-sidecar-handoff",
+      "error": "BadRequestError: Error code: 400 - {'error': {'message': \"The requested model 'coloop-intentional-missing-model' does not exist.\", 'type': 'invalid_request_error', 'param': 'model', 'code': 'model_not_found'}}",
+      "finding": "The bounded specialist did not return a result.",
+      "return_to": "codex",
+      "specialist": "risk_reviewer",
+      "status": "failed",
+      "unresolved_points": [
+        "Codex must decide whether to retry or continue without the specialist."
+      ]
+    },
+    "test": "provider rejected an intentionally nonexistent model",
+    "trace": {
+      "export_enabled": true,
+      "sensitive_payloads_included": false,
+      "trace_id": "trace_97b4208172c6475b8e014d786519c7a5"
+    }
+  },
+  "handoff": {
+    "approval": {
+      "note": "The handoff changes ownership but has no side effect and was not approval-gated.",
+      "paused": false,
+      "required": false
+    },
+    "handoff_metadata_received": [
+      {
+        "approval_required": false,
+        "context": [
+          "Owner approved only the episode question and two synthetic constraints.",
+          "The specialist must not call tools or access the workspace."
+        ],
+        "episode_id": "episode-sidecar-handoff",
+        "pattern": "handoff",
+        "requested_by": "codex",
+        "specialist": "risk_reviewer",
+        "task": "Identify the single most important guardrail for this synthetic episode.",
+        "type": "request_handoff"
+      }
+    ],
+    "latency_ms": {
+      "total": 3215.3
+    },
+    "ownership": {
+      "final_owner": "Risk reviewer",
+      "specialist_took_control": true
+    },
+    "pattern": "handoff",
+    "result": {
+      "episode_id": "episode-sidecar-handoff",
+      "error": null,
+      "finding": "Do not infer or introduce any facts, permissions, or context beyond the supplied envelope; base the review solely on the approved episode question and two synthetic constraints.",
+      "return_to": "codex",
+      "specialist": "risk_reviewer",
+      "status": "completed",
+      "unresolved_points": []
+    },
+    "trace": {
+      "export_enabled": true,
+      "sensitive_payloads_included": false,
+      "trace_id": "trace_48c690e37672425aa64cf5077887cddc"
+    },
+    "usage": {
+      "api_model_calls": 2,
+      "estimate_basis": "gpt-5.6-luna: $0.2/M input and $1.2/M output; cache discounts omitted",
+      "estimated_usd": 0.0003194,
+      "input_tokens": 565,
+      "output_tokens": 172,
+      "sdk_requests": 2
+    }
+  },
+  "ordinary_discord_turn": {
+    "agents_sdk_invoked": false,
+    "api_model_calls": 0,
+    "message": "Collaborator: should the episode mention latency?",
+    "route": "codex_direct"
+  },
+  "trace_export": {
+    "dashboard_ui_visually_checked": false,
+    "dashboard_visibility_inferred_from_successful_ingest": true,
+    "flush_completed": true,
+    "flush_latency_ms": 2008.8,
+    "ingest_accepted": true,
+    "ingest_status_codes": [
+      204,
+      204,
+      204,
+      204
+    ]
+  }
+}
