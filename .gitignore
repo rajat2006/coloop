@@ -1,5 +1,5 @@
 node_modules/
-packages/coloop/dist/
+packages/**/dist/
 .env
 .env.*
 !.env.example

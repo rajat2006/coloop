@@ -6,7 +6,17 @@ settings:
 
 importers:
 
-  .: {}
+  .:
+    devDependencies:
+      '@types/node':
+        specifier: ^24.0.0
+        version: 24.13.3
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+      vitest:
+        specifier: ^3.0.0
+        version: 3.2.7(@types/node@24.13.3)(tsx@4.23.12)
 
   .sandcastle:
     dependencies:
@@ -30,20 +40,50 @@ importers:
         specifier: ^4.4.3
         version: 4.4.3
 
-  packages/coloop:
-    devDependencies:
-      '@types/node':
-        specifier: ^24.0.0
-        version: 24.13.3
-      tsx:
-        specifier: ^4.19.2
-        version: 4.23.12
-      typescript:
-        specifier: ^5.7.2
-        version: 5.9.3
-      vitest:
-        specifier: ^3.0.0
-        version: 3.2.7(@types/node@24.13.3)(tsx@4.23.12)
+  packages/agent-runtimes/openai-agents:
+    dependencies:
+      '@coloop/core':
+        specifier: workspace:*
+        version: link:../../core
+
+  packages/cli:
+    dependencies:
+      '@coloop/coding-agent-codex':
+        specifier: workspace:*
+        version: link:../coding-agents/codex
+      '@coloop/coding-agent-protocol':
+        specifier: workspace:*
+        version: link:../coding-agents/protocol
+      '@coloop/core':
+        specifier: workspace:*
+        version: link:../core
+      '@coloop/discord':
+        specifier: workspace:*
+        version: link:../collaboration-channels/discord
+      '@coloop/local-storage':
+        specifier: workspace:*
+        version: link:../storage/local
+      '@coloop/openai-agents':
+        specifier: workspace:*
+        version: link:../agent-runtimes/openai-agents
+
+  packages/coding-agents/codex: {}
+
+  packages/coding-agents/protocol: {}
+
+  packages/collaboration-channels/discord:
+    dependencies:
+      '@coloop/core':
+        specifier: workspace:*
+        version: link:../../core
+
+  packages/core: {}
+
+  packages/storage/local:
+    dependencies:
+      '@coloop/core':
+        specifier: workspace:*
+        version: link:../../core
 
 packages:
 
