@@ -1,0 +1,801 @@
+import { createHash, randomUUID } from "node:crypto";
+import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+
+export type EpisodePhase = "OPENING" | "ACTIVE" | "FINALIZED" | "CANCELLED";
+
+export interface DiscordEpisodeTransport {
+  provisionEpisode(input: {
+    readonly guildId: string;
+    readonly parentChannelId: string;
+    readonly ownerDiscordUserId: string;
+    readonly episodeId: string;
+    readonly openingBrief: string;
+  }): Promise<{ readonly threadId: string; readonly threadUrl: string }>;
+  presentCancellation(input: {
+    readonly guildId: string;
+    readonly threadId: string;
+    readonly episodeId: string;
+    readonly reason?: string;
+  }): Promise<void>;
+}
+
+export type EpisodeView =
+  | {
+      readonly id: string;
+      readonly originSessionId: string;
+      readonly phase: "OPENING" | "ACTIVE";
+      readonly threadUrl?: string;
+      readonly contextPackage: {
+        readonly reference: string;
+        readonly sha256: string;
+      };
+    }
+  | {
+      readonly id: string;
+      readonly phase: "CANCELLED";
+      readonly cancellation: {
+        readonly cancelledAt: string;
+        readonly reason?: string;
+      };
+    }
+  | { readonly id: string; readonly phase: "FINALIZED" };
+
+interface RuntimeConfiguration {
+  readonly databasePath: string;
+  readonly artifactDirectory: string;
+  readonly ownerDiscordUserId: string;
+  readonly guildId: string;
+  readonly parentChannelId: string;
+  readonly discord: DiscordEpisodeTransport;
+  readonly now?: () => Date;
+  readonly createId?: () => string;
+}
+
+interface TrustedHook {
+  readonly event: "PreToolUse";
+  readonly client: "codex-cli";
+  readonly clientVersion: "0.150.1";
+  readonly sessionId: string;
+  readonly turnId: string;
+  readonly toolUseId: string;
+  readonly transcriptPath: string;
+}
+
+type CodexRequest =
+  | {
+      readonly operation: "open_episode";
+      readonly approved: boolean;
+      readonly arguments: {
+        readonly openingBrief: string;
+        readonly originalRequest: string;
+        readonly originSessionId?: string;
+        readonly turnId?: string;
+        readonly transcriptPath?: string;
+      };
+    }
+  | {
+      readonly operation: "get_episode";
+      readonly arguments: { readonly episodeId: string; readonly originSessionId?: string };
+    }
+  | {
+      readonly operation: "cancel_episode";
+      readonly approved: boolean;
+      readonly arguments: {
+        readonly episodeId: string;
+        readonly reason?: string;
+        readonly originSessionId?: string;
+      };
+    };
+
+export type EpisodeOperationResult =
+  | { readonly ok: true; readonly episode: EpisodeView; readonly created?: boolean }
+  | { readonly ok: false; readonly reason: string; readonly code: string };
+
+export interface EpisodeModule {
+  openEpisode(input: {
+    readonly originSessionId: string;
+    readonly originTurnId: string;
+    readonly originalQuestion: string;
+    readonly openingBrief: string;
+    readonly contextMarkdown: string;
+  }): Promise<EpisodeOperationResult>;
+  getEpisode(input: {
+    readonly originSessionId: string;
+    readonly episodeId: string;
+  }): EpisodeOperationResult;
+  cancelEpisode(input: {
+    readonly originSessionId: string;
+    readonly episodeId: string;
+    readonly reason?: string;
+  }): Promise<EpisodeOperationResult>;
+}
+
+interface InternalEpisodeModule extends EpisodeModule {
+  findByOrigin(originSessionId: string): EpisodeView | undefined;
+}
+
+interface EpisodeRow {
+  readonly id: string;
+  readonly origin_session_id: string;
+  readonly phase: EpisodePhase;
+  readonly thread_id: string | null;
+  readonly thread_url: string | null;
+  readonly context_reference: string;
+  readonly context_digest: string;
+  readonly context_retention_deadline: string | null;
+  readonly cancelled_at: string | null;
+  readonly cancellation_reason: string | null;
+}
+
+export function createColoopRuntime(configuration: RuntimeConfiguration) {
+  mkdirSyncParent(configuration.databasePath);
+  const database = new DatabaseSync(configuration.databasePath);
+  database.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
+  migrate(database);
+  const now = configuration.now ?? (() => new Date());
+  const createId = configuration.createId ?? randomUUID;
+  const episodes = createEpisodeModule(database, configuration, now, createId);
+
+  return {
+    async handleCodexOperation(input: {
+      readonly hook: unknown;
+      readonly request: unknown;
+    }): Promise<EpisodeOperationResult> {
+      const hook = parseTrustedHook(input.hook);
+      if (!hook.ok) return hook;
+      const request = parseCodexRequest(input.request);
+      if (!request.ok) return request;
+      const replay = checkReplay(database, hook.value, request.value);
+      if (replay !== undefined) return replay;
+      let result: EpisodeOperationResult;
+      switch (request.value.operation) {
+        case "open_episode": {
+          if (!request.value.approved) {
+            result = failure(
+              "APPROVAL_REQUIRED",
+              "Opening a Collaboration Episode requires Owner approval.",
+            );
+            break;
+          }
+          const existing = episodes.findByOrigin(hook.value.sessionId);
+          if (existing !== undefined) {
+            result = { ok: true, created: false, episode: existing };
+            break;
+          }
+          const transcript = await captureTranscript(hook.value);
+          if (!transcript.ok) {
+            result = transcript;
+            break;
+          }
+          if (lastOwnerText(transcript.messages) !== request.value.arguments.originalRequest) {
+            result = failure(
+              "ORIGINAL_REQUEST_MISMATCH",
+              "The approved original request does not match the current trusted transcript.",
+            );
+            break;
+          }
+          const credentialFinding = findCredential(
+            `${transcript.contextMarkdown}\n${request.value.arguments.openingBrief}`,
+          );
+          if (credentialFinding !== undefined) {
+            result = failure(
+              "CREDENTIAL_DETECTED",
+              `Opening blocked: remove the credential-like value ${credentialFinding}.`,
+            );
+            break;
+          }
+          result = await episodes.openEpisode({
+            originSessionId: hook.value.sessionId,
+            originTurnId: hook.value.turnId,
+            originalQuestion: request.value.arguments.originalRequest,
+            openingBrief: request.value.arguments.openingBrief,
+            contextMarkdown: transcript.contextMarkdown,
+          });
+          break;
+        }
+        case "get_episode":
+          result = episodes.getEpisode({
+            originSessionId: hook.value.sessionId,
+            episodeId: request.value.arguments.episodeId,
+          });
+          break;
+        case "cancel_episode": {
+          if (!request.value.approved) {
+            result = failure(
+              "APPROVAL_REQUIRED",
+              "Cancelling a Collaboration Episode requires Owner approval.",
+            );
+            break;
+          }
+          result = await episodes.cancelEpisode({
+            originSessionId: hook.value.sessionId,
+            episodeId: request.value.arguments.episodeId,
+            ...(request.value.arguments.reason === undefined
+              ? {}
+              : { reason: request.value.arguments.reason }),
+          });
+          break;
+        }
+      }
+      if (result.ok) recordCompletedOperation(database, hook.value, request.value, result.episode.id, now());
+      return result;
+    },
+    close(): void {
+      database.close();
+    },
+  };
+}
+
+function createEpisodeModule(
+  database: DatabaseSync,
+  configuration: RuntimeConfiguration,
+  now: () => Date,
+  createId: () => string,
+): InternalEpisodeModule {
+  return {
+    openEpisode: (input) => openEpisode(database, configuration, now, createId, input),
+    getEpisode: (input) => getEpisode(database, input.originSessionId, input.episodeId),
+    cancelEpisode: (input) => cancelEpisode(database, configuration, now, input),
+    findByOrigin: (originSessionId) => {
+      const row = findByOrigin(database, originSessionId);
+      return row === undefined ? undefined : toView(row);
+    },
+  };
+}
+
+async function openEpisode(
+  database: DatabaseSync,
+  configuration: RuntimeConfiguration,
+  now: () => Date,
+  createId: () => string,
+  input: Parameters<EpisodeModule["openEpisode"]>[0],
+): Promise<EpisodeOperationResult> {
+  const existing = findByOrigin(database, input.originSessionId);
+  if (existing !== undefined) return { ok: true, created: false, episode: toView(existing) };
+
+  const episodeId = createId();
+  const episodeDirectory = resolve(configuration.artifactDirectory, episodeId);
+  const contextReference = join(episodeDirectory, "context.md");
+  await mkdir(episodeDirectory, { recursive: true, mode: 0o700 });
+  await writeFile(contextReference, input.contextMarkdown, { mode: 0o600, flag: "wx" });
+  await chmod(contextReference, 0o400);
+  const contextDigest = digest(input.contextMarkdown);
+  const createdAt = now().toISOString();
+
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    database
+      .prepare(
+        `INSERT INTO episodes (
+          id, origin_session_id, origin_turn_id, owner_discord_user_id, guild_id,
+          parent_channel_id, phase, phase_version, original_question, opening_brief,
+          context_reference, context_digest, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 'OPENING', 1, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        episodeId,
+        input.originSessionId,
+        input.originTurnId,
+        configuration.ownerDiscordUserId,
+        configuration.guildId,
+        configuration.parentChannelId,
+        input.originalQuestion,
+        input.openingBrief,
+        contextReference,
+        contextDigest,
+        createdAt,
+        createdAt,
+      );
+    addAudit(database, episodeId, 1, "EPISODE_OPENING", "owner", createdAt);
+    database.exec("COMMIT");
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
+
+  let provisioned: { readonly threadId: string; readonly threadUrl: string };
+  try {
+    provisioned = await configuration.discord.provisionEpisode({
+      guildId: configuration.guildId,
+      parentChannelId: configuration.parentChannelId,
+      ownerDiscordUserId: configuration.ownerDiscordUserId,
+      episodeId,
+      openingBrief: input.openingBrief,
+    });
+  } catch {
+    return failure(
+      "DISCORD_PROVISIONING_FAILED",
+      `Episode ${episodeId} remains OPENING because Discord provisioning failed.`,
+    );
+  }
+
+  const activatedAt = now().toISOString();
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    database
+      .prepare(
+        `UPDATE episodes SET phase = 'ACTIVE', phase_version = 2, thread_id = ?,
+         thread_url = ?, updated_at = ? WHERE id = ? AND phase = 'OPENING'`,
+      )
+      .run(provisioned.threadId, provisioned.threadUrl, activatedAt, episodeId);
+    addAudit(database, episodeId, 2, "EPISODE_ACTIVATED", "discord", activatedAt);
+    addAcknowledgedOutbox(database, episodeId, provisioned.threadId, activatedAt);
+    database.exec("COMMIT");
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
+  const row = findById(database, episodeId);
+  if (row === undefined) throw new Error("Activated Episode was not found.");
+  return { ok: true, created: true, episode: toView(row) };
+}
+
+function getEpisode(
+  database: DatabaseSync,
+  originSessionId: string,
+  episodeId: string,
+): EpisodeOperationResult {
+  const row = findById(database, episodeId);
+  if (row === undefined || row.origin_session_id !== originSessionId) {
+    return failure("EPISODE_NOT_FOUND", "No Episode is available to this Origin Session.");
+  }
+  return { ok: true, episode: toView(row) };
+}
+
+async function cancelEpisode(
+  database: DatabaseSync,
+  configuration: RuntimeConfiguration,
+  now: () => Date,
+  input: Parameters<EpisodeModule["cancelEpisode"]>[0],
+): Promise<EpisodeOperationResult> {
+  const row = findById(database, input.episodeId);
+  if (row === undefined || row.origin_session_id !== input.originSessionId) {
+    return failure("EPISODE_NOT_FOUND", "No Episode is available to this Origin Session.");
+  }
+  if (row.phase === "CANCELLED" || row.phase === "FINALIZED") {
+    return { ok: true, episode: toView(row) };
+  }
+  const cancelledAt = now().toISOString();
+  const retentionDeadline = new Date(
+    new Date(cancelledAt).getTime() + 72 * 60 * 60 * 1_000,
+  ).toISOString();
+  database.exec("BEGIN IMMEDIATE");
+  try {
+    database
+      .prepare(
+        `UPDATE episodes SET phase = 'CANCELLED', phase_version = phase_version + 1,
+         cancelled_at = ?, cancellation_reason = ?, context_retention_deadline = ?, updated_at = ?
+         WHERE id = ? AND phase IN ('OPENING', 'ACTIVE')`,
+      )
+      .run(
+        cancelledAt,
+        input.reason ?? null,
+        retentionDeadline,
+        cancelledAt,
+        row.id,
+      );
+    addAudit(database, row.id, 3, "EPISODE_CANCELLED", "owner", cancelledAt);
+    database.exec("COMMIT");
+  } catch (error) {
+    database.exec("ROLLBACK");
+    throw error;
+  }
+  if (row.thread_id !== null) {
+    await configuration.discord.presentCancellation({
+      guildId: configuration.guildId,
+      threadId: row.thread_id,
+      episodeId: row.id,
+      ...(input.reason === undefined ? {} : { reason: input.reason }),
+    });
+  }
+  const cancelled = findById(database, row.id);
+  if (cancelled === undefined) throw new Error("Cancelled Episode was not found.");
+  return { ok: true, episode: toView(cancelled) };
+}
+
+type CapturedMessage =
+  | { readonly author: "owner"; readonly text: string }
+  | { readonly author: "codex"; readonly phase: "commentary" | "final_answer"; readonly text: string };
+
+async function captureTranscript(
+  hook: TrustedHook,
+): Promise<
+  | { readonly ok: true; readonly messages: readonly CapturedMessage[]; readonly contextMarkdown: string }
+  | { readonly ok: false; readonly reason: string; readonly code: string }
+> {
+  let source: string;
+  try {
+    source = await readFile(hook.transcriptPath, "utf8");
+  } catch {
+    return failure("TRANSCRIPT_UNREADABLE", "The trusted Codex transcript cannot be read.");
+  }
+  const lines = source.trim().split("\n");
+  const records: unknown[] = [];
+  for (const line of lines) {
+    try {
+      records.push(JSON.parse(line) as unknown);
+    } catch {
+      return failure("UNSUPPORTED_TRANSCRIPT", "The Codex transcript is not valid JSONL.");
+    }
+  }
+  const metadata = records.shift();
+  if (!isSessionMetadata(metadata, hook.sessionId)) {
+    return failure(
+      "UNSUPPORTED_TRANSCRIPT",
+      "The transcript session or Codex CLI provenance is unsupported.",
+    );
+  }
+  const messages: CapturedMessage[] = [];
+  let trustedTurnFound = false;
+  for (const record of records) {
+    if (isRecord(record) && record.type === "turn_context" && isRecord(record.payload)) {
+      if (record.payload.turn_id === hook.turnId) trustedTurnFound = true;
+      else if (typeof record.payload.turn_id !== "string") {
+        return failure("UNSUPPORTED_TRANSCRIPT", "A transcript turn has no trusted identity.");
+      }
+      continue;
+    }
+    const parsed = parseVisibleRecord(record);
+    if (parsed === "excluded") continue;
+    if (parsed === undefined) {
+      return failure(
+        "UNSUPPORTED_TRANSCRIPT",
+        "The transcript contains an unsupported or ambiguous visible record.",
+      );
+    }
+    messages.push(parsed);
+  }
+  if (!trustedTurnFound) {
+    return failure(
+      "UNSUPPORTED_TRANSCRIPT",
+      "The trusted Codex turn is not present in the transcript.",
+    );
+  }
+  if (messages.length === 0 || !messages.some((message) => message.author === "owner")) {
+    return failure("UNSUPPORTED_TRANSCRIPT", "The transcript has no visible Owner request.");
+  }
+  return { ok: true, messages, contextMarkdown: renderContext(messages) };
+}
+
+function parseVisibleRecord(record: unknown): CapturedMessage | "excluded" | undefined {
+  if (!isRecord(record) || !isRecord(record.payload)) return undefined;
+  if (record.type === "event_msg" && record.payload.type === "user_message") {
+    return typeof record.payload.message === "string" && record.payload.message.length > 0
+      ? { author: "owner", text: record.payload.message }
+      : undefined;
+  }
+  if (record.type === "response_item" && record.payload.type === "message") {
+    if (record.payload.role === "system" || record.payload.role === "developer") return "excluded";
+    if (
+      record.payload.role !== "assistant" ||
+      (record.payload.phase !== "commentary" && record.payload.phase !== "final_answer") ||
+      !Array.isArray(record.payload.content) ||
+      record.payload.content.length !== 1
+    ) {
+      return undefined;
+    }
+    const content = record.payload.content[0];
+    return isRecord(content) &&
+      content.type === "output_text" &&
+      typeof content.text === "string"
+      ? {
+          author: "codex",
+          phase: record.payload.phase,
+          text: content.text,
+        }
+      : undefined;
+  }
+  if (
+    record.type === "response_item" &&
+    (record.payload.type === "reasoning" ||
+      record.payload.type === "function_call" ||
+      record.payload.type === "function_call_output")
+  ) {
+    return "excluded";
+  }
+  if (record.type === "event_msg" && record.payload.type === "token_count") return "excluded";
+  return undefined;
+}
+
+function renderContext(messages: readonly CapturedMessage[]): string {
+  const sections = messages.map((message) => {
+    if (message.author === "owner") return `## Owner\n\n${message.text}`;
+    return `## Codex ${message.phase === "final_answer" ? "final" : "commentary"}\n\n${message.text}`;
+  });
+  return `# Collaboration Episode Context\n\n${sections.join("\n\n")}\n`;
+}
+
+function lastOwnerText(messages: readonly CapturedMessage[]): string | undefined {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.author === "owner") return message.text;
+  }
+  return undefined;
+}
+
+function findCredential(content: string): string | undefined {
+  const patterns = [
+    /\bsk-[A-Za-z0-9_-]{20,}\b/g,
+    /\bgh[pousr]_[A-Za-z0-9]{20,}\b/g,
+    /\bAKIA[A-Z0-9]{16}\b/g,
+    /\b[A-Za-z\d_-]{23,28}\.[A-Za-z\d_-]{6}\.[A-Za-z\d_-]{27,}\b/g,
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(content)?.[0];
+    if (match !== undefined) return `${match.slice(0, 3)}…${match.slice(-4)}`;
+  }
+  return undefined;
+}
+
+function parseTrustedHook(
+  value: unknown,
+):
+  | { readonly ok: true; readonly value: TrustedHook }
+  | { readonly ok: false; readonly code: string; readonly reason: string } {
+  if (
+    !isRecord(value) ||
+    value.event !== "PreToolUse" ||
+    value.client !== "codex-cli" ||
+    value.clientVersion !== "0.150.1" ||
+    typeof value.sessionId !== "string" ||
+    value.sessionId.length === 0 ||
+    typeof value.turnId !== "string" ||
+    value.turnId.length === 0 ||
+    typeof value.toolUseId !== "string" ||
+    value.toolUseId.length === 0 ||
+    typeof value.transcriptPath !== "string" ||
+    value.transcriptPath.length === 0
+  ) {
+    return failure(
+      "UNSUPPORTED_CODEX_CLIENT",
+      "A trusted Codex CLI 0.150.1 pre-tool hook is required.",
+    );
+  }
+  return {
+    ok: true,
+    value: {
+      event: value.event,
+      client: value.client,
+      clientVersion: value.clientVersion,
+      sessionId: value.sessionId,
+      turnId: value.turnId,
+      toolUseId: value.toolUseId,
+      transcriptPath: value.transcriptPath,
+    },
+  };
+}
+
+function parseCodexRequest(
+  value: unknown,
+):
+  | { readonly ok: true; readonly value: CodexRequest }
+  | { readonly ok: false; readonly code: string; readonly reason: string } {
+  if (!isRecord(value) || !isRecord(value.arguments)) return invalidOperation();
+  if (
+    value.operation === "open_episode" &&
+    typeof value.approved === "boolean" &&
+    typeof value.arguments.openingBrief === "string" &&
+    typeof value.arguments.originalRequest === "string"
+  ) {
+    return {
+      ok: true,
+      value: {
+        operation: "open_episode",
+        approved: value.approved,
+        arguments: {
+          openingBrief: value.arguments.openingBrief,
+          originalRequest: value.arguments.originalRequest,
+        },
+      },
+    };
+  }
+  if (value.operation === "get_episode" && typeof value.arguments.episodeId === "string") {
+    return {
+      ok: true,
+      value: { operation: "get_episode", arguments: { episodeId: value.arguments.episodeId } },
+    };
+  }
+  if (
+    value.operation === "cancel_episode" &&
+    typeof value.approved === "boolean" &&
+    typeof value.arguments.episodeId === "string" &&
+    (value.arguments.reason === undefined || typeof value.arguments.reason === "string")
+  ) {
+    return {
+      ok: true,
+      value: {
+        operation: "cancel_episode",
+        approved: value.approved,
+        arguments: {
+          episodeId: value.arguments.episodeId,
+          ...(value.arguments.reason === undefined ? {} : { reason: value.arguments.reason }),
+        },
+      },
+    };
+  }
+  return invalidOperation();
+}
+
+function invalidOperation(): { readonly ok: false; readonly code: string; readonly reason: string } {
+  return failure(
+    "INVALID_OPERATION",
+    "The Codex Episode operation is unsupported or malformed.",
+  );
+}
+
+function isSessionMetadata(value: unknown, sessionId: string): boolean {
+  return (
+    isRecord(value) &&
+    value.type === "session_meta" &&
+    isRecord(value.payload) &&
+    value.payload.id === sessionId &&
+    value.payload.source === "cli"
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function digest(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function failure(code: string, reason: string): { readonly ok: false; readonly code: string; readonly reason: string } {
+  return { ok: false, code, reason };
+}
+
+function findByOrigin(database: DatabaseSync, originSessionId: string): EpisodeRow | undefined {
+  return database
+    .prepare("SELECT * FROM episodes WHERE origin_session_id = ?")
+    .get(originSessionId) as unknown as EpisodeRow | undefined;
+}
+
+function findById(database: DatabaseSync, episodeId: string): EpisodeRow | undefined {
+  return database.prepare("SELECT * FROM episodes WHERE id = ?").get(episodeId) as unknown as
+    | EpisodeRow
+    | undefined;
+}
+
+function toView(row: EpisodeRow): EpisodeView {
+  if (row.phase === "CANCELLED") {
+    if (row.cancelled_at === null) throw new Error("Cancelled Episode has no terminal timestamp.");
+    return {
+      id: row.id,
+      phase: "CANCELLED",
+      cancellation: {
+        cancelledAt: row.cancelled_at,
+        ...(row.cancellation_reason === null ? {} : { reason: row.cancellation_reason }),
+      },
+    };
+  }
+  if (row.phase === "FINALIZED") return { id: row.id, phase: "FINALIZED" };
+  return {
+    id: row.id,
+    originSessionId: row.origin_session_id,
+    phase: row.phase,
+    ...(row.thread_url === null ? {} : { threadUrl: row.thread_url }),
+    contextPackage: {
+      reference: row.context_reference,
+      sha256: row.context_digest,
+    },
+  };
+}
+
+function migrate(database: DatabaseSync): void {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS episodes (
+      id TEXT PRIMARY KEY, origin_session_id TEXT NOT NULL UNIQUE, origin_turn_id TEXT NOT NULL,
+      owner_discord_user_id TEXT NOT NULL, guild_id TEXT NOT NULL, parent_channel_id TEXT NOT NULL,
+      thread_id TEXT, thread_url TEXT, phase TEXT NOT NULL, phase_version INTEGER NOT NULL,
+      original_question TEXT NOT NULL, opening_brief TEXT NOT NULL, context_reference TEXT NOT NULL,
+      context_digest TEXT NOT NULL, context_retention_deadline TEXT,
+      cancelled_at TEXT, cancellation_reason TEXT,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS provider_inbox (
+      provider_event_id TEXT PRIMARY KEY, episode_id TEXT NOT NULL, input_digest TEXT NOT NULL,
+      effect_kind TEXT NOT NULL, status TEXT NOT NULL, received_at TEXT NOT NULL, completed_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS recovery_outbox (
+      action_id TEXT PRIMARY KEY, episode_id TEXT NOT NULL, sequence INTEGER NOT NULL,
+      action_kind TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE, destination_reference TEXT NOT NULL,
+      state TEXT NOT NULL, payload TEXT, created_at TEXT NOT NULL, acknowledged_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS episode_audit (
+      id TEXT PRIMARY KEY, episode_id TEXT NOT NULL, phase_version INTEGER NOT NULL,
+      transition_type TEXT NOT NULL, actor_kind TEXT NOT NULL, schema_version INTEGER NOT NULL,
+      occurred_at TEXT NOT NULL
+    );
+  `);
+}
+
+function addAudit(
+  database: DatabaseSync,
+  episodeId: string,
+  phaseVersion: number,
+  transitionType: string,
+  actorKind: string,
+  occurredAt: string,
+): void {
+  database
+    .prepare(
+      "INSERT INTO episode_audit VALUES (?, ?, ?, ?, ?, 1, ?)",
+    )
+    .run(randomUUID(), episodeId, phaseVersion, transitionType, actorKind, occurredAt);
+}
+
+function addAcknowledgedOutbox(
+  database: DatabaseSync,
+  episodeId: string,
+  threadId: string,
+  occurredAt: string,
+): void {
+  database
+    .prepare(
+      `INSERT INTO recovery_outbox VALUES (?, ?, 1, 'DISCORD_EPISODE_OPENED', ?, ?,
+       'ACKNOWLEDGED', NULL, ?, ?)`,
+    )
+    .run(randomUUID(), episodeId, `episode-opened:${episodeId}`, threadId, occurredAt, occurredAt);
+}
+
+function checkReplay(
+  database: DatabaseSync,
+  hook: TrustedHook,
+  request: CodexRequest,
+): { readonly ok: false; readonly code: string; readonly reason: string } | undefined {
+  const row = database
+    .prepare("SELECT input_digest FROM provider_inbox WHERE provider_event_id = ?")
+    .get(providerEventId(hook, request)) as unknown as
+    | { readonly input_digest: string }
+    | undefined;
+  if (row !== undefined && row.input_digest !== digest(JSON.stringify(request))) {
+    return failure(
+      "REPLAY_INPUT_MISMATCH",
+      "The trusted operation identity was reused with different input.",
+    );
+  }
+  return undefined;
+}
+
+function recordCompletedOperation(
+  database: DatabaseSync,
+  hook: TrustedHook,
+  request: CodexRequest,
+  episodeId: string,
+  occurredAt: Date,
+): void {
+  const timestamp = occurredAt.toISOString();
+  database
+    .prepare(
+      `INSERT INTO provider_inbox (
+        provider_event_id, episode_id, input_digest, effect_kind, status, received_at, completed_at
+      ) VALUES (?, ?, ?, ?, 'COMPLETED', ?, ?)
+      ON CONFLICT(provider_event_id) DO UPDATE SET status = 'COMPLETED', completed_at = excluded.completed_at`,
+    )
+    .run(
+      providerEventId(hook, request),
+      episodeId,
+      digest(JSON.stringify(request)),
+      request.operation,
+      timestamp,
+      timestamp,
+    );
+}
+
+function providerEventId(hook: TrustedHook, request: CodexRequest): string {
+  return `${hook.sessionId}:${hook.toolUseId}:${request.operation}`;
+}
+
+function mkdirSyncParent(path: string): void {
+  const parent = dirname(resolve(path));
+  // DatabaseSync cannot create its parent. The product composition owns this local setup step.
+  requireDirectory(parent);
+}
+
+function requireDirectory(path: string): void {
+  const { mkdirSync } = process.getBuiltinModule("node:fs");
+  mkdirSync(path, { recursive: true, mode: 0o700 });
+}

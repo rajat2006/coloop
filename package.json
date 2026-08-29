@@ -8,7 +8,7 @@
   },
   "scripts": {
     "ci:product": "pnpm run typecheck && pnpm run test",
-    "test": "pnpm --dir .sandcastle test",
-    "typecheck": "pnpm --dir .sandcastle typecheck"
+    "test": "pnpm -r test",
+    "typecheck": "pnpm -r typecheck"
   }
 }
