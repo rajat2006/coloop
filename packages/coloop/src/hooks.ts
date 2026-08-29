@@ -1,0 +1,69 @@
+import type { Readable, Writable } from "node:stream";
+
+const readInput = async (input: Readable): Promise<string> => {
+  let body = "";
+  for await (const chunk of input) {
+    body += chunk.toString();
+    if (body.length > 1_000_000) {
+      throw new Error("hook_input_too_large");
+    }
+  }
+  return body;
+};
+
+export const runCodexHook = async (
+  hook: string | undefined,
+  input: Readable,
+  output: Writable,
+  error: Writable,
+): Promise<number> => {
+  if (hook !== "pre-tool-use" && hook !== "user-prompt-submit") {
+    error.write("Unsupported Coloop Codex hook.\n");
+    return 2;
+  }
+
+  try {
+    const event = JSON.parse(await readInput(input)) as Record<string, unknown>;
+    if (hook === "user-prompt-submit") {
+      if (
+        event.hook_event_name !== "UserPromptSubmit" ||
+        typeof event.session_id !== "string" ||
+        typeof event.turn_id !== "string" ||
+        typeof event.prompt !== "string"
+      ) {
+        throw new Error("unsupported_hook_shape");
+      }
+      return 0;
+    }
+    if (
+      event.hook_event_name !== "PreToolUse" ||
+      event.tool_name !== "mcp__coloop__open_episode" ||
+      typeof event.session_id !== "string" ||
+      typeof event.turn_id !== "string" ||
+      typeof event.transcript_path !== "string" ||
+      typeof event.tool_input !== "object" ||
+      event.tool_input === null ||
+      Array.isArray(event.tool_input)
+    ) {
+      throw new Error("unsupported_hook_shape");
+    }
+    output.write(
+      `${JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "allow",
+          updatedInput: {
+            ...(event.tool_input as Record<string, unknown>),
+            origin_session_id: event.session_id,
+            origin_transcript_path: event.transcript_path,
+            origin_turn_id: event.turn_id,
+          },
+        },
+      })}\n`,
+    );
+    return 0;
+  } catch {
+    error.write("Coloop blocked an unsupported Codex hook payload.\n");
+    return 2;
+  }
+};
