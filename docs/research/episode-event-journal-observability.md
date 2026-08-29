@@ -35,9 +35,10 @@ For observability, use **OpenTelemetry as Coloop's emission contract** and keep 
 vendor out of the recovery path. The recommended first trial is **PostHog Cloud**,
 honoring the Owner's preference, behind a small Coloop telemetry adapter and an
 OpenTelemetry Collector. PostHog currently combines OTel-native logs, AI trace UX,
-evaluations, product analytics, and inexpensive free allowances. Its general
-distributed tracing is still beta and application metrics are alpha, so it should
-not become a hard dependency. PostHog's open-source self-host is explicitly a
+evaluations, product analytics, and inexpensive free allowances. As of the research
+date, PostHog's primary product pages label general distributed tracing **beta** and
+application metrics **alpha**, so neither should become a hard dependency. PostHog's
+open-source self-host is explicitly a
 hobbyist, single-machine deployment with limited support and missing Cloud features;
 do not operate it for v0. [PostHog distributed
 tracing](https://posthog.com/docs/distributed-tracing), [application
@@ -77,11 +78,15 @@ Product capabilities, protocol behavior, prices, limits, and documented defaults
 this report are **source-backed facts** and link to primary documentation or source
 repositories. The proposed Coloop schema, privacy classification, retention defaults,
 trial gates, and vendor choice are **architectural inferences/recommendations** from
-those facts and the ticket-27 runtime evidence. Issues #18, #20, and #22 still own the
-final reconciliation, retention, and operational-ownership policies.
+those facts and the [Agents SDK runtime prototype](https://github.com/rajat2006/coloop/issues/27).
+[Define bridge restart and Discord reconciliation](https://github.com/rajat2006/coloop/issues/18),
+[Define episode record retention audit and deletion](https://github.com/rajat2006/coloop/issues/20),
+and [Define v0 observability and operational ownership](https://github.com/rajat2006/coloop/issues/22)
+still own the final reconciliation, retention, and operational-ownership policies.
 
-The local ticket-27 probe is project evidence rather than an external source. It found
-that SQLite currently contains Episode Phase; Discord routing and event IDs; content
+The local [Agents SDK runtime prototype](https://github.com/rajat2006/coloop/issues/27)
+is project evidence rather than an external source. It found that SQLite currently
+contains Episode Phase; Discord routing and event IDs; content
 SHA-256 values and mutable `pending` to `completed` processing status; the latest
 Responses `previous_response_id`; Context Package path and deadline; Outcome until
 acknowledgement; delivery/error state; and, only during an interruption, about 1007
@@ -171,13 +176,13 @@ CREATE TABLE episode (
   terminal_at                 TEXT,
   created_at                  TEXT NOT NULL,
   updated_at                  TEXT NOT NULL,
-  CHECK (phase IN ('CREATED', 'ACTIVE', 'FINALIZED', 'CANCELLED'))
+  CHECK (phase IN ('OPENING', 'ACTIVE', 'FINALIZED', 'CANCELLED'))
 );
 
 CREATE TABLE agent_continuation (
   episode_id                  TEXT PRIMARY KEY REFERENCES episode(id),
   provider                    TEXT NOT NULL,
-  continuation_id_ciphertext  BLOB,
+  continuation_ref            TEXT,
   sdk_name                    TEXT NOT NULL,
   sdk_version                 TEXT NOT NULL,
   interrupted_run_state       BLOB,
@@ -239,18 +244,20 @@ CREATE TABLE recovery_action_outbox (
 );
 ```
 
-The exact private-field encryption mechanism is an implementation decision, but the
-schema makes the boundary visible. `continuation_id_ciphertext`, temporary
+The schema makes the private boundary visible. `continuation_ref`, temporary
 `interrupted_run_state`, exact pending payloads, raw Discord IDs, Context Package
-reference/digest, and Outcome are restricted local data. `telemetry_episode_id` is a
-random, vendor-facing pseudonym that is not a Discord snowflake, database primary
-key, content hash, or provider continuation ID.
+reference/digest, and Outcome are restricted local data. The settled Owner-local v0
+uses the Owner's OS account/process boundary and restrictive file permissions rather
+than app-level encryption. A hosted deployment must make a separate encryption and
+key-ownership decision. `telemetry_episode_id` is a random, vendor-facing pseudonym
+that is not a Discord snowflake, database primary key, content hash, or provider
+continuation ID.
 
-`episode.phase` is only the Owner-visible **Episode Phase**. Provider failure,
-exporter health, retry state, and worker status belong in the inbox, continuation,
-outbox, and telemetry records; they must not introduce an infrastructure `FAILED`
-business phase. The final phase names remain a domain-state-machine decision, but the
-separation is required by the current vocabulary.
+`episode.phase` is only the Owner-visible **Episode Phase**. Its established states
+are `OPENING`, `ACTIVE`, `FINALIZED`, and `CANCELLED`. Provider failure, exporter
+health, retry state, and worker status belong in the inbox, continuation, outbox, and
+telemetry records; they must not introduce an infrastructure `FAILED` business
+phase.
 
 The audit table contains only lifecycle/control metadata, not message bodies,
 Context Package data, Outcome text, provider payloads, or a serialized whole-row
@@ -283,7 +290,8 @@ An OpenAI call or Discord HTTP request cannot share that database transaction. T
 recovery action outbox exists for **product side effects**, not for telemetry: commit
 the intended exact outbound action with the state change, then dispatch and mark it
 acknowledged. A crash after an ambiguous provider response can still produce a retry;
-provider-specific reconciliation and deduplication remain for issue #20. The
+provider-specific reconciliation and deduplication remain for
+[Define bridge restart and Discord reconciliation](https://github.com/rajat2006/coloop/issues/18). The
 transactional-outbox pattern prevents a database/message dual write from silently
 diverging, but consumers and providers still need idempotency because duplicate
 delivery is possible. [AWS, Transactional Outbox
@@ -306,11 +314,12 @@ pattern](https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-p
 
 ### Mutable inbox rows are not events
 
-The ticket-27 prototype's `pending` to `completed` Discord rows correctly model a
-provider **inbox processing state machine**. They answer "has this external delivery
-been durably accepted and finished?" An append-only domain event would instead state
-a business fact such as `EpisodeFinalizationRequested`. Renaming and separating the
-table prevents future code from treating provider bookkeeping as permanent business
+The [Agents SDK runtime prototype](https://github.com/rajat2006/coloop/issues/27)
+correctly models its `pending` to `completed` Discord rows as a provider **inbox
+processing state machine**. They answer "has this external delivery been durably
+accepted and finished?" An append-only domain event would instead state a business
+fact such as `EpisodeFinalizationRequested`. Renaming and separating the table
+prevents future code from treating provider bookkeeping as permanent business
 history.
 
 ### Projections and replay
@@ -370,7 +379,7 @@ telemetry into another durable product workload.
 
 | Classification | Data | Rule |
 | --- | --- | --- |
-| Restricted recovery content | Context Package and path, Opening Brief/pending exact outbound text, completed Outcome until acknowledgement, temporary `RunState`, provider continuation, raw Discord/thread/message IDs, credentials | Owner-local only; credentials belong in OS secret storage, not these tables. Encrypt or otherwise protect sensitive local blobs and minimize lifetime. |
+| Restricted recovery content | Context Package and path, Opening Brief/pending exact outbound text, completed Outcome until acknowledgement, temporary `RunState`, provider continuation, raw Discord/thread/message IDs, credentials | Owner-local only; credentials belong in OS secret storage, not these tables. Rely on the Owner OS account/process boundary and restrictive file permissions for v0, and minimize lifetime. |
 | Restricted conversational content | Completed collaborator Discord text and completed Agent reply | Not locally mirrored after completion. Vendor export is off by default and allowed only by the explicit installation content opt-in and visible participant disclosure. |
 | Export-safe pseudonymous metadata | Random telemetry Episode ID, phase/result enum, attempt count, model/release, token count, duration, content byte count, allowlisted error class | Positive allowlist only. No free-form strings, stable provider IDs, paths, content hashes, raw stack traces, or exception messages. |
 | Aggregate metric | Counts/rates/histograms without installation/Episode/person cardinality | Exportable by default. |
@@ -387,22 +396,26 @@ These are defaults for safe progress, not final product policy:
 
 - Delete serialized `RunState` immediately after successful resume, finalization, or
   cancellation. While genuinely interrupted, retain it only through the Episode's
-  recovery deadline plus a short reconciliation grace; issue #18 decides the final
-  window.
+  recovery deadline plus a short reconciliation grace;
+  [Define episode record retention audit and deletion](https://github.com/rajat2006/coloop/issues/20)
+  decides the final window.
 - Retain exact outbound payload only until provider acknowledgement and any ambiguous
   delivery reconciliation window. Retain the Outcome only until the Origin Session
   acknowledges it.
 - Keep the minimum provider inbox key/status needed to suppress replay for the
   reconciliation window. Compaction may remove error details and payload digest after
-  closure while retaining a short-lived deduplication tombstone; issue #20 decides
-  the exact window.
+  closure while retaining a short-lived deduplication tombstone. The reconciliation
+  behavior belongs to [Define bridge restart and Discord reconciliation](https://github.com/rajat2006/coloop/issues/18),
+  and its retention window belongs to [Define episode record retention audit and
+  deletion](https://github.com/rajat2006/coloop/issues/20).
 - Keep metadata-only audits for a provisional 30 days after terminal state, then
   compact/delete unless a product/compliance requirement justifies longer. Recovery
   must continue to work after they are gone.
 - Credentials are never journaled. Local deletion from SQLite does not necessarily
-  overwrite old pages or backups immediately; combine short lifetimes with encrypted
-  storage/key deletion and a backup-retention policy rather than promising physical
-  erasure from a simple `DELETE`.
+  overwrite old pages or backups immediately; combine short lifetimes, restrictive
+  Owner-only file/process permissions, and a backup-retention policy rather than
+  promising physical erasure from a simple `DELETE`. App-level encryption is not a
+  v0 requirement; a hosted mode may reopen encryption and key ownership explicitly.
 
 ### Real-content opt-in
 
@@ -704,7 +717,7 @@ The logical schema deliberately migrates without changing the persistence model:
 3. Transform SQLite canonical text/BLOB columns to Postgres `timestamptz`, `jsonb`,
    and `bytea`; recreate primary, unique, check, and foreign-key constraints.
 4. Validate counts, nonterminal Episode state, inbox/outbox status, continuation
-   decryptability, phase versions, uniqueness, foreign keys, and a sample of content
+   reference readability, phase versions, uniqueness, foreign keys, and a sample of content
    digests before changing the endpoint.
 5. Start hosted workers against Postgres, reconcile Discord/OpenAI state, then resume
    dispatch. Keep the local database read-only through a rollback window; do not run
@@ -714,7 +727,8 @@ The logical schema deliberately migrates without changing the persistence model:
    every key and query before more than one Owner shares infrastructure.
 
 Hosted Postgres moves restricted recovery data out of the Owner's machine, which is a
-new trust and operational-ownership decision for issue #22. It does not follow from
+new trust and operational-ownership decision for [Define v0 observability and
+operational ownership](https://github.com/rajat2006/coloop/issues/22). It does not follow from
 selecting PostHog, and PostHog must never substitute for the Postgres backup/recovery
 plan.
 
@@ -807,8 +821,13 @@ failure affects Episode behavior.
 - GenAI semantic conventions are still evolving. Version Coloop's `coloop.*`
   attributes and map them at the adapter rather than letting vendor mappings define
   the domain.
-- Discord's exact ambiguous-delivery reconciliation and the final local retention
-  windows belong to issues #20 and #18; hosted trust/ownership belongs to #22.
-- The ticket-27 runtime evidence is deterministic/offline. Live provider behavior can
-  still change checkpoint and reconciliation needs, but it does not create a reason
-  for event sourcing.
+- Discord's exact ambiguous-delivery reconciliation belongs to [Define bridge restart
+  and Discord reconciliation](https://github.com/rajat2006/coloop/issues/18); final
+  local retention windows belong to [Define episode record retention audit and
+  deletion](https://github.com/rajat2006/coloop/issues/20); hosted trust/ownership
+  belongs to [Define v0 observability and operational
+  ownership](https://github.com/rajat2006/coloop/issues/22).
+- The [Agents SDK runtime prototype](https://github.com/rajat2006/coloop/issues/27)
+  evidence is deterministic/offline. Live provider behavior can still change
+  checkpoint and reconciliation needs, but it does not create a reason for event
+  sourcing.
