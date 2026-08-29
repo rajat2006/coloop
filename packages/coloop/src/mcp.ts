@@ -12,6 +12,20 @@ const writeMessage = (output: Writable, value: object): void => {
   output.write(`${JSON.stringify(value)}\n`);
 };
 
+const openEpisodeTool = {
+  description:
+    "Open a private Coloop Collaboration Episode from the approved Origin Session context.",
+  inputSchema: {
+    additionalProperties: true,
+    properties: {
+      opening_brief: { type: "string" },
+    },
+    required: ["opening_brief"],
+    type: "object",
+  },
+  name: "open_episode",
+};
+
 export const runMcpServer = async (
   input: Readable,
   output: Writable,
@@ -52,7 +66,32 @@ export const runMcpServer = async (
       writeMessage(output, {
         id: request.id,
         jsonrpc: "2.0",
-        result: { tools: [] },
+        result: { tools: [openEpisodeTool] },
+      });
+      continue;
+    }
+    if (request.method === "tools/call") {
+      const params = request.params as { name?: unknown } | undefined;
+      if (params?.name !== "open_episode") {
+        writeMessage(output, {
+          error: { code: -32602, message: "Unknown tool" },
+          id: request.id,
+          jsonrpc: "2.0",
+        });
+        continue;
+      }
+      writeMessage(output, {
+        id: request.id,
+        jsonrpc: "2.0",
+        result: {
+          content: [
+            {
+              text: "Episode opening is unavailable until the Episode runtime is installed.",
+              type: "text",
+            },
+          ],
+          isError: true,
+        },
       });
       continue;
     }

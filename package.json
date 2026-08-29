@@ -9,7 +9,7 @@
   "scripts": {
     "build": "pnpm --dir packages/coloop build",
     "ci:product": "pnpm run typecheck && pnpm run test && pnpm run build",
-    "coloop": "pnpm --dir packages/coloop exec tsx src/cli.ts",
+    "coloop": "pnpm --dir packages/coloop build && node packages/coloop/dist/cli.js",
     "test": "pnpm --dir packages/coloop test && pnpm --dir .sandcastle test",
     "typecheck": "pnpm --dir packages/coloop typecheck && pnpm --dir .sandcastle typecheck"
   }

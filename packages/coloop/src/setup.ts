@@ -3,6 +3,7 @@ import type {
   DiscordChannel,
   DiscordGuild,
 } from "./dependencies.js";
+import { isCredentialRejectedError } from "./dependencies.js";
 import { installAndVerifyCodexIntegration } from "./codex-integration.js";
 import {
   getInstallationPaths,
@@ -41,19 +42,14 @@ const selectGuild = async (
   if (guilds.length === 0) {
     throw new Error("The Discord application is not installed in a server.");
   }
-  if (guilds.length === 1) {
-    const guild = guilds[0]!;
-    if (!(await terminal.confirm(`Use server ${guild.name} (${guild.id})?`))) {
-      throw new Error("Server selection was not confirmed.");
-    }
-    return guild;
+  if (guilds.length > 1) {
+    throw new Error(
+      "Remove the dedicated Discord application from every other server, leaving exactly one allowed server, then rerun setup.",
+    );
   }
-  terminal.line("Available servers:");
-  guilds.forEach((guild, index) => terminal.line(`  ${index + 1}. ${guild.name}`));
-  const selected = Number(await terminal.ask("Select one server by number: "));
-  const guild = guilds[selected - 1];
-  if (!guild) {
-    throw new Error("A valid server selection is required.");
+  const guild = guilds[0]!;
+  if (!(await terminal.confirm(`Use server ${guild.name} (${guild.id})?`))) {
+    throw new Error("Server selection was not confirmed.");
   }
   return guild;
 };
@@ -102,6 +98,50 @@ export const verifyPermissions = (channel: DiscordChannel): void => {
       "Permission check failed: View Channel, Send Messages, Create Private Threads, Send Messages in Threads, Read Message History, and Use Application Commands are required.",
     );
   }
+  if (permissions !== requiredDiscordPermissions) {
+    throw new Error(
+      "Permission check failed: remove every permission outside the required least-privilege set.",
+    );
+  }
+};
+
+export const verifyChannelIsolation = (
+  channels: DiscordChannel[],
+  parentChannel: DiscordChannel,
+): void => {
+  for (const channel of channels) {
+    if (channel.id === parentChannel.id) continue;
+    let permissions: bigint;
+    try {
+      permissions = BigInt(channel.permissions);
+    } catch {
+      throw new Error("Discord returned an invalid permission set.");
+    }
+    if ((permissions & (1n << 10n)) !== 0n) {
+      throw new Error(
+        `Permission check failed: deny the dedicated Discord application access to every channel except #${parentChannel.name}.`,
+      );
+    }
+  }
+};
+
+const resolveOwnerMember = async (
+  dependencies: ColoopDependencies,
+  discordToken: string,
+  guildId: string,
+  ownerId: string,
+) => {
+  try {
+    return await dependencies.discord.resolveMember(
+      discordToken,
+      guildId,
+      ownerId,
+    );
+  } catch {
+    throw new Error(
+      "Discord Owner Pairing validation is temporarily unavailable; saved pairing was not changed.",
+    );
+  }
 };
 
 export const runSetup = async (
@@ -129,12 +169,17 @@ export const runSetup = async (
   let application;
   try {
     application = await dependencies.discord.getApplication(discordToken);
-  } catch {
-    await openForOwnerAction(
-      dependencies,
-      "https://discord.com/developers/applications",
+  } catch (error) {
+    if (isCredentialRejectedError(error)) {
+      await openForOwnerAction(
+        dependencies,
+        "https://discord.com/developers/applications",
+      );
+      throw new Error("DISCORD_TOKEN was rejected by Discord.");
+    }
+    throw new Error(
+      "Discord application validation is temporarily unavailable; rerun setup without changing credentials.",
     );
-    throw new Error("DISCORD_TOKEN was rejected by Discord.");
   }
   terminal.line(`Discord application: ${application.name}`);
   terminal.line("Required intents: Guilds, Guild Messages, Message Content.");
@@ -179,6 +224,11 @@ export const runSetup = async (
     await openForOwnerAction(dependencies, installer.toString());
     throw new Error("The Discord application is not installed in a server.");
   }
+  if (guilds.length > 1) {
+    throw new Error(
+      "Remove the dedicated Discord application from every other server, leaving exactly one allowed server, then rerun setup.",
+    );
+  }
   let guild = guilds.find((candidate) => candidate.id === config.guildId);
   if (guild) {
     terminal.line("Saved server is valid; skipping selection.");
@@ -206,6 +256,7 @@ export const runSetup = async (
     channel = await selectChannel(terminal, channels);
   }
   verifyPermissions(channel);
+  verifyChannelIsolation(channels, channel);
   config.parentChannelId = channel.id;
   await saveConfig(paths.configFile, config);
   terminal.line(`Parent channel: #${channel.name}`);
@@ -215,7 +266,7 @@ export const runSetup = async (
   terminal.line("Owner Pairing");
   let ownerId = config.ownerUserId;
   let member = ownerId
-    ? await dependencies.discord.resolveMember(discordToken, guild.id, ownerId)
+    ? await resolveOwnerMember(dependencies, discordToken, guild.id, ownerId)
     : null;
   if (ownerId && member) {
     terminal.line("Saved Owner Pairing is valid; skipping pairing.");
@@ -234,7 +285,8 @@ export const runSetup = async (
   if (!isNumericDiscordId(ownerId)) {
     throw new Error("Owner Pairing requires a numeric Discord user ID.");
   }
-  member ??= await dependencies.discord.resolveMember(
+  member ??= await resolveOwnerMember(
+    dependencies,
     discordToken,
     guild.id,
     ownerId,
@@ -274,12 +326,17 @@ export const runSetup = async (
   }
   try {
     await dependencies.openai.validateCredential(openaiApiKey);
-  } catch {
-    await openForOwnerAction(
-      dependencies,
-      "https://platform.openai.com/api-keys",
+  } catch (error) {
+    if (isCredentialRejectedError(error)) {
+      await openForOwnerAction(
+        dependencies,
+        "https://platform.openai.com/api-keys",
+      );
+      throw new Error("OPENAI_API_KEY was rejected by OpenAI Platform.");
+    }
+    throw new Error(
+      "OpenAI Platform credential validation is temporarily unavailable; rerun setup without changing credentials.",
     );
-    throw new Error("OPENAI_API_KEY was rejected by OpenAI Platform.");
   }
   terminal.line("OpenAI Platform credential verified.");
 

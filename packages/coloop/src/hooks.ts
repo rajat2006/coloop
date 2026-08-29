@@ -11,6 +11,9 @@ const readInput = async (input: Readable): Promise<string> => {
   return body;
 };
 
+const isNonEmptyString = (value: unknown): value is string =>
+  typeof value === "string" && value.length > 0;
+
 export const runCodexHook = async (
   hook: string | undefined,
   input: Readable,
@@ -27,8 +30,8 @@ export const runCodexHook = async (
     if (hook === "user-prompt-submit") {
       if (
         event.hook_event_name !== "UserPromptSubmit" ||
-        typeof event.session_id !== "string" ||
-        typeof event.turn_id !== "string" ||
+        !isNonEmptyString(event.session_id) ||
+        !isNonEmptyString(event.turn_id) ||
         typeof event.prompt !== "string"
       ) {
         throw new Error("unsupported_hook_shape");
@@ -38,9 +41,9 @@ export const runCodexHook = async (
     if (
       event.hook_event_name !== "PreToolUse" ||
       event.tool_name !== "mcp__coloop__open_episode" ||
-      typeof event.session_id !== "string" ||
-      typeof event.turn_id !== "string" ||
-      typeof event.transcript_path !== "string" ||
+      !isNonEmptyString(event.session_id) ||
+      !isNonEmptyString(event.turn_id) ||
+      !isNonEmptyString(event.transcript_path) ||
       typeof event.tool_input !== "object" ||
       event.tool_input === null ||
       Array.isArray(event.tool_input)
@@ -54,9 +57,9 @@ export const runCodexHook = async (
           permissionDecision: "allow",
           updatedInput: {
             ...(event.tool_input as Record<string, unknown>),
-            origin_session_id: event.session_id,
-            origin_transcript_path: event.transcript_path,
-            origin_turn_id: event.turn_id,
+            _origin_session_id: event.session_id,
+            _origin_transcript_path: event.transcript_path,
+            _origin_turn_id: event.turn_id,
           },
         },
       })}\n`,

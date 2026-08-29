@@ -4,12 +4,13 @@ import type {
   DiscordChannel,
   DiscordGuild,
 } from "./dependencies.js";
+import { isCredentialRejectedError } from "./dependencies.js";
 import {
   getInstallationPaths,
   loadConfig,
   verifyPrivateStorage,
 } from "./installation.js";
-import { verifyPermissions } from "./setup.js";
+import { verifyChannelIsolation, verifyPermissions } from "./setup.js";
 import { Terminal } from "./terminal.js";
 
 export const runRuntime = async (
@@ -41,8 +42,11 @@ export const runRuntime = async (
   let application;
   try {
     application = await dependencies.discord.getApplication(discordToken);
-  } catch {
-    throw new Error("DISCORD_TOKEN was rejected by Discord.");
+  } catch (error) {
+    if (isCredentialRejectedError(error)) {
+      throw new Error("DISCORD_TOKEN was rejected by Discord.");
+    }
+    throw new Error("Discord application readiness check failed.");
   }
   if (
     application.id !== config.discordApplicationId ||
@@ -58,6 +62,11 @@ export const runRuntime = async (
     guilds = await dependencies.discord.listGuilds(discordToken);
   } catch {
     throw new Error("Discord server readiness check failed.");
+  }
+  if (guilds.length !== 1) {
+    throw new Error(
+      "The dedicated Discord application must remain installed in exactly one server; rerun `coloop setup`.",
+    );
   }
   const guild = guilds.find((candidate) => candidate.id === config.guildId);
   if (!guild) {
@@ -78,11 +87,17 @@ export const runRuntime = async (
     );
   }
   verifyPermissions(channel);
-  const owner = await dependencies.discord.resolveMember(
-    discordToken,
-    guild.id,
-    config.ownerUserId,
-  );
+  verifyChannelIsolation(channels, channel);
+  let owner;
+  try {
+    owner = await dependencies.discord.resolveMember(
+      discordToken,
+      guild.id,
+      config.ownerUserId,
+    );
+  } catch {
+    throw new Error("Discord Owner Pairing readiness check failed.");
+  }
   if (!owner) {
     throw new Error(
       "The paired Owner no longer resolves in the saved server; rerun `coloop setup`.",
@@ -91,8 +106,11 @@ export const runRuntime = async (
 
   try {
     await dependencies.openai.validateCredential(openaiApiKey);
-  } catch {
-    throw new Error("OPENAI_API_KEY was rejected by OpenAI Platform.");
+  } catch (error) {
+    if (isCredentialRejectedError(error)) {
+      throw new Error("OPENAI_API_KEY was rejected by OpenAI Platform.");
+    }
+    throw new Error("OpenAI Platform credential readiness check failed.");
   }
   await verifyPrivateStorage(paths);
   await verifyCodexIntegration(paths.codexHome, dependencies);

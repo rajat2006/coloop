@@ -26,9 +26,10 @@ and numeric Owner user ID. It requires the `Guilds`, `Guild Messages`, and
 - Read Message History
 - Use Application Commands
 
-Administrator is rejected. Setup also creates Owner-private SQLite and Episode
-artifact locations, then configures the hook and MCP entry points for Codex CLI
-0.150.1. Codex IDE and desktop clients are outside the v0 support boundary.
+Setup rejects Administrator and every permission outside that exact set. It
+also creates Owner-private SQLite and Episode artifact locations, then
+configures the hook and MCP entry points for Codex CLI 0.150.1. Codex IDE and
+desktop clients are outside the v0 support boundary.
 
 By default, non-secret configuration lives under
 `$XDG_CONFIG_HOME/coloop/config.json` and durable local state under

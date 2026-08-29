@@ -2,11 +2,14 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type {
   ColoopDependencies,
+  CommandInvocation,
+  CommandResult,
   DiscordApplication,
   DiscordChannel,
   DiscordGuild,
   DiscordMember,
 } from "./dependencies.js";
+import { CredentialRejectedError } from "./dependencies.js";
 
 const discordApi = "https://discord.com/api/v10";
 const openaiApi = "https://api.openai.com/v1";
@@ -62,7 +65,15 @@ interface DiscordChannelResponse {
   type?: unknown;
 }
 
+class ProviderResourceNotFoundError extends Error {}
+
 const readJson = async <T>(response: Response): Promise<T> => {
+  if (response.status === 401) {
+    throw new CredentialRejectedError();
+  }
+  if (response.status === 404) {
+    throw new ProviderResourceNotFoundError();
+  }
   if (!response.ok) {
     throw new Error("provider_request_failed");
   }
@@ -234,7 +245,39 @@ const connectDiscordGateway = async (
   };
 };
 
-export const createProductionDependencies = (): ColoopDependencies => ({
+const runColoopProcess = async (
+  entrypoint: CommandInvocation,
+  args: string[],
+  input: string,
+): Promise<CommandResult> =>
+  await new Promise((resolve) => {
+    const child = execFile(
+      entrypoint.command,
+      [...entrypoint.args, ...args],
+      {
+        encoding: "utf8",
+        env: sanitizedSubprocessEnvironment(),
+        timeout: 15_000,
+      },
+      (error, stdout, stderr) => {
+        resolve({
+          exitCode: error
+            ? typeof error.code === "number"
+              ? error.code
+              : 1
+            : 0,
+          stderr,
+          stdout,
+        });
+      },
+    );
+    child.stdin?.end(input);
+  });
+
+export const createProductionDependencies = (
+  coloopEntrypoint: CommandInvocation,
+): ColoopDependencies => ({
+  coloopEntrypoint,
   discord: {
     connectGateway: connectDiscordGateway,
     async getApplication(token) {
@@ -265,26 +308,24 @@ export const createProductionDependencies = (): ColoopDependencies => ({
       const memberRoleIds = Array.isArray(member.roles)
         ? member.roles.map(requireString)
         : [];
-      return channels
-        .filter((channel) => channel.type === 0)
-        .map<DiscordChannel>((channel) => {
-          const overwrites = Array.isArray(channel.permission_overwrites)
-            ? (channel.permission_overwrites as DiscordOverwriteResponse[])
-            : [];
-          return {
+      return channels.map<DiscordChannel>((channel) => {
+        const overwrites = Array.isArray(channel.permission_overwrites)
+          ? (channel.permission_overwrites as DiscordOverwriteResponse[])
+          : [];
+        return {
+          guildId,
+          id: requireString(channel.id),
+          name: requireString(channel.name),
+          permissions: calculateChannelPermissions(
             guildId,
-            id: requireString(channel.id),
-            name: requireString(channel.name),
-            permissions: calculateChannelPermissions(
-              guildId,
-              botId,
-              memberRoleIds,
-              roles,
-              overwrites,
-            ),
-            type: "GUILD_TEXT",
-          };
-        });
+            botId,
+            memberRoleIds,
+            roles,
+            overwrites,
+          ),
+          type: channel.type === 0 ? "GUILD_TEXT" : "OTHER",
+        };
+      });
     },
     async listGuilds(token) {
       const guilds = await discordRequest<DiscordGuildResponse[]>(
@@ -311,8 +352,9 @@ export const createProductionDependencies = (): ColoopDependencies => ({
               ? member.user.global_name
               : username;
         return { displayName: preferredName, id, username } satisfies DiscordMember;
-      } catch {
-        return null;
+      } catch (error) {
+        if (error instanceof ProviderResourceNotFoundError) return null;
+        throw error;
       }
     },
   },
@@ -324,7 +366,7 @@ export const createProductionDependencies = (): ColoopDependencies => ({
           ? { executable: "cmd", args: ["/c", "start", "", url] }
           : { executable: "xdg-open", args: [url] };
     await new Promise<void>((resolve, reject) => {
-      const child = execFile(
+      execFile(
         command.executable,
         command.args,
         { env: sanitizedSubprocessEnvironment() },
@@ -333,7 +375,6 @@ export const createProductionDependencies = (): ColoopDependencies => ({
           else resolve();
         },
       );
-      child.unref();
     });
   },
   openai: {
@@ -342,6 +383,9 @@ export const createProductionDependencies = (): ColoopDependencies => ({
         headers: { Authorization: `Bearer ${apiKey}` },
         signal: AbortSignal.timeout(15_000),
       });
+      if (response.status === 401) {
+        throw new CredentialRejectedError();
+      }
       if (!response.ok) {
         throw new Error("provider_request_failed");
       }
@@ -369,6 +413,8 @@ export const createProductionDependencies = (): ColoopDependencies => ({
       };
     }
   },
+  runColoop: async (args, input) =>
+    await runColoopProcess(coloopEntrypoint, args, input),
   waitForShutdown: async () =>
     await new Promise<void>((resolve) => {
       process.once("SIGINT", resolve);

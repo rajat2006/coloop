@@ -14,7 +14,7 @@ export interface DiscordChannel {
   id: string;
   name: string;
   permissions: string;
-  type: "GUILD_TEXT";
+  type: "GUILD_TEXT" | "OTHER";
 }
 
 export interface DiscordMember {
@@ -45,10 +45,28 @@ export interface CommandResult {
   stdout: string;
 }
 
+export interface CommandInvocation {
+  args: string[];
+  command: string;
+}
+
+export class CredentialRejectedError extends Error {
+  constructor() {
+    super("provider_credential_rejected");
+    this.name = "CredentialRejectedError";
+  }
+}
+
+export const isCredentialRejectedError = (
+  error: unknown,
+): error is CredentialRejectedError => error instanceof CredentialRejectedError;
+
 export interface ColoopDependencies {
+  coloopEntrypoint: CommandInvocation;
   discord: DiscordProvider;
   openExternal(url: string): Promise<void>;
   openai: OpenAIProvider;
   runCodex(args: string[]): Promise<CommandResult>;
+  runColoop(args: string[], input: string): Promise<CommandResult>;
   waitForShutdown(): Promise<void>;
 }

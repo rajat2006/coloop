@@ -28,9 +28,9 @@ describe("Codex CLI integration entry points", () => {
           session_id: "trusted-session",
           tool_input: {
             opening_brief: "Please review this bounded question.",
-            origin_session_id: "model-authored-session",
-            origin_transcript_path: "/untrusted/transcript.jsonl",
-            origin_turn_id: "model-authored-turn",
+            _origin_session_id: "model-authored-session",
+            _origin_transcript_path: "/untrusted/transcript.jsonl",
+            _origin_turn_id: "model-authored-turn",
           },
           tool_name: "mcp__coloop__open_episode",
           transcript_path: "/trusted/transcript.jsonl",
@@ -47,11 +47,34 @@ describe("Codex CLI integration entry points", () => {
       hookSpecificOutput: { updatedInput: Record<string, unknown> };
     };
     expect(response.hookSpecificOutput.updatedInput).toEqual({
+      _origin_session_id: "trusted-session",
+      _origin_transcript_path: "/trusted/transcript.jsonl",
+      _origin_turn_id: "trusted-turn",
       opening_brief: "Please review this bounded question.",
-      origin_session_id: "trusted-session",
-      origin_transcript_path: "/trusted/transcript.jsonl",
-      origin_turn_id: "trusted-turn",
     });
+  });
+
+  test("the pre-tool hook rejects empty trusted identity fields", async () => {
+    const output = new StringWriter();
+    const error = new StringWriter();
+    const exitCode = await runCodexHook(
+      "pre-tool-use",
+      Readable.from([
+        JSON.stringify({
+          hook_event_name: "PreToolUse",
+          session_id: "",
+          tool_input: {},
+          tool_name: "mcp__coloop__open_episode",
+          transcript_path: "/trusted/transcript.jsonl",
+          turn_id: "trusted-turn",
+        }),
+      ]),
+      output,
+      error,
+    );
+
+    expect(exitCode).toBe(2);
+    expect(output.value).toBe("");
   });
 
   test("the pre-tool hook fails closed for unsupported identity payloads", async () => {
@@ -127,7 +150,15 @@ describe("Codex CLI integration entry points", () => {
           serverInfo: { name: "coloop", version: "0.0.0" },
         },
       },
-      { id: 2, jsonrpc: "2.0", result: { tools: [] } },
+      {
+        id: 2,
+        jsonrpc: "2.0",
+        result: {
+          tools: [
+            expect.objectContaining({ name: "open_episode" }),
+          ],
+        },
+      },
     ]);
   });
 });

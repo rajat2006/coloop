@@ -12,6 +12,7 @@ import type {
   DiscordGuild,
   DiscordMember,
 } from "../src/dependencies.js";
+import { CredentialRejectedError } from "../src/dependencies.js";
 
 const ownerId = "123456789012345678";
 const replacementOwnerId = "987654321098765432";
@@ -20,6 +21,7 @@ const readyFixture = {
   discord: {
     expectedCredential: "discord-test-secret",
     credentialValid: true,
+    providerUnavailable: false,
     application: {
       id: "100000000000000001",
       name: "Coloop Test",
@@ -47,6 +49,7 @@ const readyFixture = {
   openai: {
     expectedCredential: "openai-test-secret",
     credentialValid: true,
+    providerUnavailable: false,
   },
   codex: {
     version: "codex-cli 0.150.1",
@@ -73,10 +76,12 @@ interface Fixture {
     expectedCredential: string;
     guilds: DiscordGuild[];
     members: Array<DiscordMember & { guildId: string }>;
+    providerUnavailable?: boolean;
   };
   openai: {
     credentialValid: boolean;
     expectedCredential: string;
+    providerUnavailable?: boolean;
   };
 }
 
@@ -107,36 +112,44 @@ const createDependencies = (
   openedUrls: string[],
   state: InstallationTestState,
 ): ColoopDependencies => {
+  const coloopEntrypoint = {
+    args: ["/test/coloop/dist/cli.js"],
+    command: "/test/node",
+  };
   return {
+    coloopEntrypoint,
     discord: {
       async connectGateway(token) {
         if (!fixture.discord.credentialValid || token !== fixture.discord.expectedCredential) {
-          throw new Error("invalid_credential");
+          throw new CredentialRejectedError();
         }
         state.runtimeStarts += 1;
         return { close: async () => {} };
       },
       async getApplication(token) {
+        if (fixture.discord.providerUnavailable) {
+          throw new Error("provider_unavailable");
+        }
         if (!fixture.discord.credentialValid || token !== fixture.discord.expectedCredential) {
-          throw new Error("invalid_credential");
+          throw new CredentialRejectedError();
         }
         return fixture.discord.application;
       },
       async listChannels(token, guildId) {
         if (!fixture.discord.credentialValid || token !== fixture.discord.expectedCredential) {
-          throw new Error("invalid_credential");
+          throw new CredentialRejectedError();
         }
         return fixture.discord.channels.filter((channel) => channel.guildId === guildId);
       },
       async listGuilds(token) {
         if (!fixture.discord.credentialValid || token !== fixture.discord.expectedCredential) {
-          throw new Error("invalid_credential");
+          throw new CredentialRejectedError();
         }
         return fixture.discord.guilds;
       },
       async resolveMember(token, guildId, userId) {
         if (!fixture.discord.credentialValid || token !== fixture.discord.expectedCredential) {
-          throw new Error("invalid_credential");
+          throw new CredentialRejectedError();
         }
         return (
           fixture.discord.members.find(
@@ -150,8 +163,11 @@ const createDependencies = (
     },
     openai: {
       async validateCredential(apiKey) {
+        if (fixture.openai.providerUnavailable) {
+          throw new Error("provider_unavailable");
+        }
         if (!fixture.openai.credentialValid || apiKey !== fixture.openai.expectedCredential) {
-          throw new Error("invalid_credential");
+          throw new CredentialRejectedError();
         }
       },
     },
@@ -178,8 +194,10 @@ const createDependencies = (
                 enabled: true,
                 name: "coloop",
                 transport: {
-                  args: ["mcp"],
-                  command: state.mcpCommandValid ? "coloop" : "legacy-coloop",
+                  args: [...coloopEntrypoint.args, "mcp"],
+                  command: state.mcpCommandValid
+                    ? coloopEntrypoint.command
+                    : "legacy-coloop",
                   type: "stdio",
                 },
               }),
@@ -187,6 +205,20 @@ const createDependencies = (
           : { exitCode: 1, stderr: "not found\n", stdout: "" };
       }
       return { exitCode: 1, stderr: "unsupported command\n", stdout: "" };
+    },
+    runColoop: async (args) => {
+      if (args[0] !== "verify-entrypoint") {
+        return { exitCode: 1, stderr: "unsupported command\n", stdout: "" };
+      }
+      return {
+        exitCode: 0,
+        stderr: "",
+        stdout: `${JSON.stringify({
+          id: 2,
+          jsonrpc: "2.0",
+          result: { tools: [{ name: "open_episode" }] },
+        })}\n`,
+      };
     },
     waitForShutdown: async () => {},
   };
@@ -471,6 +503,22 @@ describe("coloop CLI", () => {
     expect(installer.searchParams.get("permissions")).toBe("345744935936");
   });
 
+  test("setup rejects a dedicated application installed in more than one server", async () => {
+    const installedTwice = structuredClone(readyFixture);
+    installedTwice.discord.guilds.push({
+      id: "200000000000000099",
+      name: "Unexpected Guild",
+    });
+
+    const result = await runCli(["setup"], "y\n", installedTwice);
+
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain(
+      "Remove the dedicated Discord application from every other server",
+    );
+    expect(result.stdout).not.toContain("Select one server by number");
+  });
+
   test("Owner Pairing fails when the numeric identity does not resolve in the configured server", async () => {
     const unresolved = structuredClone(readyFixture);
     unresolved.discord.members = [];
@@ -505,6 +553,75 @@ describe("coloop CLI", () => {
       "Permission check failed: View Channel, Send Messages, Create Private Threads",
     );
     expect(result.stdout).not.toContain("Owner Pairing");
+  });
+
+  test("setup rejects permissions beyond the exact least-privilege set", async () => {
+    const excessivePermissions = structuredClone(readyFixture);
+    excessivePermissions.discord.channels[0]!.permissions = (
+      BigInt(readyFixture.discord.channels[0]!.permissions) |
+      (1n << 28n)
+    ).toString();
+
+    const result = await runCli(
+      ["setup"],
+      "y\ny\ny\n",
+      excessivePermissions,
+    );
+
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain(
+      "Permission check failed: remove every permission outside the required least-privilege set.",
+    );
+    expect(result.stdout).not.toContain("Owner Pairing");
+  });
+
+  test("setup rejects access to every Discord channel except the selected parent", async () => {
+    const unrelatedChannelAccess = structuredClone(readyFixture);
+    unrelatedChannelAccess.discord.channels.push({
+      guildId: readyFixture.discord.guilds[0]!.id,
+      id: "300000000000000099",
+      name: "general",
+      permissions: "1024",
+      type: "GUILD_TEXT",
+    });
+
+    const result = await runCli(
+      ["setup"],
+      "y\ny\n1\n",
+      unrelatedChannelAccess,
+    );
+
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain(
+      "Permission check failed: deny the dedicated Discord application access to every channel except #collaboration.",
+    );
+    expect(result.stdout).not.toContain("Owner Pairing");
+  });
+
+  test("setup does not open provider pages for transient validation failures", async () => {
+    const discordUnavailable = structuredClone(readyFixture);
+    discordUnavailable.discord.providerUnavailable = true;
+    const discordResult = await runCli(["setup"], "", discordUnavailable);
+
+    expect(discordResult.code).toBe(1);
+    expect(discordResult.stderr).toContain(
+      "Discord application validation is temporarily unavailable",
+    );
+    expect(discordResult.openedUrls).toEqual([]);
+
+    const openaiUnavailable = structuredClone(readyFixture);
+    openaiUnavailable.openai.providerUnavailable = true;
+    const openaiResult = await runCli(
+      ["setup"],
+      `y\ny\ny\n${ownerId}\ny\n`,
+      openaiUnavailable,
+    );
+
+    expect(openaiResult.code).toBe(1);
+    expect(openaiResult.stderr).toContain(
+      "OpenAI Platform credential validation is temporarily unavailable",
+    );
+    expect(openaiResult.openedUrls).toEqual([]);
   });
 
   test("setup never persists either provider credential", async () => {
@@ -559,5 +676,20 @@ describe("coloop CLI", () => {
       "OPENAI_API_KEY is required to start Coloop.",
     );
     expect(missingCredential.runtimeStarts).toBe(1);
+
+    const invalidProvider = structuredClone(readyFixture);
+    invalidProvider.openai.credentialValid = false;
+    const rejectedCredential = await runCli(
+      ["run"],
+      "",
+      invalidProvider,
+      {},
+      setup.root,
+    );
+    expect(rejectedCredential.code).toBe(1);
+    expect(rejectedCredential.stderr).toContain(
+      "OPENAI_API_KEY was rejected by OpenAI Platform.",
+    );
+    expect(rejectedCredential.runtimeStarts).toBe(1);
   });
 });
