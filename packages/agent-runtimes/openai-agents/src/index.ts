@@ -1,4 +1,4 @@
-import type { EmptyResult } from "@coloop/core";
+import type { EmptyResult, EpisodeAgent } from "@coloop/core";
 import { Agent, Runner, type Model } from "@openai/agents";
 
 const openaiApi = "https://api.openai.com/v1";
@@ -9,22 +9,7 @@ export interface OpenAICredentialProvider {
   ): Promise<EmptyResult<"credential-rejected" | "provider-unavailable">>;
 }
 
-export interface EpisodeAgent {
-  streamResponse(input: {
-    readonly contextPackage: string;
-    readonly message: string;
-    readonly previousResponseId?: string;
-    readonly onTextDelta: (
-      delta: string,
-    ) => Promise<EmptyResult<"delivery-failed">> | EmptyResult<"delivery-failed">;
-  }): Promise<
-    | { readonly ok: true; readonly responseId: string }
-    | {
-        readonly ok: false;
-        readonly reason: "delivery-failed" | "provider-failed";
-      }
-  >;
-}
+export type { EpisodeAgent } from "@coloop/core";
 
 interface EpisodeAgentContext {
   readonly contextPackage: string;

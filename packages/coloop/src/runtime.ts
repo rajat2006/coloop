@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import type { EpisodeAgent } from "@coloop/core";
 import type {
   CodexRequest,
   EpisodeToolArguments,
@@ -39,27 +40,7 @@ export interface DiscordEpisodeTransport {
   }>;
 }
 
-export interface EpisodeAgentTransport {
-  streamResponse(input: {
-    readonly contextPackage: string;
-    readonly message: string;
-    readonly previousResponseId?: string;
-    readonly onTextDelta: (
-      delta: string,
-    ) =>
-      | Promise<
-          { readonly ok: true } | { readonly ok: false; readonly reason: "delivery-failed" }
-        >
-      | { readonly ok: true }
-      | { readonly ok: false; readonly reason: "delivery-failed" };
-  }): Promise<
-    | { readonly ok: true; readonly responseId: string }
-    | {
-        readonly ok: false;
-        readonly reason: "delivery-failed" | "provider-failed";
-      }
-  >;
-}
+export type EpisodeAgentTransport = EpisodeAgent;
 
 export interface DiscordMessageEvent {
   readonly eventId: string;
@@ -68,6 +49,12 @@ export interface DiscordMessageEvent {
   readonly authorKind: "human" | "external-bot" | "webhook" | "coloop";
   readonly content: string;
   readonly mentionsApplication: boolean;
+  readonly relevantConversation?: readonly DiscordConversationMessage[];
+}
+
+export interface DiscordConversationMessage {
+  readonly authorKind: "human" | "external-bot" | "webhook";
+  readonly content: string;
 }
 
 export type DiscordMessageResult =
@@ -147,7 +134,7 @@ export interface CodexEpisodeRuntime {
     readonly request: unknown;
     readonly approval?: unknown;
   }): Promise<EpisodeOperationResult>;
-  handleDiscordMessage(input: DiscordMessageEvent): Promise<DiscordMessageResult>;
+  handleDiscordMessage(input: unknown): Promise<DiscordMessageResult>;
   close(): void;
 }
 
@@ -288,16 +275,102 @@ export function createColoopRuntime(configuration: RuntimeConfiguration): CodexE
       return result;
     },
     async handleDiscordMessage(input): Promise<DiscordMessageResult> {
+      const event = parseDiscordMessageEvent(input);
+      if (!event.ok) return event;
       return await serializeDiscordTurn(
         discordTurnQueues,
-        `${input.guildId}:${input.threadId}`,
-        async () => await processDiscordMessage(database, configuration, input, now),
+        `${event.value.guildId}:${event.value.threadId}`,
+        async () =>
+          await processDiscordMessage(database, configuration, event.value, now),
       );
     },
     close(): void {
       database.close();
     },
   };
+}
+
+function parseDiscordMessageEvent(
+  value: unknown,
+):
+  | { readonly ok: true; readonly value: DiscordMessageEvent }
+  | { readonly ok: false; readonly reason: string; readonly code: string } {
+  if (
+    !isRecord(value) ||
+    !isNonEmptyString(value.eventId) ||
+    !isNonEmptyString(value.guildId) ||
+    !isNonEmptyString(value.threadId) ||
+    !isDiscordMessageAuthor(value.authorKind) ||
+    !isNonEmptyString(value.content) ||
+    typeof value.mentionsApplication !== "boolean"
+  ) {
+    return invalidDiscordEvent();
+  }
+  let relevantConversation: DiscordConversationMessage[] | undefined;
+  if (value.relevantConversation !== undefined) {
+    if (!Array.isArray(value.relevantConversation)) return invalidDiscordEvent();
+    relevantConversation = [];
+    for (const message of value.relevantConversation) {
+      if (
+        !isRecord(message) ||
+        !isParticipantAuthor(message.authorKind) ||
+        !isNonEmptyString(message.content)
+      ) {
+        return invalidDiscordEvent();
+      }
+      relevantConversation.push({
+        authorKind: message.authorKind,
+        content: message.content,
+      });
+    }
+    const triggeringMessage = relevantConversation.at(-1);
+    if (
+      value.authorKind !== "coloop" &&
+      (triggeringMessage?.authorKind !== value.authorKind ||
+        triggeringMessage.content !== value.content)
+    ) {
+      return invalidDiscordEvent();
+    }
+  }
+  return {
+    ok: true,
+    value: {
+      eventId: value.eventId,
+      guildId: value.guildId,
+      threadId: value.threadId,
+      authorKind: value.authorKind,
+      content: value.content,
+      mentionsApplication: value.mentionsApplication,
+      ...(relevantConversation === undefined ? {} : { relevantConversation }),
+    },
+  };
+}
+
+function isDiscordMessageAuthor(
+  value: unknown,
+): value is DiscordMessageEvent["authorKind"] {
+  return value === "human" || isParticipantAuthor(value) || value === "coloop";
+}
+
+function isParticipantAuthor(
+  value: unknown,
+): value is DiscordConversationMessage["authorKind"] {
+  return value === "human" || value === "external-bot" || value === "webhook";
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function invalidDiscordEvent(): {
+  readonly ok: false;
+  readonly reason: string;
+  readonly code: string;
+} {
+  return failure(
+    "INVALID_DISCORD_EVENT",
+    "The Discord message event is unsupported or malformed.",
+  );
 }
 
 async function serializeDiscordTurn<Value>(
@@ -392,7 +465,7 @@ async function processDiscordMessage(
   const contextPackage = await readFile(episode.context_reference, "utf8");
   const agentResult = await configuration.agent.streamResponse({
     contextPackage,
-    message: input.content,
+    message: renderDiscordConversation(input),
     ...(episode.agent_previous_response_id === null
       ? {}
       : { previousResponseId: episode.agent_previous_response_id }),
@@ -439,6 +512,16 @@ async function processDiscordMessage(
       .run(completedAt, `agent-response:${input.eventId}`);
   });
   return { ok: true, status: "completed" };
+}
+
+function renderDiscordConversation(input: DiscordMessageEvent): string {
+  if (input.relevantConversation === undefined) return input.content;
+  return (
+    "# Relevant Discord conversation\n\n" +
+    input.relevantConversation
+      .map((message) => `${message.authorKind}: ${message.content}`)
+      .join("\n\n")
+  );
 }
 
 function abandonAgentTurn(database: DatabaseSync, eventId: string): void {

@@ -15,3 +15,4 @@ export {
   type ReadyInstallationConfig,
 } from "./installation/installation-config.js";
 export { type EmptyResult, type Result } from "./result.js";
+export { type EpisodeAgent } from "./episode-agent.js";

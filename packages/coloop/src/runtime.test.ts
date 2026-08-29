@@ -1042,6 +1042,10 @@ describe("Discord Episode Agent conversation", () => {
     });
     if (!opened.ok) throw new Error(opened.reason);
 
+    await expect(
+      runtime.handleDiscordMessage({} as DiscordMessageEvent),
+    ).resolves.toMatchObject({ ok: false, code: "INVALID_DISCORD_EVENT" });
+
     const ignoredEvents: DiscordMessageEvent[] = [
       {
         ...discordMessage("not-mentioned", "Ordinary participant discussion"),
@@ -1060,11 +1064,20 @@ describe("Discord Episode Agent conversation", () => {
         status: "ignored",
       });
     }
+    const externalBotMention = {
+      ...discordMessage("external-bot", "@Coloop compare these"),
+      authorKind: "external-bot" as const,
+      relevantConversation: [
+        { authorKind: "human" as const, content: "Option A is safer." },
+        { authorKind: "webhook" as const, content: "Option B is faster." },
+        {
+          authorKind: "external-bot" as const,
+          content: "@Coloop compare these",
+        },
+      ],
+    };
     await expect(
-      runtime.handleDiscordMessage({
-        ...discordMessage("external-bot", "@Coloop compare these"),
-        authorKind: "external-bot",
-      }),
+      runtime.handleDiscordMessage(externalBotMention),
     ).resolves.toEqual({ ok: true, status: "completed" });
     await expect(
       runtime.handleDiscordMessage({
@@ -1074,7 +1087,10 @@ describe("Discord Episode Agent conversation", () => {
     ).resolves.toEqual({ ok: true, status: "completed" });
 
     expect(agent.inputs.map((input) => input.message)).toEqual([
-      "@Coloop compare these",
+      "# Relevant Discord conversation\n\n" +
+        "human: Option A is safer.\n\n" +
+        "webhook: Option B is faster.\n\n" +
+        "external-bot: @Coloop compare these",
       "@Coloop summarize this",
     ]);
     runtime.close();
@@ -1198,6 +1214,130 @@ describe("Discord Episode Agent conversation", () => {
     database.close();
     runtime.close();
   });
+
+  it("does not acknowledge begin, append, or completion delivery failures", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "coloop-delivery-failure-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "coloop.sqlite");
+    const transcriptPath = join(directory, "rollout.jsonl");
+    await writeFile(
+      transcriptPath,
+      fixtureTranscript("origin-1", [ownerMessage("Review the rollout plan.")]),
+    );
+    const discord = new RecordingDiscordTransport(false, false, [
+      "begin",
+      "append",
+      "complete",
+    ]);
+    const agent = new RecordingEpisodeAgent([
+      { deltas: ["Undeliverable append"], responseId: "response-1" },
+      { deltas: ["Undeliverable completion"], responseId: "response-2" },
+    ]);
+    const runtime = createColoopRuntime({
+      databasePath,
+      artifactDirectory: join(directory, "episodes"),
+      ownerDiscordUserId: "1001",
+      guildId: "2002",
+      parentChannelId: "3003",
+      discord,
+      agent,
+    });
+    const opened = await runtime.handleCodexOperation({
+      hook: trustedHook("origin-1", transcriptPath),
+      approval: approveOwnerOnlyOpen(
+        "tool-use-1",
+        "# Review",
+        "Review the rollout plan.",
+      ),
+      request: {
+        operation: "open_episode",
+        arguments: {
+          openingBrief: "# Review",
+          originalRequest: "Review the rollout plan.",
+        },
+      },
+    });
+    if (!opened.ok) throw new Error(opened.reason);
+
+    for (const eventId of ["begin-failure", "append-failure", "complete-failure"]) {
+      await expect(
+        runtime.handleDiscordMessage(
+          discordMessage(eventId, `@Coloop ${eventId}`),
+        ),
+      ).resolves.toMatchObject({ ok: false, code: "DISCORD_DELIVERY_FAILED" });
+    }
+
+    const database = new DatabaseSync(databasePath);
+    expect(
+      database
+        .prepare(
+          "SELECT status, completed_at FROM provider_inbox WHERE effect_kind = 'agent_turn' ORDER BY received_at",
+        )
+        .all(),
+    ).toEqual([
+      { status: "FAILED", completed_at: null },
+      { status: "FAILED", completed_at: null },
+      { status: "FAILED", completed_at: null },
+    ]);
+    expect(
+      database
+        .prepare("SELECT agent_previous_response_id FROM episodes")
+        .get(),
+    ).toEqual({ agent_previous_response_id: null });
+    database.close();
+    runtime.close();
+  });
+
+  it("presents selective Context Package answers and explicit missing context", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "coloop-agent-context-"));
+    temporaryDirectories.push(directory);
+    const transcriptPath = join(directory, "rollout.jsonl");
+    const originalRequest =
+      "Review the rollout plan. The rollback window is ten minutes.";
+    await writeFile(
+      transcriptPath,
+      fixtureTranscript("origin-1", [ownerMessage(originalRequest)]),
+    );
+    const discord = new RecordingDiscordTransport();
+    const runtime = createColoopRuntime({
+      databasePath: join(directory, "coloop.sqlite"),
+      artifactDirectory: join(directory, "episodes"),
+      ownerDiscordUserId: "1001",
+      guildId: "2002",
+      parentChannelId: "3003",
+      discord,
+      agent: new ContextAwareEpisodeAgent(),
+    });
+    const opened = await runtime.handleCodexOperation({
+      hook: trustedHook("origin-1", transcriptPath),
+      approval: approveOwnerOnlyOpen("tool-use-1", "# Review", originalRequest),
+      request: {
+        operation: "open_episode",
+        arguments: { openingBrief: "# Review", originalRequest },
+      },
+    });
+    if (!opened.ok) throw new Error(opened.reason);
+
+    await runtime.handleDiscordMessage(
+      discordMessage("context-answer", "@Coloop What is the rollback window?"),
+    );
+    await runtime.handleDiscordMessage(
+      discordMessage("context-gap", "@Coloop Which database version is installed?"),
+    );
+
+    expect(
+      discord.agentResponseEffects.filter((effect) =>
+        isTextDeltaEffect(effect),
+      ),
+    ).toEqual([
+      { kind: "delta", text: "The approved snapshot says ten minutes." },
+      {
+        kind: "delta",
+        text: "The approved snapshot does not include the database version.",
+      },
+    ]);
+    runtime.close();
+  });
 });
 
 function trustedHook(
@@ -1254,6 +1394,12 @@ function discordMessage(eventId: string, content: string): DiscordMessageEvent {
   };
 }
 
+function isTextDeltaEffect(
+  value: object,
+): value is { readonly kind: "delta"; readonly text: string } {
+  return "kind" in value && value.kind === "delta";
+}
+
 function approveOwnerOnlyOpen(
   toolUseId: string,
   openingBrief: string,
@@ -1276,6 +1422,9 @@ class RecordingDiscordTransport implements DiscordEpisodeTransport {
   constructor(
     private readonly failProvisioning = false,
     private failCancellationOnce = false,
+    private readonly agentDeliveryFailures: Array<
+      "begin" | "append" | "complete"
+    > = [],
   ) {}
 
   async provisionEpisode(
@@ -1326,6 +1475,8 @@ class RecordingDiscordTransport implements DiscordEpisodeTransport {
     readonly guildId: string;
     readonly threadId: string;
   }) {
+    const failure = this.agentDeliveryFailures.shift();
+    if (failure === "begin") throw new Error("Discord unavailable");
     this.agentResponseEffects.push({
       kind: "begin",
       eventId: input.eventId,
@@ -1333,9 +1484,11 @@ class RecordingDiscordTransport implements DiscordEpisodeTransport {
     });
     return {
       appendText: async (text: string) => {
+        if (failure === "append") throw new Error("Discord unavailable");
         this.agentResponseEffects.push({ kind: "delta", text });
       },
       complete: async () => {
+        if (failure === "complete") throw new Error("Discord unavailable");
         this.agentResponseEffects.push({ kind: "complete" });
       },
     };
@@ -1422,6 +1575,25 @@ class DeferredEpisodeAgent implements EpisodeAgentTransport {
 class FailingEpisodeAgent implements EpisodeAgentTransport {
   async streamResponse(): ReturnType<EpisodeAgentTransport["streamResponse"]> {
     return { ok: false, reason: "provider-failed" };
+  }
+}
+
+class ContextAwareEpisodeAgent implements EpisodeAgentTransport {
+  private turn = 0;
+
+  async streamResponse(
+    input: Parameters<EpisodeAgentTransport["streamResponse"]>[0],
+  ): ReturnType<EpisodeAgentTransport["streamResponse"]> {
+    this.turn += 1;
+    const text = input.message.includes("rollback")
+      ? input.contextPackage.includes("rollback window is ten minutes")
+        ? "The approved snapshot says ten minutes."
+        : "The approved snapshot does not include the rollback window."
+      : "The approved snapshot does not include the database version.";
+    const delivery = await input.onTextDelta(text);
+    return delivery.ok
+      ? { ok: true, responseId: `response-${this.turn}` }
+      : delivery;
   }
 }
 

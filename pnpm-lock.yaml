@@ -85,6 +85,10 @@ importers:
         version: link:../../core
 
   packages/coloop:
+    dependencies:
+      '@coloop/core':
+        specifier: workspace:*
+        version: link:../core
     devDependencies:
       '@types/node':
         specifier: ^24.0.0
