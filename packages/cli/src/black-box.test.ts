@@ -260,7 +260,7 @@ describe("built coloop CLI", () => {
     expect(
       retained
         .prepare(
-          "SELECT phase, return_pending, outcome_result_markdown, returned_turn_id FROM episodes",
+          "SELECT phase, return_pending, outcome_result_markdown, returned_turn_id, telemetry_id FROM episodes",
         )
         .get(),
     ).toEqual({
@@ -268,6 +268,7 @@ describe("built coloop CLI", () => {
       return_pending: 0,
       outcome_result_markdown: "Use a canary rollout.",
       returned_turn_id: "next-turn",
+      telemetry_id: expect.any(String),
     });
     retained.close();
   });

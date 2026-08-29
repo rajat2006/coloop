@@ -1,10 +1,19 @@
 import type { EmptyResult, EpisodeAgent } from "@coloop/core";
-import type { PrivateAgentTracePolicy } from "@coloop/observability";
+import {
+  containsRecognizedCredential,
+  type PrivateAgentTracePolicy,
+} from "@coloop/observability";
 import {
   Agent,
   Runner,
+  setTraceProcessors,
   type JsonSchemaDefinition,
   type Model,
+  type Span,
+  type SpanData,
+  type Trace,
+  type TracingExporter,
+  type TracingProcessor,
 } from "@openai/agents";
 
 const openaiApi = "https://api.openai.com/v1";
@@ -57,6 +66,7 @@ const outcomeProposalOutput = {
 export const createEpisodeAgent = (configuration: {
   readonly model?: Model | string;
   readonly privateAgentTracePolicy?: PrivateAgentTracePolicy;
+  readonly privateAgentTraceExporter?: TracingExporter;
 } = {}): EpisodeAgent => {
   const manager = new Agent<
     EpisodeAgentContext,
@@ -83,9 +93,15 @@ Synthesize the requested public Outcome Proposal from the authorized context and
     traceIncludeSensitiveData: false,
     tracingDisabled: true,
   });
+  const privateTracingAvailable = configuration.privateAgentTraceExporter !== undefined;
+  if (configuration.privateAgentTraceExporter !== undefined) {
+    setTraceProcessors([
+      new CredentialExcludingTraceProcessor(configuration.privateAgentTraceExporter),
+    ]);
+  }
   const privateTrialRunner = new Runner({
     traceIncludeSensitiveData: true,
-    tracingDisabled: false,
+    tracingDisabled: !privateTracingAvailable,
     workflowName: "Coloop private Collaboration Episode trial",
   });
 
@@ -94,7 +110,7 @@ Synthesize the requested public Outcome Proposal from the authorized context and
     readonly sensitiveTraceEnabled: boolean;
   } => {
     const decision = configuration.privateAgentTracePolicy?.decide(content);
-    return decision?.enabled === true
+    return privateTracingAvailable && decision?.enabled === true
       ? { runner: privateTrialRunner, sensitiveTraceEnabled: true }
       : { runner: defaultRunner, sensitiveTraceEnabled: false };
   };
@@ -103,6 +119,7 @@ Synthesize the requested public Outcome Proposal from the authorized context and
     async streamResponse(input) {
       try {
         const trace = selectRunner(`${input.contextPackage}\n${input.message}`);
+        let completedText = "";
         const stream = await trace.runner.run(manager, input.message, {
           context: { contextPackage: input.contextPackage },
           maxTurns: 1,
@@ -112,6 +129,7 @@ Synthesize the requested public Outcome Proposal from the authorized context and
           stream: true,
         });
         for await (const delta of stream.toTextStream()) {
+          completedText += delta;
           const delivery = await input.onTextDelta(delta);
           if (!delivery.ok) return delivery;
         }
@@ -119,7 +137,10 @@ Synthesize the requested public Outcome Proposal from the authorized context and
         if (stream.lastResponseId === undefined) {
           return { ok: false, reason: "provider-failed" };
         }
-        if (trace.sensitiveTraceEnabled) {
+        if (
+          trace.sensitiveTraceEnabled &&
+          configuration.privateAgentTracePolicy?.decide(completedText).enabled === true
+        ) {
           configuration.privateAgentTracePolicy?.recordAcceptedAgentTurn();
         }
         return { ok: true, responseId: stream.lastResponseId };
@@ -140,7 +161,12 @@ Synthesize the requested public Outcome Proposal from the authorized context and
         if (result.lastResponseId === undefined || result.finalOutput === undefined) {
           return { ok: false, reason: "provider-failed" };
         }
-        if (trace.sensitiveTraceEnabled) {
+        if (
+          trace.sensitiveTraceEnabled &&
+          configuration.privateAgentTracePolicy?.decide(
+            JSON.stringify(result.finalOutput),
+          ).enabled === true
+        ) {
           configuration.privateAgentTracePolicy?.recordAcceptedAgentTurn();
         }
         return {
@@ -154,6 +180,43 @@ Synthesize the requested public Outcome Proposal from the authorized context and
     },
   };
 };
+
+export class CredentialExcludingTraceProcessor implements TracingProcessor {
+  private readonly itemsByTrace = new Map<
+    string,
+    Array<Trace | Span<SpanData>>
+  >();
+
+  constructor(private readonly exporter: TracingExporter) {}
+
+  async onTraceStart(trace: Trace): Promise<void> {
+    this.itemsByTrace.set(trace.traceId, [trace]);
+  }
+
+  async onTraceEnd(trace: Trace): Promise<void> {
+    const items = this.itemsByTrace.get(trace.traceId) ?? [trace];
+    this.itemsByTrace.delete(trace.traceId);
+    if (containsRecognizedCredential(JSON.stringify(items.map((item) => item.toJSON())))) {
+      return;
+    }
+    try {
+      await this.exporter.export(items);
+    } catch {
+      // The private trace path is optional and cannot affect an Agent turn.
+    }
+  }
+
+  async onSpanStart(_span: Span<SpanData>): Promise<void> {}
+
+  async onSpanEnd(span: Span<SpanData>): Promise<void> {
+    const items = this.itemsByTrace.get(span.traceId);
+    if (items !== undefined) items.push(span);
+  }
+
+  async shutdown(): Promise<void> {}
+
+  async forceFlush(): Promise<void> {}
+}
 
 export const createOpenAICredentialProvider = (): OpenAICredentialProvider => ({
   async validateCredential(apiKey) {

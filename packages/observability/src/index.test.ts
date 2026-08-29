@@ -1,8 +1,13 @@
-import { describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import {
   createApplicationTelemetry,
+  createPrivateTrialTelemetry,
   type TelemetryEnvelope,
 } from "./index.js";
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
 
 describe("content-safe application telemetry", () => {
   test("exports only versioned allowlisted fields to independent destinations", async () => {
@@ -35,7 +40,11 @@ describe("content-safe application telemetry", () => {
         name: "agent.run",
         occurredAt: "2026-08-29T12:00:01.000Z",
         telemetryEpisodeId: "telemetry-1",
-        attributes: { result: "provider-failed", latencyMs: 25 },
+        attributes: {
+          result: "failed",
+          errorClass: "AGENT_PROVIDER_FAILED",
+          latencyMs: 25,
+        },
       }),
     ).toEqual({ ok: true });
 
@@ -72,6 +81,29 @@ describe("content-safe application telemetry", () => {
     });
   });
 
+  test("rejects sensitive values hidden behind allowlisted field names", () => {
+    const telemetry = createApplicationTelemetry({ capacity: 1 });
+
+    expect(
+      telemetry.record({
+        schemaVersion: 1,
+        stream: "operational",
+        name: "provider.call",
+        occurredAt: "2026-08-29T12:00:00.000Z",
+        telemetryEpisodeId: "correlation-a",
+        attributes: {
+          provider: "discord-user-123456789",
+          operation: "stream",
+          result: "raw error: sk-abcdefghijklmnopqrstuvwxyz123456",
+        },
+      }),
+    ).toEqual({
+      ok: false,
+      reason: "forbidden-value",
+      field: "provider",
+    });
+  });
+
   test("drops bounded overflow and exporter failures without throwing", async () => {
     const telemetry = createApplicationTelemetry({
       capacity: 1,
@@ -84,7 +116,7 @@ describe("content-safe application telemetry", () => {
       stream: "product" as const,
       name: "setup.readiness" as const,
       occurredAt: "2026-08-29T12:00:00.000Z",
-      attributes: { result: "succeeded" },
+      attributes: { result: "succeeded", check: "configuration" },
     };
 
     expect(telemetry.record(event)).toEqual({ ok: true });
@@ -94,5 +126,29 @@ describe("content-safe application telemetry", () => {
       failed: 1,
       dropped: 1,
     });
+  });
+
+  test("configures PostHog as the automatically drained product destination", async () => {
+    const fetch = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    vi.stubGlobal("fetch", fetch);
+    const telemetry = createPrivateTrialTelemetry({
+      capacity: 4,
+      postHogProjectApiKey: "phc_project_key",
+      postHogHost: "https://us.i.posthog.com",
+      installationTelemetryId: "installation-a",
+    });
+
+    expect(
+      telemetry.record({
+        schemaVersion: 1,
+        stream: "product",
+        name: "owner.pairing",
+        occurredAt: "2026-08-29T12:00:00.000Z",
+        attributes: { result: "succeeded", authorizationResult: "allowed" },
+      }),
+    ).toEqual({ ok: true });
+
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledOnce());
+    expect(fetch.mock.calls[0]?.[0]).toBe("https://us.i.posthog.com/capture/");
   });
 });

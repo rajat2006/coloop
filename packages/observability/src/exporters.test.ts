@@ -64,4 +64,31 @@ describe("trial exporters", () => {
     );
     expect(JSON.stringify(fetch.mock.calls[0]?.[1])).not.toContain("episode-1");
   });
+
+  test("rejects stream mixups and non-success destination responses", async () => {
+    const rejectedFetch = vi.fn().mockResolvedValue(new Response(null, { status: 503 }));
+    const postHog = createPostHogProductExporter({
+      projectApiKey: "phc_project_key",
+      host: "https://us.i.posthog.com",
+      installationTelemetryId: "installation-a",
+      fetch: rejectedFetch,
+    });
+    const otlp = createOtlpOperationalExporter({
+      endpoint: "http://127.0.0.1:4318",
+      fetch: rejectedFetch,
+    });
+
+    await expect(postHog({ ...productEnvelope, stream: "operational" })).rejects.toThrow(
+      "PostHog accepts only the content-safe product stream.",
+    );
+    await expect(otlp(productEnvelope)).rejects.toThrow(
+      "OTLP accepts only the content-safe operational stream.",
+    );
+    await expect(postHog(productEnvelope)).rejects.toThrow(
+      "PostHog product export failed.",
+    );
+    await expect(
+      otlp({ ...productEnvelope, stream: "operational", name: "agent.run" }),
+    ).rejects.toThrow("OTLP operational export failed.");
+  });
 });

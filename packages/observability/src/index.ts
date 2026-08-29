@@ -2,10 +2,15 @@ export type TelemetryStream = "product" | "operational";
 
 export {
   createPrivateAgentTracePolicy,
+  containsRecognizedCredential,
   type PrivateAgentTraceDecision,
   type PrivateAgentTracePolicy,
 } from "./private-agent-tracing.js";
 export {
+  createOtlpOperationalExporter,
+  createPostHogProductExporter,
+} from "./exporters.js";
+import {
   createOtlpOperationalExporter,
   createPostHogProductExporter,
 } from "./exporters.js";
@@ -40,6 +45,11 @@ export type TelemetryRecordResult =
   | {
       readonly ok: false;
       readonly reason: "forbidden-field";
+      readonly field: string;
+    }
+  | {
+      readonly ok: false;
+      readonly reason: "forbidden-value";
       readonly field: string;
     }
   | { readonly ok: false; readonly reason: "invalid-envelope" };
@@ -90,6 +100,20 @@ const allowedAttributes: Readonly<Record<TelemetryEventName, readonly string[]>>
   "exporter.health": ["destination", "result", "errorClass", "droppedCount"],
 };
 
+const requiredAttributes: Readonly<Record<TelemetryEventName, readonly string[]>> = {
+  "setup.readiness": ["result", "check"],
+  "owner.pairing": ["result", "authorizationResult"],
+  "episode.lifecycle": ["phase", "result"],
+  "episode.control": ["control", "result", "authorizationResult"],
+  "episode.return": ["result"],
+  "agent.run": ["result"],
+  "discord.gateway": ["result"],
+  delivery: ["destination", "result"],
+  "sqlite.operation": ["operation", "result"],
+  "provider.call": ["provider", "operation", "result"],
+  "exporter.health": ["destination", "result"],
+};
+
 export function createApplicationTelemetry(
   configuration: ApplicationTelemetryConfiguration,
 ): ApplicationTelemetry {
@@ -98,8 +122,12 @@ export function createApplicationTelemetry(
   }
   const buffer: TelemetryEnvelope[] = [];
   let dropped = 0;
+  let flushScheduled = false;
+  let flushInFlight:
+    | Promise<{ readonly exported: number; readonly failed: number; readonly dropped: number }>
+    | undefined;
 
-  return {
+  const telemetry: ApplicationTelemetry = {
     record(value): TelemetryRecordResult {
       const parsed = parseEnvelope(value);
       if (!parsed.ok) return parsed;
@@ -113,30 +141,77 @@ export function createApplicationTelemetry(
         return { ok: false, reason: "buffer-full" };
       }
       buffer.push(parsed.envelope);
+      if (!flushScheduled) {
+        flushScheduled = true;
+        queueMicrotask(() => {
+          flushScheduled = false;
+          void telemetry.flush();
+        });
+      }
       return { ok: true };
     },
 
-    async flush() {
-      const pending = buffer.splice(0);
-      let exported = 0;
-      let failed = 0;
-      for (const envelope of pending) {
-        const exporter = envelope.stream === "product"
-          ? configuration.productExporter
-          : configuration.operationalExporter;
-        if (exporter === undefined) continue;
+    flush() {
+      if (flushInFlight !== undefined) return flushInFlight;
+      const operation = (async () => {
         try {
-          await exporter(envelope);
-          exported += 1;
-        } catch {
-          failed += 1;
+          let exported = 0;
+          let failed = 0;
+          while (buffer.length > 0) {
+            const pending = buffer.splice(0);
+            for (const envelope of pending) {
+              const exporter = envelope.stream === "product"
+                ? configuration.productExporter
+                : configuration.operationalExporter;
+              if (exporter === undefined) continue;
+              try {
+                await exporter(envelope);
+                exported += 1;
+              } catch {
+                failed += 1;
+              }
+            }
+          }
+          const result = { exported, failed, dropped };
+          dropped = 0;
+          return result;
+        } finally {
+          flushInFlight = undefined;
         }
-      }
-      const result = { exported, failed, dropped };
-      dropped = 0;
-      return result;
+      })();
+      flushInFlight = operation;
+      return operation;
     },
   };
+  return telemetry;
+}
+
+export function createPrivateTrialTelemetry(configuration: {
+  readonly capacity: number;
+  readonly postHogProjectApiKey: string;
+  readonly postHogHost: string;
+  readonly installationTelemetryId: string;
+  readonly otlpEndpoint?: string;
+  readonly localDiagnostic?: (envelope: TelemetryEnvelope) => void;
+}): ApplicationTelemetry {
+  return createApplicationTelemetry({
+    capacity: configuration.capacity,
+    productExporter: createPostHogProductExporter({
+      projectApiKey: configuration.postHogProjectApiKey,
+      host: configuration.postHogHost,
+      installationTelemetryId: configuration.installationTelemetryId,
+    }),
+    ...(configuration.otlpEndpoint === undefined
+      ? {}
+      : {
+          operationalExporter: createOtlpOperationalExporter({
+            endpoint: configuration.otlpEndpoint,
+          }),
+        }),
+    ...(configuration.localDiagnostic === undefined
+      ? {}
+      : { localDiagnostic: configuration.localDiagnostic }),
+  });
 }
 
 function parseEnvelope(value: unknown):
@@ -168,7 +243,15 @@ function parseEnvelope(value: unknown):
     ) {
       return { ok: false, reason: "invalid-envelope" };
     }
+    if (!isAllowedAttributeValue(field, attribute)) {
+      return { ok: false, reason: "forbidden-value", field };
+    }
     attributes[field] = attribute;
+  }
+  for (const field of requiredAttributes[value.name]) {
+    if (!(field in attributes)) {
+      return { ok: false, reason: "invalid-envelope" };
+    }
   }
   return {
     ok: true,
@@ -183,6 +266,103 @@ function parseEnvelope(value: unknown):
       attributes,
     },
   };
+}
+
+function isAllowedAttributeValue(
+  field: string,
+  value: TelemetryAttribute,
+): boolean {
+  switch (field) {
+    case "phase":
+      return isOneOf(value, ["OPENING", "ACTIVE", "FINALIZED", "CANCELLED"]);
+    case "result":
+      return isOneOf(value, [
+        "succeeded",
+        "failed",
+        "interrupted",
+        "rejected",
+        "duplicate",
+        "ignored",
+        "dropped",
+        "unavailable",
+      ]);
+    case "check":
+      return isOneOf(value, [
+        "configuration",
+        "local-storage",
+        "discord-credential",
+        "openai-credential",
+        "owner-pairing",
+        "codex-integration",
+      ]);
+    case "errorClass":
+      return isOneOf(value, [
+        "RUNTIME_INTERRUPTED",
+        "DISCORD_GATEWAY_INTERRUPTED",
+        "AGENT_PROVIDER_FAILED",
+        "AGENT_CONTINUATION_REJECTED",
+        "DISCORD_DELIVERY_AMBIGUOUS",
+        "credential-rejected",
+        "provider-unavailable",
+        "database-failed",
+        "export-failed",
+        "buffer-full",
+      ]);
+    case "authorizationResult":
+      return isOneOf(value, ["allowed", "denied"]);
+    case "control":
+      return isOneOf(value, ["open", "get", "cancel", "finalize"]);
+    case "destination":
+      return isOneOf(value, [
+        "discord",
+        "codex",
+        "posthog",
+        "otlp",
+        "local-diagnostics",
+      ]);
+    case "provider":
+      return isOneOf(value, ["discord", "openai", "posthog", "otlp", "sqlite"]);
+    case "operation":
+      return isOneOf(value, [
+        "setup",
+        "pair",
+        "open",
+        "get",
+        "cancel",
+        "finalize",
+        "stream",
+        "synthesize",
+        "return",
+        "read",
+        "write",
+        "export",
+      ]);
+    case "latencyMs":
+      return isBoundedNumber(value, 86_400_000);
+    case "acceptedTurns":
+      return isBoundedInteger(value, 300);
+    case "droppedCount":
+      return isBoundedInteger(value, 1_000_000);
+    case "created":
+      return typeof value === "boolean";
+    default:
+      return false;
+  }
+}
+
+function isOneOf(
+  value: TelemetryAttribute,
+  allowed: readonly string[],
+): boolean {
+  return typeof value === "string" && allowed.includes(value);
+}
+
+function isBoundedNumber(value: TelemetryAttribute, maximum: number): boolean {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= maximum;
+}
+
+function isBoundedInteger(value: TelemetryAttribute, maximum: number): boolean {
+  return isBoundedNumber(value, maximum) && Number.isSafeInteger(value);
 }
 
 function isTelemetryEventName(value: unknown): value is TelemetryEventName {

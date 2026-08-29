@@ -1059,14 +1059,7 @@ async function processDiscordMessage(
       )
       .run(completedAt, `agent-response:${input.eventId}`);
   });
-  emitTelemetry(configuration, {
-    schemaVersion: 1,
-    stream: "operational",
-    name: "agent.run",
-    occurredAt: completedAt,
-    telemetryEpisodeId: episode.telemetry_id,
-    attributes: { result: "succeeded", acceptedTurns: 1 },
-  });
+  emitSuccessfulAgentRun(configuration, episode, completedAt);
   const current = findActiveByDiscord(database, input.guildId, input.threadId);
   if (
     episode.proposal_revision_id !== null &&
@@ -1332,14 +1325,7 @@ async function synthesizeOutcomeProposal(
       )
       .run(completedAt, `proposal:${input.eventId}`);
   });
-  emitTelemetry(configuration, {
-    schemaVersion: 1,
-    stream: "operational",
-    name: "agent.run",
-    occurredAt: completedAt,
-    telemetryEpisodeId: episode.telemetry_id,
-    attributes: { result: "succeeded", acceptedTurns: 1 },
-  });
+  emitSuccessfulAgentRun(configuration, episode, completedAt);
   return { ok: true, status: "completed" };
 }
 
@@ -2323,6 +2309,21 @@ function emitTelemetry(
   } catch {
     // Remote telemetry is deliberately lossy and cannot participate in Episode correctness.
   }
+}
+
+function emitSuccessfulAgentRun(
+  configuration: RuntimeConfiguration,
+  episode: EpisodeRow,
+  occurredAt: string,
+): void {
+  emitTelemetry(configuration, {
+    schemaVersion: 1,
+    stream: "operational",
+    name: "agent.run",
+    occurredAt,
+    telemetryEpisodeId: episode.telemetry_id,
+    attributes: { result: "succeeded", acceptedTurns: 1 },
+  });
 }
 
 function findByOrigin(database: DatabaseSync, originSessionId: string): EpisodeRow | undefined {

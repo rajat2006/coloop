@@ -130,6 +130,80 @@ describe("Codex Episode operations", () => {
     fixture.runtime.close();
   });
 
+  it("emits terminal and interruption telemetry once per durable effect", async () => {
+    const envelopes: TelemetryEnvelope[] = [];
+    const telemetry: ApplicationTelemetry = {
+      record(value) {
+        envelopes.push(value as TelemetryEnvelope);
+        return { ok: true };
+      },
+      async flush() {
+        return { exported: 0, failed: 0, dropped: 0 };
+      },
+    };
+    const finalizedFixture = await openProposalFixture({ telemetry });
+    await finalizedFixture.runtime.handleDiscordMessage({
+      ...discordMessage("proposal-event-1", "@Coloop create an Outcome Proposal."),
+      authorDiscordUserId: "1001",
+    });
+    const finalization = finalizationInteraction("proposal-revision-1");
+    await finalizedFixture.runtime.handleDiscordFinalization(finalization);
+    await finalizedFixture.runtime.handleDiscordFinalization(finalization);
+    finalizedFixture.runtime.close();
+
+    const cancelledFixture = await openProposalFixture({ telemetry });
+    const cancellationHook = trustedHook(
+      "origin-1",
+      join(cancelledFixture.directory, "rollout.jsonl"),
+      "cancel_episode",
+    );
+    const cancellationInput = {
+      hook: {
+        ...cancellationHook,
+        payload: { ...cancellationHook.payload, tool_use_id: "cancel-tool" },
+      },
+      approval: createOwnerApproval({
+        toolUseId: "cancel-tool",
+        operation: "cancel_episode" as const,
+        episodeId: "episode-1",
+      }),
+      request: {
+        operation: "cancel_episode" as const,
+        arguments: { episodeId: "episode-1" },
+      },
+    };
+    await cancelledFixture.runtime.handleCodexOperation(cancellationInput);
+    await cancelledFixture.runtime.handleCodexOperation(cancellationInput);
+    cancelledFixture.runtime.close();
+
+    const interruptedFixture = await openProposalFixture({ telemetry });
+    await interruptedFixture.runtime.handleConnectedPathInterruption({
+      kind: "DISCORD_GATEWAY_INTERRUPTED",
+    });
+    await interruptedFixture.runtime.handleConnectedPathInterruption({
+      kind: "DISCORD_GATEWAY_INTERRUPTED",
+    });
+    interruptedFixture.runtime.close();
+
+    expect(
+      envelopes
+        .filter((envelope) => envelope.name === "episode.lifecycle")
+        .map((envelope) => envelope.attributes.phase),
+    ).toEqual([
+      "OPENING",
+      "ACTIVE",
+      "FINALIZED",
+      "OPENING",
+      "ACTIVE",
+      "CANCELLED",
+      "OPENING",
+      "ACTIVE",
+    ]);
+    expect(
+      envelopes.filter((envelope) => envelope.name === "discord.gateway"),
+    ).toHaveLength(1);
+  });
+
   it("returns a finalized Outcome on the Origin Session's next prompt", async () => {
     const fixture = await openProposalFixture({});
     await fixture.runtime.handleDiscordMessage({

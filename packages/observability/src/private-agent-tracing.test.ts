@@ -72,4 +72,21 @@ describe("private Agents SDK tracing policy", () => {
       reason: "trial-ended",
     });
   });
+
+  test("updates consenting-Episode and monthly-spend trial limits", () => {
+    const policy = createPrivateAgentTracePolicy(eligibleConfiguration());
+
+    policy.recordConsentingEpisode(29);
+    expect(policy.decide("Authorized context.")).toEqual({
+      enabled: false,
+      reason: "trial-ended",
+    });
+
+    const spendPolicy = createPrivateAgentTracePolicy(eligibleConfiguration());
+    spendPolicy.updateMonthlyObservabilitySpendUsd(10);
+    expect(spendPolicy.decide("Authorized context.")).toEqual({
+      enabled: false,
+      reason: "spend-ceiling",
+    });
+  });
 });

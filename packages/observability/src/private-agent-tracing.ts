@@ -18,6 +18,8 @@ export type PrivateAgentTraceDecision =
 export interface PrivateAgentTracePolicy {
   decide(agentContent: string): PrivateAgentTraceDecision;
   recordAcceptedAgentTurn(): void;
+  recordConsentingEpisode(count?: number): void;
+  updateMonthlyObservabilitySpendUsd(spendUsd: number): void;
 }
 
 interface PrivateAgentTracePolicyConfiguration {
@@ -41,8 +43,20 @@ export function createPrivateAgentTracePolicy(
   if (Number.isNaN(trialStartedAt)) {
     throw new Error("The private trace trial start must be an ISO timestamp.");
   }
+  if (
+    !Number.isSafeInteger(configuration.consentingEpisodes) ||
+    configuration.consentingEpisodes < 0 ||
+    !Number.isSafeInteger(configuration.acceptedAgentTurns) ||
+    configuration.acceptedAgentTurns < 0 ||
+    !Number.isFinite(configuration.monthlyObservabilitySpendUsd) ||
+    configuration.monthlyObservabilitySpendUsd < 0
+  ) {
+    throw new Error("Private trace trial counters must be non-negative.");
+  }
   const now = configuration.now ?? (() => new Date());
   let acceptedAgentTurns = configuration.acceptedAgentTurns;
+  let consentingEpisodes = configuration.consentingEpisodes;
+  let monthlyObservabilitySpendUsd = configuration.monthlyObservabilitySpendUsd;
 
   return {
     decide(agentContent) {
@@ -63,18 +77,18 @@ export function createPrivateAgentTracePolicy(
       }
       if (
         now().getTime() - trialStartedAt >= trialDurationMs ||
-        configuration.consentingEpisodes >= 30 ||
+        consentingEpisodes >= 30 ||
         acceptedAgentTurns >= 300
       ) {
         return { enabled: false, reason: "trial-ended" };
       }
       if (
         configuration.billingEnabled &&
-        configuration.monthlyObservabilitySpendUsd >= 10
+        monthlyObservabilitySpendUsd >= 10
       ) {
         return { enabled: false, reason: "spend-ceiling" };
       }
-      if (containsCredential(agentContent)) {
+      if (containsRecognizedCredential(agentContent)) {
         return { enabled: false, reason: "credential-detected" };
       }
       return { enabled: true };
@@ -82,10 +96,22 @@ export function createPrivateAgentTracePolicy(
     recordAcceptedAgentTurn() {
       acceptedAgentTurns += 1;
     },
+    recordConsentingEpisode(count = 1) {
+      if (!Number.isSafeInteger(count) || count < 1) {
+        throw new Error("The consenting Episode increment must be a positive integer.");
+      }
+      consentingEpisodes += count;
+    },
+    updateMonthlyObservabilitySpendUsd(spendUsd) {
+      if (!Number.isFinite(spendUsd) || spendUsd < 0) {
+        throw new Error("Monthly observability spend must be non-negative.");
+      }
+      monthlyObservabilitySpendUsd = spendUsd;
+    },
   };
 }
 
-function containsCredential(content: string): boolean {
+export function containsRecognizedCredential(content: string): boolean {
   return [
     /\bsk-[A-Za-z0-9_-]{20,}\b/,
     /\bgh[pousr]_[A-Za-z0-9]{20,}\b/,
