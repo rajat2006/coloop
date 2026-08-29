@@ -13,6 +13,7 @@
     "vitest": "^3.0.0"
   },
   "dependencies": {
-    "@coloop/core": "workspace:*"
+    "@coloop/core": "workspace:*",
+    "@coloop/discord": "workspace:*"
   }
 }

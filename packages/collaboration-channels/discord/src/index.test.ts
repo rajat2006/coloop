@@ -111,7 +111,7 @@ describe("Discord /finalize adapter", () => {
           guild_id: "200000000000000002",
           channel_id: "300000000000000003",
           member: {
-            user: { id: "100000000000000001", bot: false },
+            user: { id: "100000000000000001" },
           },
           data: { name: "finalize", type: 1 },
         },

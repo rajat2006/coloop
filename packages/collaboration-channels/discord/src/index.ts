@@ -56,8 +56,8 @@ export interface DiscordFinalizationInteraction {
   readonly interactionId: string;
   readonly guildId: string;
   readonly threadId: string;
-  readonly actorKind: "human";
-  readonly actorDiscordUserId: string;
+  readonly actorKind: "human" | "bot" | "webhook";
+  readonly actorDiscordUserId?: string;
   readonly revisionId: string;
   readonly proposal: {
     readonly resultMarkdown: string;
@@ -101,7 +101,7 @@ export function mapDiscordFinalizeInteraction(
     return { ok: false, reason: "unsupported-actor" };
   }
   const actorDiscordUserId = parseDiscordUserId(value.member.user.id);
-  if (!actorDiscordUserId.ok || value.member.user.bot !== false) {
+  if (!actorDiscordUserId.ok || value.member.user.bot === true) {
     return { ok: false, reason: "unsupported-actor" };
   }
   if (

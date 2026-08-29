@@ -3,6 +3,7 @@ import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { EpisodeAgent } from "@coloop/core";
+import type { DiscordFinalizationInteraction } from "@coloop/discord";
 import type {
   CodexRequest,
   EpisodeToolArguments,
@@ -112,15 +113,7 @@ export interface DiscordConversationMessage {
   readonly content: string;
 }
 
-export interface DiscordFinalizationInteraction {
-  readonly interactionId: string;
-  readonly guildId: string;
-  readonly threadId: string;
-  readonly actorKind: "human" | "bot" | "webhook";
-  readonly actorDiscordUserId?: string;
-  readonly revisionId: string;
-  readonly proposal: OutcomeProposalContent;
-}
+export type { DiscordFinalizationInteraction } from "@coloop/discord";
 
 export type DiscordMessageResult =
   | { readonly ok: true; readonly status: "completed" | "duplicate" | "ignored" }

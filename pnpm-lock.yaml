@@ -89,6 +89,9 @@ importers:
       '@coloop/core':
         specifier: workspace:*
         version: link:../core
+      '@coloop/discord':
+        specifier: workspace:*
+        version: link:../collaboration-channels/discord
     devDependencies:
       '@types/node':
         specifier: ^24.0.0
