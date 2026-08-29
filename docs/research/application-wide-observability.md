@@ -69,11 +69,11 @@ leading integrated OTel-native alternative when its Cloud minimum or self-hostin
 burden is acceptable.
 
 The critical architectural limit is non-negotiable: PostHog and the Collector are
-**lossy egress**. SQLite remains authoritative for Episode Phase, provider inbox and
-continuation, pending delivery, reconciliation, cleanup deadlines, and unacknowledged
-Episode Outcome return. No dashboard, trace, log, metric, or analytics event is read
-to recover a Collaboration Episode. This follows [Research the Episode event journal
-and observability storage](https://github.com/rajat2006/coloop/issues/28) and the
+**lossy egress**. SQLite remains authoritative for Episode Phase, accepted-input
+idempotency, provider continuation, pending delivery, cleanup deadlines, and
+unacknowledged Episode Outcome return. No dashboard, trace, log, metric, or analytics
+event is read to recover a Collaboration Episode. This follows [Research the Episode
+event journal and observability storage](https://github.com/rajat2006/coloop/issues/28) and the
 supporting [Episode persistence and observability storage](./episode-event-journal-observability.md)
 research.
 
@@ -163,8 +163,8 @@ Agent tracing cannot reliably infer any of the following:
 | Collaboration Episode entered `OPENING`, `ACTIVE`, `FINALIZED`, or `CANCELLED` | Product event after the SQLite transaction commits, plus a metadata-only operational log |
 | Episode Outcome was actually acknowledged by the Origin Session | `episode_outcome_returned` product event and delivery log after acknowledgement, not when queued |
 | Discord Gateway connected, heartbeat acknowledged, disconnected, resumed, or re-identified | Gateway metrics and state-change logs from the Discord adapter |
-| Missed Discord events were replayed/reconciled and duplicates suppressed | Reconciliation span, metrics, and summary log from the inbox/reconciliation component |
-| A Discord or Origin delivery is pending, retried, acknowledged, or quarantined | Outbox gauges/counters and state-change logs |
+| A Gateway/provider/delivery interruption crossed the connected-only support boundary | Interruption counter and state-change log; no replay or reconstruction telemetry exists in v0 |
+| A Discord or Origin delivery is pending, attempted, acknowledged, failed, or suppressed as stale/duplicate | Delivery gauges/counters and state-change logs |
 | SQLite is open, migrated, responsive, busy, corrupt, oversized, or accumulating WAL pages | Local readiness checks, metrics, and health logs |
 | A Context Package or other restricted artifact is overdue for deletion | Cleanup gauges, run summary, and local alert |
 | Provider quota/rate-limit state or account-level spend | Explicit provider response classification and configured-budget comparison; Agent cost is not billing truth |
@@ -183,7 +183,11 @@ API](https://developers.openai.com/api/reference/python/resources/admin/subresou
 Discord requires heartbeats and Heartbeat ACKs, says a client missing an ACK should
 terminate and reconnect, and uses the last sequence number plus `session_id` and
 `resume_gateway_url` to replay missed events after Resume. Those are application
-adapter facts outside any model run. [Discord Gateway lifecycle](https://docs.discord.com/developers/events/gateway)
+adapter facts outside any model run. The selected connected-only scope deliberately
+does less than Discord permits: after an interruption, transport reconnection exists
+only so Coloop can report the interruption and accept Owner cancellation; replayed
+conversation is never supplied to the affected Episode Agent. [Discord Gateway
+lifecycle](https://docs.discord.com/developers/events/gateway)
 
 ## Canonical v0 schema
 
@@ -281,10 +285,10 @@ template interpolation or free-form exception message is exported.
 | `runtime.started` | INFO | Process initializes | `restart_kind`, `service.version` |
 | `runtime.readiness_changed` | INFO/WARN/ERROR | Overall status changes | `from`, `to`, `reason_class` |
 | `gateway.state_changed` | INFO/WARN | Gateway state changes | `from`, `to`, `resume_possible`, `close_code_class` |
-| `gateway.resume_completed` | INFO/WARN | Resume or re-identify completes | `mode`, `result`, `elapsed_ms`, `replayed_event_bucket` |
-| `reconciliation.completed` | INFO/ERROR | Startup/disconnect reconciliation ends | `result`, `elapsed_ms`, `input_count_bucket`, `duplicate_count_bucket`, `pending_action_bucket` |
+| `gateway.reconnect_completed` | INFO/WARN | Transport reconnect or re-identify completes after an interruption | `mode`, `result`, `elapsed_ms`, `affected_episode_count_bucket` |
+| `runtime.interruption_detected` | WARN/ERROR | An active Episode crosses the connected-only support boundary | `component`, `reason_class`, `affected_episode_count_bucket`, `owner_notice_result` |
 | `provider.attempt_completed` | INFO/WARN/ERROR | Provider-facing attempt ends | `provider`, `operation`, `result`, `elapsed_ms`, `attempt_bucket`, `error.type`, `retry_scheduled` |
-| `inbox.item_completed` | INFO/WARN | Accepted input completes or is suppressed | `result` enum (`completed`, `duplicate`, `retryable`, `quarantined`), `attempt_bucket` |
+| `inbox.item_completed` | INFO/WARN | Connected-path input completes or is suppressed | `result` enum (`completed`, `duplicate`, `stale`, `rejected`), `attempt_bucket` |
 | `delivery.state_changed` | INFO/WARN/ERROR | Outbound action changes state | `action_kind`, `from`, `to`, `attempt_bucket`, `error.type` |
 | `sqlite.health_check_completed` | INFO/ERROR | Startup/scheduled check ends | `check_kind`, `result`, `elapsed_ms`, `database_size_bucket`, `wal_size_bucket` |
 | `sqlite.busy_observed` | WARN | An operation exhausts its busy wait | `operation_class`, `wait_bucket` |
@@ -317,9 +321,8 @@ a metric attribute.
 | `coloop.runtime.uptime` | observable gauge, `s` | none | Distinguish a live process from a recent restart locally; remote absence is not a reliable v0 alert. |
 | `coloop.gateway.connected` | observable gauge, `1` | none | Current Gateway usability (`0` or `1`). |
 | `coloop.gateway.heartbeat.rtt` | histogram, `ms` | `result` | Gateway latency and missing ACK diagnosis; do not log every heartbeat. |
-| `coloop.gateway.reconnects` | counter, `{attempt}` | `mode`, `result`, `reason_class` | Reconnect/resume stability. |
-| `coloop.reconciliation.runs` | counter, `{run}` | `trigger`, `result` | Restart/disconnect reconciliation outcomes. |
-| `coloop.reconciliation.duration` | histogram, `ms` | `trigger`, `result` | Reconciliation lag. |
+| `coloop.gateway.reconnects` | counter, `{attempt}` | `mode`, `result`, `reason_class` | Transport reconnect stability; it does not imply Episode continuation. |
+| `coloop.runtime.interruptions` | counter, `{interruption}` | `component`, `reason_class` | Unsupported interruptions that require Owner cancellation and a fresh Episode. |
 | `coloop.provider.requests` | counter, `{request}` | `provider`, `operation`, `result`, `error.type` | Explicit provider failures and rate limits outside or around Agent tracing. |
 | `coloop.provider.request.duration` | histogram, `ms` | `provider`, `operation`, `result` | Provider boundary health. |
 | `coloop.delivery.pending` | observable gauge, `{action}` | `action_kind` | Current pending outbox actions. |
@@ -378,10 +381,9 @@ episode.outcome.return
   origin.outcome.deliver
   sqlite.outbox.acknowledge
 
-runtime.reconcile
-  discord.resume_or_fetch
-  sqlite.inbox.reconcile
-  sqlite.outbox.reconcile
+runtime.report_interruption
+  sqlite.nonterminal.find
+  discord.owner_notice.deliver
 ```
 
 Span attributes use only operation names, result/error enums, attempt buckets,
@@ -527,7 +529,7 @@ failure. Do not optimize raw message, turn, trace, or token volume as product va
 ### Dashboard 2: Episode reliability and delivery
 
 - Opening activation latency and failure classes.
-- Reconciliation run results/duration and duplicate-suppression counts.
+- Unsupported interruption counts and stale/duplicate-input suppression counts.
 - Provider request results, retry count, rate limits, and p95 duration.
 - Pending Discord/Origin actions and oldest pending age.
 - Outcome return acknowledgement rate.
@@ -537,7 +539,8 @@ failure. Do not optimize raw message, turn, trace, or token volume as product va
 
 - Agent invocation/turn/generation counts, p50/p95 duration, input/output/cache
   tokens, approximate cost, error type, tool/handoff counts by model and release.
-- Gateway connection, heartbeat RTT, reconnect/resume results.
+- Gateway connection, heartbeat RTT, transport reconnect results, and affected
+  Episode interruption counts.
 - SQLite busy count, operation p95, database/WAL size, last quick-check status.
 - Cleanup overdue count/age.
 - Telemetry export failures, dropped items, and queue utilization.
@@ -556,13 +559,13 @@ diagnostic snapshot because the process or exporter may be down.
 | Condition | Threshold for the trial | Surface | Owner action |
 | --- | --- | --- | --- |
 | SQLite unavailable/migration/quick-check failure | Any occurrence | Immediate local ERROR and blocked readiness; remote log if export works | Stop accepting work; preserve DB files; run documented diagnosis/repair, not automatic destructive repair. |
-| Gateway unhealthy | No ACK by the next negotiated heartbeat attempt, or disconnected for two intervals | Immediate local degraded status; aggregate dashboard | Reconnect/resume automatically; Owner inspects if it persists. Discord itself requires reconnect after a missing ACK. |
-| Gateway reconnect loop | 3 failed reconnect/resume attempts in 10 min | PostHog log-count alert + local WARN | Check network/token/Discord status and reconciliation state. |
-| Reconciliation stuck | One run older than 5 min or any quarantined item | Local ERROR + remote log alert | Inspect content-free inbox/outbox status; do not replay from telemetry. |
-| Pending delivery stuck | Oldest pending action >5 min, or 3 failed attempts | Local WARN/ERROR + remote alert | Inspect provider availability and the recovery outbox; preserve idempotency. |
-| Provider failure burst | 3 consecutive failures or >20% over 15 min with at least 5 requests | Remote log alert + local status | Inspect error class/rate limit; back off, do not change Episode Phase. |
+| Gateway unhealthy | No ACK by the next negotiated heartbeat attempt, or disconnected for two intervals | Immediate local degraded status; aggregate dashboard | Reconnect the transport so Coloop can report the interruption, but do not continue affected Episodes; the Owner cancels and opens a fresh Episode. Discord itself requires reconnect after a missing ACK. |
+| Gateway reconnect loop | 3 failed reconnect attempts in 10 min | PostHog log-count alert + local WARN | Check network, token, and Discord status; affected Episodes remain interrupted. |
+| Episode interrupted | Any active Episode crosses a Gateway, provider-call, delivery, or process interruption | Immediate local ERROR + remote log if export works | Keep Episode Phase unchanged, notify the Owner when connected, and require cancellation plus a fresh Episode; never fetch/replay missed conversation. |
+| Pending delivery stuck | Oldest pending action >5 min, or 3 failed attempts | Local WARN/ERROR + remote alert | Inspect provider availability and the local pending-delivery record; preserve idempotency. |
+| Provider failure burst | 3 consecutive failures or >20% over 15 min with at least 5 requests | Remote log alert + local status | Inspect error class/rate limit and SDK backoff; a terminal failure interrupts the affected Episode without changing Episode Phase. |
 | Spend/quota risk | Configured provider budget estimate/provider quota reaches 80%, then 100% | Local + remote WARN/ERROR | Owner decides whether to stop new Agent work; approximate trace cost never automatically authorizes spend. |
-| Cleanup overdue | Any Context Package >1 hour beyond its selected deletion deadline | Local ERROR + remote alert | Retry cleanup, report affected artifact count, and follow the final policy from [Define episode record retention audit and deletion](https://github.com/rajat2006/coloop/issues/20). |
+| Cleanup overdue | Any Context Package >1 hour beyond its selected deletion deadline | Local ERROR + remote alert | Retry cleanup, report affected artifact count, and follow the final policy from [Implement Episode data retention and cleanup](https://github.com/rajat2006/coloop/issues/31). |
 | Telemetry broken | Any drop, or export continuously failing for 15 min | Local WARN only plus diagnostic counter; recovery notice after exporter resumes | Continue Episodes; fix configuration/network later. A remote system cannot reliably alert on its own missing path. |
 
 PostHog log alerts check every five minutes and support thresholds over 5–60 minute
@@ -589,17 +592,17 @@ the contract is:
   "gateway": {
     "state": "connected | reconnecting | disconnected",
     "last_ack_age_ms": 0,
-    "reconnect_attempts": 0,
-    "reconciliation_state": "idle | running | blocked"
+    "reconnect_attempts": 0
   },
   "episodes": {
     "nonterminal_count": 0,
-    "interrupted_run_count": 0
+    "interrupted_episode_count": 0,
+    "stale_or_duplicate_input_count_since_start": 0
   },
   "delivery": {
     "pending_count": 0,
     "oldest_pending_age_s": 0,
-    "quarantined_count": 0
+    "failed_count_since_start": 0
   },
   "sqlite": {
     "open": true,
@@ -747,7 +750,7 @@ credential.
 
 | Data | v0 retention |
 | --- | --- |
-| Local structured logs | Capped ring: 7 days or 50 MiB, whichever comes first. [Define episode record retention audit and deletion](https://github.com/rajat2006/coloop/issues/20) may shorten this; recovery never reads it. |
+| Local structured logs | Capped ring: 7 days or 50 MiB, whichever comes first. [Implement Episode data retention and cleanup](https://github.com/rajat2006/coloop/issues/31) may shorten this; recovery never reads it. |
 | Owner-generated support bundle | Owner deletes after the support exchange; tooling warns at 7 days. No automatic upload. |
 | PostHog Logs | Default 14 days; do not buy 30-day extension for v0. PostHog documents the extension at $0.05/GB. [Logs pricing](https://posthog.com/docs/logs/pricing) |
 | Full Agent trace large content properties | PostHog removes the listed large `$ai_*` properties after 30 days; end/destroy the dedicated trial project sooner if the consented trial ends first. [AI data retention](https://posthog.com/docs/ai-observability/data-retention) |
@@ -755,9 +758,9 @@ credential.
 | General application traces and metrics | Trial only; treat as disposable and delete with the project. Their current public docs do not state a separate retention guarantee, so do not promise one. |
 
 The 7-day local log window is a concrete recommendation for this signal design, but
-[Define episode record retention audit and deletion](https://github.com/rajat2006/coloop/issues/20)
-owns the final cross-store deletion schedule. A later decision may shorten the ring
-without changing recovery.
+[Implement Episode data retention and cleanup](https://github.com/rajat2006/coloop/issues/31)
+owns the final cross-store deletion schedule outside this map. Its implementation may
+shorten the ring without changing recovery.
 
 ### Access and deletion
 
@@ -937,8 +940,8 @@ scorecard:
   Episodes, allowing for explicitly lost telemetry?
 - Did a full Agent trace produce an actionable Agent/product improvement unavailable
   from metadata and ordinary Discord inspection?
-- Were gateway/reconciliation/provider/delivery failures diagnosable without opening
-  raw SQLite tables?
+- Were Gateway interruptions and provider/delivery failures diagnosable without
+  opening raw SQLite tables?
 - What events, log bytes, spans, metric series/points, dropped items, and projected
   monthly price did the installation generate?
 - Did any query require a raw identifier, content field, or unbounded label? If so,
@@ -1009,18 +1012,23 @@ and observability storage](https://github.com/rajat2006/coloop/issues/28):
 ### Define bridge restart and Discord reconciliation
 
 [Define bridge restart and Discord reconciliation](https://github.com/rajat2006/coloop/issues/18)
-still decides the exact durable cursor, replay window, ambiguous-delivery behavior,
-and orphaned-turn policy. This report gives that decision named signals—reconnect
-mode/result, replay/duplicate buckets, reconciliation duration/status, pending action
-age—and forbids using those signals as the cursor or deduplication state.
+places restart reconciliation and interrupted-run recovery outside the v0 supported
+path. The signal inventory therefore records transport health, stale/duplicate
+suppression, pending-delivery state, and the moment an Episode crosses the unsupported
+interruption boundary. It intentionally defines no durable cursor, replay window,
+reconstruction span, quarantine workflow, or telemetry-assisted continuation. The
+affected Episode Phase remains unchanged until the Owner cancels it and opens a fresh
+Episode.
 
-### Define episode record retention audit and deletion
+### Define the minimal connected-path Episode record and follow-up cleanup
 
-[Define episode record retention audit and deletion](https://github.com/rajat2006/coloop/issues/20)
-still owns final local windows, compaction, deletion audit, and who may export a
-support bundle. This report proposes a 7-day/50 MiB sanitized log ring, a 24-hour
-support slice, deadline-lag signals, and vendor trial teardown. Those can be shortened
-without changing Episode recovery.
+[Define the minimal connected-path Episode record](https://github.com/rajat2006/coloop/issues/20)
+settles the connected-only SQLite boundary and defers retention schedules, compaction,
+cleanup-failure behavior, and inspection/export to [Implement Episode data retention
+and cleanup](https://github.com/rajat2006/coloop/issues/31) outside this map. This
+report supplies that follow-up with a 7-day/50 MiB sanitized log-ring recommendation,
+a 24-hour support slice, deadline-lag signals, and vendor trial teardown. Those can be
+shortened without changing Episode recovery.
 
 ### Define v0 observability and operational ownership
 
@@ -1040,8 +1048,8 @@ Phase remains unchanged.
 1. **Instrument product milestones explicitly.** Use the nine-event inventory above,
    pseudonymous installation/Episode/operation IDs, server-side capture, and no Owner
    profile/autocapture.
-2. **Instrument operations independently of Agent tracing.** Gateway,
-   reconciliation, provider, delivery, SQLite, cleanup, quota, startup, and exporter
+2. **Instrument operations independently of Agent tracing.** Gateway and unsupported
+   interruption, provider, delivery, SQLite, cleanup, quota, startup, and exporter
    signals are not derivable from a model run.
 3. **Read Agent measurements from the settled full-trace stream once.** Use PostHog
    AI's run/turn/generation/tool, token, latency, error, and approximate-cost views;
@@ -1079,9 +1087,7 @@ Phase remains unchanged.
 - Provider-reported token usage and PostHog cost calculation do not establish
   account-level spend or remaining quota. Compare to provider billing/quota data when
   available and label estimates honestly.
-- [Define bridge restart and Discord reconciliation](https://github.com/rajat2006/coloop/issues/18),
-  [Define episode record retention audit and deletion](https://github.com/rajat2006/coloop/issues/20),
+- [Implement Episode data retention and cleanup](https://github.com/rajat2006/coloop/issues/31)
   and [Define v0 observability and operational ownership](https://github.com/rajat2006/coloop/issues/22)
-  may refine reconciliation windows, local retention, alert thresholds, and
-  ownership. They should reuse this signal contract rather than put recovery state
-  or content into telemetry.
+  may refine local retention, alert thresholds, and ownership. They should reuse this
+  signal contract rather than put recovery state or content into telemetry.
