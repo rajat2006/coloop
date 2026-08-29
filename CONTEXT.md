@@ -38,9 +38,15 @@ _Avoid_: Origin agent, bot
 
 **Context Package**:
 An immutable, owner-authorized snapshot of the visible text exchanged in an
-origin session through the opening request, made available to its collaboration
-episode.
+origin session through the opening request, made privately available to its
+episode agent as source context.
 _Avoid_: Full agent state, repository snapshot, prompt dump
+
+**Opening Brief**:
+The exact owner-approved, collaborator-visible text posted when a collaboration
+episode opens, defining its objective and relevant background while its context
+package remains private to the episode agent.
+_Avoid_: Context Package, Handoff Draft, prompt
 
 **Episode Control**:
 The owner's exclusive authority to change a collaboration episode's objective
