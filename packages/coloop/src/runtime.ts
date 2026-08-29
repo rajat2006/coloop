@@ -50,6 +50,12 @@ export interface DiscordEpisodeTransport {
     readonly episodeId: string;
     readonly reason?: string;
   }): Promise<void>;
+  presentInterruption(input: {
+    readonly guildId: string;
+    readonly threadId: string;
+    readonly message: string;
+    readonly finalizationDisabled: true;
+  }): Promise<void>;
   beginAgentResponse(input: {
     readonly eventId: string;
     readonly guildId: string;
@@ -133,6 +139,11 @@ export type EpisodeView =
         readonly messageId: string;
         readonly revisionId: string;
         readonly sha256: string;
+      };
+      readonly interruption?: {
+        readonly kind: ConnectedPathInterruptionClass;
+        readonly interruptedAt: string;
+        readonly requiresCancellation: true;
       };
     }
   | {
@@ -220,6 +231,9 @@ export interface CodexEpisodeRuntime {
   }): Promise<EpisodeOperationResult>;
   handleDiscordMessage(input: unknown): Promise<DiscordMessageResult>;
   handleDiscordFinalization(input: unknown): Promise<EpisodeOperationResult>;
+  handleConnectedPathInterruption(input: {
+    readonly kind: "RUNTIME_INTERRUPTED" | "DISCORD_GATEWAY_INTERRUPTED";
+  }): Promise<{ readonly ok: true; readonly interruptedEpisodes: number }>;
   handleCodexPromptSubmit(input: {
     readonly hook: unknown;
     readonly inject: (additionalContext: string) => Promise<void>;
@@ -283,12 +297,27 @@ interface EpisodeRow {
   readonly original_question: string;
 }
 
+interface EpisodeInterruptionRow {
+  readonly episode_id: string;
+  readonly error_class: ConnectedPathInterruptionClass;
+  readonly interrupted_at: string;
+  readonly presented_at: string | null;
+}
+
+export type ConnectedPathInterruptionClass =
+  | "RUNTIME_INTERRUPTED"
+  | "DISCORD_GATEWAY_INTERRUPTED"
+  | "AGENT_PROVIDER_FAILED"
+  | "AGENT_CONTINUATION_REJECTED"
+  | "DISCORD_DELIVERY_AMBIGUOUS";
+
 export function createColoopRuntime(configuration: RuntimeConfiguration): CodexEpisodeRuntime {
   mkdirSyncParent(configuration.databasePath);
   const database = new DatabaseSync(configuration.databasePath);
   database.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
   migrate(database);
   const now = configuration.now ?? (() => new Date());
+  recordRuntimeRestartInterruptions(database, now);
   const createId = configuration.createId ?? randomUUID;
   const episodes = createEpisodeModule(database, configuration, now, createId);
   const discordTurnQueues = new Map<string, Promise<void>>();
@@ -432,6 +461,9 @@ export function createColoopRuntime(configuration: RuntimeConfiguration): CodexE
         now,
       );
     },
+    async handleConnectedPathInterruption(input) {
+      return await interruptConnectedEpisodes(database, configuration, input.kind, now);
+    },
     close(): void {
       database.close();
     },
@@ -571,6 +603,139 @@ function invalidDiscordEvent(): {
   );
 }
 
+const interruptionMessage =
+  "This Collaboration Episode was interrupted and cannot continue. Cancel it from Codex, then open a new Episode from a fresh Origin Session.";
+
+async function interruptConnectedEpisodes(
+  database: DatabaseSync,
+  configuration: RuntimeConfiguration,
+  errorClass: ConnectedPathInterruptionClass,
+  now: () => Date,
+): Promise<{ readonly ok: true; readonly interruptedEpisodes: number }> {
+  const episodes = database
+    .prepare("SELECT * FROM episodes WHERE phase IN ('OPENING', 'ACTIVE')")
+    .all()
+    .map((value) => {
+      const episode = parseEpisodeRow(value);
+      if (episode === undefined) throw new Error("Episode state is malformed.");
+      return episode;
+    });
+  const interruptedAt = now().toISOString();
+  let interruptedEpisodes = 0;
+  for (const episode of episodes) {
+    const result = database
+      .prepare(
+        `INSERT OR IGNORE INTO episode_interruptions
+         (episode_id, error_class, interrupted_at, presented_at)
+         VALUES (?, ?, ?, NULL)`,
+      )
+      .run(episode.id, errorClass, interruptedAt);
+    interruptedEpisodes += Number(result.changes);
+    const interruption = findEpisodeInterruption(database, episode.id);
+    if (interruption !== undefined) {
+      await presentInterruption(database, configuration, episode, interruption);
+    }
+  }
+  return { ok: true, interruptedEpisodes };
+}
+
+function recordRuntimeRestartInterruptions(
+  database: DatabaseSync,
+  now: () => Date,
+): void {
+  const interruptedAt = now().toISOString();
+  database
+    .prepare(
+      `INSERT OR IGNORE INTO episode_interruptions
+       (episode_id, error_class, interrupted_at, presented_at)
+       SELECT id, 'RUNTIME_INTERRUPTED', ?, NULL FROM episodes
+       WHERE phase IN ('OPENING', 'ACTIVE')`,
+    )
+    .run(interruptedAt);
+}
+
+async function interruptEpisode(
+  database: DatabaseSync,
+  configuration: RuntimeConfiguration,
+  episode: EpisodeRow,
+  errorClass: ConnectedPathInterruptionClass,
+  now: () => Date,
+): Promise<void> {
+  database
+    .prepare(
+      `INSERT OR IGNORE INTO episode_interruptions
+       (episode_id, error_class, interrupted_at, presented_at)
+       VALUES (?, ?, ?, NULL)`,
+    )
+    .run(episode.id, errorClass, now().toISOString());
+  const interruption = findEpisodeInterruption(database, episode.id);
+  if (interruption !== undefined) {
+    await presentInterruption(database, configuration, episode, interruption);
+  }
+}
+
+function findEpisodeInterruption(
+  database: DatabaseSync,
+  episodeId: string,
+): EpisodeInterruptionRow | undefined {
+  const value = database
+    .prepare("SELECT * FROM episode_interruptions WHERE episode_id = ?")
+    .get(episodeId);
+  if (value === undefined) return undefined;
+  if (
+    !isRecord(value) ||
+    value.episode_id !== episodeId ||
+    !isConnectedPathInterruptionClass(value.error_class) ||
+    !isIsoTimestamp(value.interrupted_at) ||
+    !isNullableString(value.presented_at)
+  ) {
+    throw new Error("Episode interruption state is malformed.");
+  }
+  return {
+    episode_id: value.episode_id,
+    error_class: value.error_class,
+    interrupted_at: value.interrupted_at,
+    presented_at: value.presented_at,
+  };
+}
+
+async function presentInterruption(
+  database: DatabaseSync,
+  configuration: RuntimeConfiguration,
+  episode: EpisodeRow,
+  interruption: EpisodeInterruptionRow,
+): Promise<void> {
+  if (episode.thread_id === null || interruption.presented_at !== null) return;
+  try {
+    await configuration.discord.presentInterruption({
+      guildId: episode.guild_id,
+      threadId: episode.thread_id,
+      message: interruptionMessage,
+      finalizationDisabled: true,
+    });
+  } catch {
+    return;
+  }
+  database
+    .prepare(
+      `UPDATE episode_interruptions SET presented_at = ?
+       WHERE episode_id = ? AND presented_at IS NULL`,
+    )
+    .run(new Date().toISOString(), episode.id);
+}
+
+function isConnectedPathInterruptionClass(
+  value: unknown,
+): value is ConnectedPathInterruptionClass {
+  return (
+    value === "RUNTIME_INTERRUPTED" ||
+    value === "DISCORD_GATEWAY_INTERRUPTED" ||
+    value === "AGENT_PROVIDER_FAILED" ||
+    value === "AGENT_CONTINUATION_REJECTED" ||
+    value === "DISCORD_DELIVERY_AMBIGUOUS"
+  );
+}
+
 async function serializeDiscordTurn<Value>(
   queues: Map<string, Promise<void>>,
   key: string,
@@ -604,6 +769,14 @@ async function processDiscordMessage(
   }
   const episode = findActiveByDiscord(database, input.guildId, input.threadId);
   if (episode === undefined) return { ok: true, status: "ignored" };
+  const interruption = findEpisodeInterruption(database, episode.id);
+  if (interruption !== undefined) {
+    await presentInterruption(database, configuration, episode, interruption);
+    return failure(
+      "EPISODE_INTERRUPTED",
+      "This Collaboration Episode was interrupted. Cancel it and open a new Episode from a fresh Origin Session.",
+    );
+  }
 
   const replayDigest = digest(JSON.stringify(input));
   const replay = findProviderInput(database, input.eventId);
@@ -677,6 +850,7 @@ async function processDiscordMessage(
 
   if (configuration.agent === undefined) {
     abandonAgentTurn(database, input.eventId);
+    await interruptEpisode(database, configuration, episode, "AGENT_PROVIDER_FAILED", now);
     return failure("AGENT_UNAVAILABLE", "The Episode Agent is not configured.");
   }
 
@@ -689,6 +863,13 @@ async function processDiscordMessage(
     });
   } catch {
     abandonAgentTurn(database, input.eventId);
+    await interruptEpisode(
+      database,
+      configuration,
+      episode,
+      "DISCORD_DELIVERY_AMBIGUOUS",
+      now,
+    );
     return failure("DISCORD_DELIVERY_FAILED", "Discord response delivery failed.");
   }
 
@@ -702,6 +883,13 @@ async function processDiscordMessage(
       });
     } catch {
       abandonAgentTurn(database, input.eventId);
+      await interruptEpisode(
+        database,
+        configuration,
+        episode,
+        "DISCORD_DELIVERY_AMBIGUOUS",
+        now,
+      );
       return failure("DISCORD_DELIVERY_FAILED", "Discord response delivery failed.");
     }
   }
@@ -724,6 +912,17 @@ async function processDiscordMessage(
   });
   if (!agentResult.ok) {
     abandonAgentTurn(database, input.eventId);
+    await interruptEpisode(
+      database,
+      configuration,
+      episode,
+      agentResult.reason === "delivery-failed"
+        ? "DISCORD_DELIVERY_AMBIGUOUS"
+        : episode.agent_previous_response_id === null
+          ? "AGENT_PROVIDER_FAILED"
+          : "AGENT_CONTINUATION_REJECTED",
+      now,
+    );
     return agentResult.reason === "delivery-failed"
       ? failure("DISCORD_DELIVERY_FAILED", "Discord response delivery failed.")
       : failure("AGENT_PROVIDER_FAILED", "The Episode Agent provider call failed.");
@@ -732,7 +931,21 @@ async function processDiscordMessage(
     await response.complete();
   } catch {
     abandonAgentTurn(database, input.eventId);
+    await interruptEpisode(
+      database,
+      configuration,
+      episode,
+      "DISCORD_DELIVERY_AMBIGUOUS",
+      now,
+    );
     return failure("DISCORD_DELIVERY_FAILED", "Discord response delivery failed.");
+  }
+  if (findEpisodeInterruption(database, episode.id) !== undefined) {
+    abandonAgentTurn(database, input.eventId);
+    return failure(
+      "EPISODE_INTERRUPTED",
+      "This Collaboration Episode was interrupted before the Agent turn was acknowledged.",
+    );
   }
 
   const completedAt = now().toISOString();
@@ -768,6 +981,13 @@ async function processDiscordMessage(
         enabled: true,
       });
     } catch {
+      await interruptEpisode(
+        database,
+        configuration,
+        episode,
+        "DISCORD_DELIVERY_AMBIGUOUS",
+        now,
+      );
       return failure("DISCORD_DELIVERY_FAILED", "Discord response delivery failed.");
     }
   }
@@ -806,6 +1026,7 @@ async function synthesizeOutcomeProposal(
 ): Promise<DiscordMessageResult> {
   const inputDigest = digest(JSON.stringify(input));
   if (configuration.agent === undefined) {
+    await interruptEpisode(database, configuration, episode, "AGENT_PROVIDER_FAILED", now);
     return failure("AGENT_UNAVAILABLE", "The Episode Agent is not configured.");
   }
 
@@ -854,6 +1075,13 @@ async function synthesizeOutcomeProposal(
       });
     } catch {
       abandonProposal(database, input.eventId);
+      await interruptEpisode(
+        database,
+        configuration,
+        episode,
+        "DISCORD_DELIVERY_AMBIGUOUS",
+        now,
+      );
       return failure("DISCORD_DELIVERY_FAILED", "Discord proposal delivery failed.");
     }
   }
@@ -867,11 +1095,21 @@ async function synthesizeOutcomeProposal(
   });
   if (!candidateResult.ok) {
     abandonProposal(database, input.eventId);
+    await interruptEpisode(
+      database,
+      configuration,
+      episode,
+      episode.agent_previous_response_id === null
+        ? "AGENT_PROVIDER_FAILED"
+        : "AGENT_CONTINUATION_REJECTED",
+      now,
+    );
     return failure("AGENT_PROVIDER_FAILED", "The Episode Agent provider call failed.");
   }
   const candidate = parseOutcomeProposalCandidate(candidateResult.candidate);
   if (candidate === undefined) {
     abandonProposal(database, input.eventId);
+    await interruptEpisode(database, configuration, episode, "AGENT_PROVIDER_FAILED", now);
     return failure(
       "INVALID_PROPOSAL_OUTPUT",
       "The Episode Agent did not return a valid Outcome Proposal.",
@@ -908,6 +1146,13 @@ async function synthesizeOutcomeProposal(
     }
   } catch {
     abandonProposal(database, input.eventId);
+    await interruptEpisode(
+      database,
+      configuration,
+      episode,
+      "DISCORD_DELIVERY_AMBIGUOUS",
+      now,
+    );
     return failure("DISCORD_DELIVERY_FAILED", "Discord proposal delivery failed.");
   }
   const expectedMessageId = episode.proposal_message_id ?? delivery.messageId;
@@ -917,16 +1162,30 @@ async function synthesizeOutcomeProposal(
     delivery.contentSha256 !== proposalDigest
   ) {
     abandonProposal(database, input.eventId);
+    await interruptEpisode(
+      database,
+      configuration,
+      episode,
+      "DISCORD_DELIVERY_AMBIGUOUS",
+      now,
+    );
     return failure(
       "STALE_PROPOSAL_DELIVERY",
       "Discord did not acknowledge the current Outcome Proposal revision.",
+    );
+  }
+  if (findEpisodeInterruption(database, episode.id) !== undefined) {
+    abandonProposal(database, input.eventId);
+    return failure(
+      "EPISODE_INTERRUPTED",
+      "This Collaboration Episode was interrupted before the Outcome Proposal was acknowledged.",
     );
   }
 
   const completedAt = now().toISOString();
   // Discord must acknowledge the exact content before it becomes current locally.
   // A failed compare-and-set leaves the connected-only Episode unsafe to continue;
-  // later interruption handling owns that fail-closed boundary.
+  // the interruption guard above prevents a late provider result from committing.
   inTransaction(database, () => {
     const proposalUpdate =
       episode.proposal_revision_id === null
@@ -1042,7 +1301,9 @@ function createEpisodeModule(
     cancelEpisode: (input) => cancelEpisode(database, configuration, now, input),
     findByOrigin: (originSessionId) => {
       const row = findByOrigin(database, originSessionId);
-      return row === undefined ? undefined : toView(row);
+      return row === undefined
+        ? undefined
+        : toView(row, findEpisodeInterruption(database, row.id));
     },
   };
 }
@@ -1055,7 +1316,13 @@ async function openEpisode(
   input: Parameters<EpisodeModule["openEpisode"]>[0],
 ): Promise<EpisodeOperationResult> {
   const existing = findByOrigin(database, input.originSessionId);
-  if (existing !== undefined) return { ok: true, created: false, episode: toView(existing) };
+  if (existing !== undefined) {
+    return {
+      ok: true,
+      created: false,
+      episode: toView(existing, findEpisodeInterruption(database, existing.id)),
+    };
+  }
 
   const episodeId = createId();
   const episodeDirectory = resolve(configuration.artifactDirectory, episodeId);
@@ -1120,6 +1387,16 @@ async function openEpisode(
       openingBrief: input.openingBrief,
     });
   } catch {
+    const row = findById(database, episodeId);
+    if (row !== undefined) {
+      await interruptEpisode(
+        database,
+        configuration,
+        row,
+        "DISCORD_DELIVERY_AMBIGUOUS",
+        now,
+      );
+    }
     return failure(
       "DISCORD_PROVISIONING_FAILED",
       `Episode ${episodeId} remains OPENING because Discord provisioning failed.`,
@@ -1162,7 +1439,10 @@ function getEpisode(
   if (row === undefined || row.origin_session_id !== originSessionId) {
     return failure("EPISODE_NOT_FOUND", "No Episode is available to this Origin Session.");
   }
-  return { ok: true, episode: toView(row) };
+  return {
+    ok: true,
+    episode: toView(row, findEpisodeInterruption(database, row.id)),
+  };
 }
 
 async function cancelEpisode(
@@ -1242,6 +1522,15 @@ async function finalizeEpisode(
     return failure(
       "FINALIZATION_SCOPE_INVALID",
       "Finalization is unavailable outside the configured Episode thread.",
+    );
+  }
+  if (
+    episode.phase === "ACTIVE" &&
+    findEpisodeInterruption(database, episode.id) !== undefined
+  ) {
+    return failure(
+      "EPISODE_INTERRUPTED",
+      "This Collaboration Episode was interrupted and cannot be finalized.",
     );
   }
   const inputDigest = digest(JSON.stringify(input));
@@ -2016,7 +2305,10 @@ function isIsoTimestamp(value: unknown): value is string {
   return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
 }
 
-function toView(row: EpisodeRow): EpisodeView {
+function toView(
+  row: EpisodeRow,
+  interruption?: EpisodeInterruptionRow,
+): EpisodeView {
   if (row.phase === "CANCELLED") {
     if (row.cancelled_at === null) throw new Error("Cancelled Episode has no terminal timestamp.");
     return {
@@ -2081,6 +2373,15 @@ function toView(row: EpisodeRow): EpisodeView {
             sha256: row.proposal_digest,
           },
         }),
+    ...(interruption === undefined
+      ? {}
+      : {
+          interruption: {
+            kind: interruption.error_class,
+            interruptedAt: interruption.interrupted_at,
+            requiresCancellation: true as const,
+          },
+        }),
   };
 }
 
@@ -2112,6 +2413,10 @@ function migrate(database: DatabaseSync): void {
       id TEXT PRIMARY KEY, episode_id TEXT NOT NULL, phase_version INTEGER NOT NULL,
       transition_type TEXT NOT NULL, actor_kind TEXT NOT NULL, schema_version INTEGER NOT NULL,
       occurred_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS episode_interruptions (
+      episode_id TEXT PRIMARY KEY, error_class TEXT NOT NULL,
+      interrupted_at TEXT NOT NULL, presented_at TEXT
     );
   `);
   const episodeColumns = database
