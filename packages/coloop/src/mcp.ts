@@ -1,4 +1,8 @@
 import type { CodexEpisodeRuntime, EpisodeOperationResult } from "./runtime";
+import {
+  episodeToolInputSchemas,
+  type EpisodeToolName,
+} from "./codex-episode-contract";
 
 export interface TrustedCodexInvocation {
   readonly hook: unknown;
@@ -8,7 +12,7 @@ export interface TrustedCodexInvocation {
 export interface EpisodeToolRegistrar {
   registerTool(
     definition: {
-      readonly name: "open_episode" | "get_episode" | "cancel_episode";
+      readonly name: EpisodeToolName;
       readonly description: string;
       readonly inputSchema: Readonly<Record<string, unknown>>;
     },
@@ -23,35 +27,17 @@ const toolDefinitions = [
   {
     name: "open_episode",
     description: "Open the one Owner-approved Collaboration Episode for this Origin Session.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        openingBrief: { type: "string" },
-        originalRequest: { type: "string" },
-      },
-      required: ["openingBrief", "originalRequest"],
-      additionalProperties: false,
-    },
+    inputSchema: episodeToolInputSchemas.open_episode,
   },
   {
     name: "get_episode",
     description: "Get an Episode that belongs to this trusted Origin Session.",
-    inputSchema: {
-      type: "object",
-      properties: { episodeId: { type: "string" } },
-      required: ["episodeId"],
-      additionalProperties: false,
-    },
+    inputSchema: episodeToolInputSchemas.get_episode,
   },
   {
     name: "cancel_episode",
     description: "Cancel an OPENING or ACTIVE Episode after exact Owner approval.",
-    inputSchema: {
-      type: "object",
-      properties: { episodeId: { type: "string" }, reason: { type: "string" } },
-      required: ["episodeId"],
-      additionalProperties: false,
-    },
+    inputSchema: episodeToolInputSchemas.cancel_episode,
   },
 ] as const;
 

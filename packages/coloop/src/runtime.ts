@@ -2,11 +2,18 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import type {
+  CodexRequest,
+  EpisodeToolArguments,
+} from "./codex-episode-contract";
+
+const contextPackageRetentionMs = 72 * 60 * 60 * 1_000;
 
 export type EpisodePhase = "OPENING" | "ACTIVE" | "FINALIZED" | "CANCELLED";
 
 export interface DiscordEpisodeTransport {
   provisionEpisode(input: {
+    readonly idempotencyKey: string;
     readonly guildId: string;
     readonly parentChannelId: string;
     readonly ownerDiscordUserId: string;
@@ -27,7 +34,7 @@ export type EpisodeView =
       readonly id: string;
       readonly originSessionId: string;
       readonly phase: "OPENING" | "ACTIVE";
-      readonly threadUrl?: string;
+      readonly collaborationUrl?: string;
       readonly contextPackage: {
         readonly reference: string;
         readonly sha256: string;
@@ -64,30 +71,6 @@ interface TrustedHook {
   readonly toolName: string;
   readonly transcriptPath: string;
 }
-
-type CodexRequest =
-  | {
-      readonly operation: "open_episode";
-      readonly arguments: {
-        readonly openingBrief: string;
-        readonly originalRequest: string;
-        readonly originSessionId?: string;
-        readonly turnId?: string;
-        readonly transcriptPath?: string;
-      };
-    }
-  | {
-      readonly operation: "get_episode";
-      readonly arguments: { readonly episodeId: string; readonly originSessionId?: string };
-    }
-  | {
-      readonly operation: "cancel_episode";
-      readonly arguments: {
-        readonly episodeId: string;
-        readonly reason?: string;
-        readonly originSessionId?: string;
-      };
-    };
 
 export type EpisodeOperationResult =
   | { readonly ok: true; readonly episode: EpisodeView; readonly created?: boolean }
@@ -250,7 +233,9 @@ export function createColoopRuntime(configuration: RuntimeConfiguration): CodexE
           break;
         }
       }
-      if (result.ok) recordCompletedOperation(database, hook.value, request.value, result.episode.id, now());
+      if (result.ok && request.value.operation !== "get_episode") {
+        recordCompletedOperation(database, hook.value, request.value, result.episode.id, now());
+      }
       return result;
     },
     close(): void {
@@ -319,11 +304,18 @@ async function openEpisode(
         createdAt,
       );
     addAudit(database, episodeId, 1, "EPISODE_OPENING", "owner", createdAt);
+    addPendingOpeningOutbox(
+      database,
+      episodeId,
+      configuration.parentChannelId,
+      createdAt,
+    );
   });
 
   let provisioned: { readonly threadId: string; readonly threadUrl: string };
   try {
     provisioned = await configuration.discord.provisionEpisode({
+      idempotencyKey: `episode-opened:${episodeId}`,
       guildId: configuration.guildId,
       parentChannelId: configuration.parentChannelId,
       ownerDiscordUserId: configuration.ownerDiscordUserId,
@@ -339,17 +331,28 @@ async function openEpisode(
 
   const activatedAt = now().toISOString();
   inTransaction(database, () => {
-    database
+    const activation = database
       .prepare(
         `UPDATE episodes SET phase = 'ACTIVE', phase_version = 2, thread_id = ?,
          thread_url = ?, updated_at = ? WHERE id = ? AND phase = 'OPENING'`,
       )
       .run(provisioned.threadId, provisioned.threadUrl, activatedAt, episodeId);
-    addAudit(database, episodeId, 2, "EPISODE_ACTIVATED", "discord", activatedAt);
-    addAcknowledgedOutbox(database, episodeId, provisioned.threadId, activatedAt);
+    acknowledgeOpeningOutbox(database, episodeId, provisioned.threadId, activatedAt);
+    if (activation.changes === 1) {
+      addAudit(database, episodeId, 2, "EPISODE_ACTIVATED", "discord", activatedAt);
+      return;
+    }
+    const winner = findById(database, episodeId);
+    if (winner?.phase === "CANCELLED") {
+      addPendingCancellationOutbox(database, episodeId, provisioned.threadId, activatedAt);
+    }
   });
   const row = findById(database, episodeId);
   if (row === undefined) throw new Error("Activated Episode was not found.");
+  if (row.phase === "CANCELLED") {
+    const delivery = await deliverPendingCancellation(database, configuration, row, now);
+    if (delivery !== undefined) return delivery;
+  }
   return { ok: true, created: true, episode: toView(row) };
 }
 
@@ -384,7 +387,7 @@ async function cancelEpisode(
   }
   const cancelledAt = now().toISOString();
   const retentionDeadline = new Date(
-    new Date(cancelledAt).getTime() + 72 * 60 * 60 * 1_000,
+    new Date(cancelledAt).getTime() + contextPackageRetentionMs,
   ).toISOString();
   let transitioned = false;
   inTransaction(database, () => {
@@ -682,15 +685,15 @@ function parseCodexRequest(
 export function createOwnerApproval(input: {
   readonly toolUseId: string;
   readonly operation: "open_episode";
-  readonly openingBrief: string;
-  readonly originalRequest: string;
+  readonly openingBrief: EpisodeToolArguments["open_episode"]["openingBrief"];
+  readonly originalRequest: EpisodeToolArguments["open_episode"]["originalRequest"];
   readonly contextMarkdown: string;
 }): object;
 export function createOwnerApproval(input: {
   readonly toolUseId: string;
   readonly operation: "cancel_episode";
-  readonly episodeId: string;
-  readonly reason?: string;
+  readonly episodeId: EpisodeToolArguments["cancel_episode"]["episodeId"];
+  readonly reason?: EpisodeToolArguments["cancel_episode"]["reason"];
 }): object;
 export function createOwnerApproval(
   input:
@@ -726,7 +729,7 @@ export function createOwnerApproval(
 }
 
 function openApprovalDigest(
-  input: { readonly openingBrief: string; readonly originalRequest: string },
+  input: EpisodeToolArguments["open_episode"],
   contextMarkdown: string,
 ): string {
   return digest(
@@ -859,7 +862,7 @@ function toView(row: EpisodeRow): EpisodeView {
     id: row.id,
     originSessionId: row.origin_session_id,
     phase: row.phase,
-    ...(row.thread_url === null ? {} : { threadUrl: row.thread_url }),
+    ...(row.thread_url === null ? {} : { collaborationUrl: row.thread_url }),
     contextPackage: {
       reference: row.context_reference,
       sha256: row.context_digest,
@@ -910,7 +913,27 @@ function addAudit(
     .run(randomUUID(), episodeId, phaseVersion, transitionType, actorKind, occurredAt);
 }
 
-function addAcknowledgedOutbox(
+function addPendingOpeningOutbox(
+  database: DatabaseSync,
+  episodeId: string,
+  parentChannelId: string,
+  occurredAt: string,
+): void {
+  database
+    .prepare(
+      `INSERT INTO recovery_outbox VALUES (?, ?, 1, 'DISCORD_EPISODE_OPENED', ?, ?,
+       'PENDING', NULL, ?, NULL)`,
+    )
+    .run(
+      randomUUID(),
+      episodeId,
+      `episode-opened:${episodeId}`,
+      parentChannelId,
+      occurredAt,
+    );
+}
+
+function acknowledgeOpeningOutbox(
   database: DatabaseSync,
   episodeId: string,
   threadId: string,
@@ -918,10 +941,11 @@ function addAcknowledgedOutbox(
 ): void {
   database
     .prepare(
-      `INSERT INTO recovery_outbox VALUES (?, ?, 1, 'DISCORD_EPISODE_OPENED', ?, ?,
-       'ACKNOWLEDGED', NULL, ?, ?)`,
+      `UPDATE recovery_outbox SET destination_reference = ?, state = 'ACKNOWLEDGED',
+       acknowledged_at = ? WHERE episode_id = ? AND action_kind = 'DISCORD_EPISODE_OPENED'
+       AND state = 'PENDING'`,
     )
-    .run(randomUUID(), episodeId, `episode-opened:${episodeId}`, threadId, occurredAt, occurredAt);
+    .run(threadId, occurredAt, episodeId);
 }
 
 function addPendingCancellationOutbox(

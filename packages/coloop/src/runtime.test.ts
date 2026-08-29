@@ -1,6 +1,7 @@
 import { chmod, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -89,7 +90,7 @@ describe("Codex Episode operations", () => {
       episode: {
         phase: "ACTIVE",
         originSessionId: "origin-1",
-        threadUrl: "https://discord.test/channels/2002/thread-1",
+        collaborationUrl: "https://discord.test/channels/2002/thread-1",
       },
     });
     if (!result.ok) throw new Error(result.reason);
@@ -97,6 +98,7 @@ describe("Codex Episode operations", () => {
     expect(discord.effects).toEqual([
       {
         kind: "create_private_thread",
+        idempotencyKey: `episode-opened:${result.episode.id}`,
         guildId: "2002",
         parentChannelId: "3003",
         ownerDiscordUserId: "1001",
@@ -230,6 +232,60 @@ describe("Codex Episode operations", () => {
     runtime.close();
   });
 
+  it("retrieves an Episode without changing durable provider state", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "coloop-get-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "coloop.sqlite");
+    const transcriptPath = join(directory, "rollout.jsonl");
+    await writeFile(
+      transcriptPath,
+      fixtureTranscript("origin-1", [ownerMessage("Review the rollout plan.")]),
+    );
+    const runtime = createColoopRuntime({
+      databasePath,
+      artifactDirectory: join(directory, "episodes"),
+      ownerDiscordUserId: "1001",
+      guildId: "2002",
+      parentChannelId: "3003",
+      discord: new RecordingDiscordTransport(),
+    });
+    const opened = await runtime.handleCodexOperation({
+      hook: trustedHook("origin-1", transcriptPath),
+      approval: approveOwnerOnlyOpen(
+        "tool-use-1",
+        "# Review\n\nIdentify rollout risks.",
+        "Review the rollout plan.",
+      ),
+      request: {
+        operation: "open_episode",
+        arguments: {
+          openingBrief: "# Review\n\nIdentify rollout risks.",
+          originalRequest: "Review the rollout plan.",
+        },
+      },
+    });
+    if (!opened.ok) throw new Error(opened.reason);
+
+    await expect(
+      runtime.handleCodexOperation({
+        hook: trustedHook("origin-1", transcriptPath, "get_episode"),
+        request: {
+          operation: "get_episode",
+          arguments: { episodeId: opened.episode.id },
+        },
+      }),
+    ).resolves.toMatchObject({ ok: true, episode: { id: opened.episode.id } });
+    runtime.close();
+
+    const database = new DatabaseSync(databasePath);
+    expect(
+      database
+        .prepare("SELECT effect_kind FROM provider_inbox ORDER BY received_at")
+        .all(),
+    ).toEqual([{ effect_kind: "open_episode" }]);
+    database.close();
+  });
+
   it("requires Owner approval for opening and cancellation", async () => {
     const directory = await mkdtemp(join(tmpdir(), "coloop-approval-"));
     temporaryDirectories.push(directory);
@@ -315,6 +371,85 @@ describe("Codex Episode operations", () => {
       reason: expect.stringContaining("remains OPENING"),
     });
     runtime.close();
+  });
+
+  it("presents cancellation when it wins during Discord provisioning", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "coloop-provision-cancel-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "coloop.sqlite");
+    const transcriptPath = join(directory, "rollout.jsonl");
+    await writeFile(
+      transcriptPath,
+      fixtureTranscript("origin-1", [ownerMessage("Request input.")]),
+    );
+    const discord = new DeferredDiscordTransport();
+    const runtime = createColoopRuntime({
+      databasePath,
+      artifactDirectory: join(directory, "episodes"),
+      ownerDiscordUserId: "1001",
+      guildId: "2002",
+      parentChannelId: "3003",
+      discord,
+      createId: () => "episode-1",
+      now: () => new Date("2026-08-29T12:00:00.000Z"),
+    });
+
+    const opening = runtime.handleCodexOperation({
+      hook: trustedHook("origin-1", transcriptPath),
+      approval: approveOwnerOnlyOpen("tool-use-1", "# Input", "Request input."),
+      request: {
+        operation: "open_episode",
+        arguments: { openingBrief: "# Input", originalRequest: "Request input." },
+      },
+    });
+    await discord.provisionStarted;
+    const cancellationHook = trustedHook(
+      "origin-1",
+      transcriptPath,
+      "cancel_episode",
+    );
+    const hook = {
+      ...cancellationHook,
+      payload: { ...cancellationHook.payload, tool_use_id: "tool-use-2" },
+    };
+    await expect(
+      runtime.handleCodexOperation({
+        hook,
+        approval: createOwnerApproval({
+          toolUseId: "tool-use-2",
+          operation: "cancel_episode",
+          episodeId: "episode-1",
+          reason: "No longer needed.",
+        }),
+        request: {
+          operation: "cancel_episode",
+          arguments: { episodeId: "episode-1", reason: "No longer needed." },
+        },
+      }),
+    ).resolves.toMatchObject({ ok: true, episode: { phase: "CANCELLED" } });
+
+    discord.finishProvisioning();
+    await expect(opening).resolves.toMatchObject({
+      ok: true,
+      episode: { phase: "CANCELLED" },
+    });
+    expect(discord.effects.at(-1)).toMatchObject({
+      kind: "present_cancellation",
+      episodeId: "episode-1",
+      threadId: "thread-1",
+    });
+    runtime.close();
+
+    const database = new DatabaseSync(databasePath);
+    expect(
+      database
+        .prepare("SELECT transition_type FROM episode_audit ORDER BY occurred_at, rowid")
+        .all(),
+    ).toEqual([
+      { transition_type: "EPISODE_OPENING" },
+      { transition_type: "EPISODE_CANCELLED" },
+    ]);
+    database.close();
   });
 
   it("requires the approved original request to match the trusted transcript", async () => {
@@ -704,16 +839,13 @@ class RecordingDiscordTransport implements DiscordEpisodeTransport {
     private failCancellationOnce = false,
   ) {}
 
-  async provisionEpisode(input: {
-    readonly guildId: string;
-    readonly parentChannelId: string;
-    readonly ownerDiscordUserId: string;
-    readonly episodeId: string;
-    readonly openingBrief: string;
-  }) {
+  async provisionEpisode(
+    input: Parameters<DiscordEpisodeTransport["provisionEpisode"]>[0],
+  ) {
     if (this.failProvisioning) throw new Error("Discord unavailable");
     this.effects.push({
       kind: "create_private_thread",
+      idempotencyKey: input.idempotencyKey,
       guildId: input.guildId,
       parentChannelId: input.parentChannelId,
       ownerDiscordUserId: input.ownerDiscordUserId,
@@ -735,13 +867,9 @@ class RecordingDiscordTransport implements DiscordEpisodeTransport {
     };
   }
 
-  async presentCancellation(input: {
-    readonly idempotencyKey: string;
-    readonly guildId: string;
-    readonly threadId: string;
-    readonly episodeId: string;
-    readonly reason?: string;
-  }): Promise<void> {
+  async presentCancellation(
+    input: Parameters<DiscordEpisodeTransport["presentCancellation"]>[0],
+  ): Promise<void> {
     if (this.failCancellationOnce) {
       this.failCancellationOnce = false;
       throw new Error("Discord unavailable");
@@ -752,6 +880,45 @@ class RecordingDiscordTransport implements DiscordEpisodeTransport {
       controlsDisabled: true,
       threadWritable: true,
     });
+  }
+}
+
+class DeferredDiscordTransport implements DiscordEpisodeTransport {
+  readonly effects: object[] = [];
+  readonly provisionStarted: Promise<void>;
+  private finishProvisioningPromise: Promise<void>;
+  private resolveFinishProvisioning!: () => void;
+  private resolveProvisionStarted!: () => void;
+
+  constructor() {
+    this.provisionStarted = new Promise((resolve) => {
+      this.resolveProvisionStarted = resolve;
+    });
+    this.finishProvisioningPromise = new Promise((resolve) => {
+      this.resolveFinishProvisioning = resolve;
+    });
+  }
+
+  async provisionEpisode(
+    input: Parameters<DiscordEpisodeTransport["provisionEpisode"]>[0],
+  ): Promise<{ readonly threadId: string; readonly threadUrl: string }> {
+    this.effects.push({ kind: "create_private_thread", episodeId: input.episodeId });
+    this.resolveProvisionStarted();
+    await this.finishProvisioningPromise;
+    return {
+      threadId: "thread-1",
+      threadUrl: "https://discord.test/channels/2002/thread-1",
+    };
+  }
+
+  finishProvisioning(): void {
+    this.resolveFinishProvisioning();
+  }
+
+  async presentCancellation(
+    input: Parameters<DiscordEpisodeTransport["presentCancellation"]>[0],
+  ): Promise<void> {
+    this.effects.push({ kind: "present_cancellation", ...input });
   }
 }
 
@@ -769,7 +936,7 @@ class RecordingEpisodeToolRegistrar implements EpisodeToolRegistrar {
   }
 
   async call(
-    name: "open_episode" | "get_episode" | "cancel_episode",
+    name: Parameters<EpisodeToolRegistrar["registerTool"]>[0]["name"],
     arguments_: unknown,
     trusted: TrustedCodexInvocation,
   ) {
