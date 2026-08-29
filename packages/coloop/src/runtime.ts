@@ -161,6 +161,11 @@ interface RuntimeConfiguration {
   readonly createId?: () => string;
 }
 
+interface CodexPromptReturnerConfiguration {
+  readonly databasePath: string;
+  readonly now?: () => Date;
+}
+
 interface TrustedHook {
   readonly event: "PreToolUse";
   readonly client: "codex-cli";
@@ -171,6 +176,18 @@ interface TrustedHook {
   readonly toolName: string;
   readonly transcriptPath: string;
 }
+
+interface TrustedPromptHook {
+  readonly event: "UserPromptSubmit";
+  readonly client: "codex-cli";
+  readonly clientVersion: "0.150.1";
+  readonly sessionId: string;
+  readonly turnId: string;
+}
+
+export type CodexPromptReturnResult =
+  | { readonly ok: true; readonly status: "returned" | "nothing-pending" }
+  | { readonly ok: false; readonly reason: string; readonly code: string };
 
 export type EpisodeOperationResult =
   | { readonly ok: true; readonly episode: EpisodeView; readonly created?: boolean }
@@ -203,7 +220,34 @@ export interface CodexEpisodeRuntime {
   }): Promise<EpisodeOperationResult>;
   handleDiscordMessage(input: unknown): Promise<DiscordMessageResult>;
   handleDiscordFinalization(input: unknown): Promise<EpisodeOperationResult>;
+  handleCodexPromptSubmit(input: {
+    readonly hook: unknown;
+    readonly inject: (additionalContext: string) => Promise<void>;
+  }): Promise<CodexPromptReturnResult>;
   close(): void;
+}
+
+export function createCodexPromptReturner(
+  configuration: CodexPromptReturnerConfiguration,
+): Pick<CodexEpisodeRuntime, "handleCodexPromptSubmit"> {
+  return {
+    async handleCodexPromptSubmit(input): Promise<CodexPromptReturnResult> {
+      const hook = parseTrustedPromptHook(input.hook);
+      if (!hook.ok) return hook;
+      const database = new DatabaseSync(configuration.databasePath);
+      try {
+        migrate(database);
+        return await returnPendingOutcome(
+          database,
+          hook.value,
+          input.inject,
+          configuration.now ?? (() => new Date()),
+        );
+      } finally {
+        database.close();
+      }
+    },
+  };
 }
 
 interface InternalEpisodeModule extends EpisodeModule {
@@ -233,6 +277,10 @@ interface EpisodeRow {
   readonly outcome_unresolved_points: string | null;
   readonly finalized_at: string | null;
   readonly return_pending: number;
+  readonly return_claim_turn_id: string | null;
+  readonly returned_at: string | null;
+  readonly returned_turn_id: string | null;
+  readonly original_question: string;
 }
 
 export function createColoopRuntime(configuration: RuntimeConfiguration): CodexEpisodeRuntime {
@@ -351,6 +399,12 @@ export function createColoopRuntime(configuration: RuntimeConfiguration): CodexE
         recordCompletedOperation(database, hook.value, request.value, result.episode.id, now());
       }
       return result;
+    },
+
+    async handleCodexPromptSubmit(input): Promise<CodexPromptReturnResult> {
+      const hook = parseTrustedPromptHook(input.hook);
+      if (!hook.ok) return hook;
+      return await returnPendingOutcome(database, hook.value, input.inject, now);
     },
     async handleDiscordMessage(input): Promise<DiscordMessageResult> {
       const event = parseDiscordMessageEvent(input);
@@ -1532,6 +1586,135 @@ function parseTrustedHook(
   };
 }
 
+function parseTrustedPromptHook(
+  value: unknown,
+):
+  | { readonly ok: true; readonly value: TrustedPromptHook }
+  | { readonly ok: false; readonly code: string; readonly reason: string } {
+  if (
+    !isRecord(value) ||
+    !isRecord(value.client) ||
+    value.client.name !== "codex-cli" ||
+    value.client.version !== "0.150.1" ||
+    !isRecord(value.payload) ||
+    value.payload.hook_event_name !== "UserPromptSubmit" ||
+    typeof value.payload.session_id !== "string" ||
+    value.payload.session_id.length === 0 ||
+    typeof value.payload.turn_id !== "string" ||
+    value.payload.turn_id.length === 0 ||
+    typeof value.payload.prompt !== "string"
+  ) {
+    return failure(
+      "UNSUPPORTED_CODEX_CLIENT",
+      "A trusted Codex CLI 0.150.1 next-prompt hook is required.",
+    );
+  }
+  return {
+    ok: true,
+    value: {
+      event: "UserPromptSubmit",
+      client: "codex-cli",
+      clientVersion: "0.150.1",
+      sessionId: value.payload.session_id,
+      turnId: value.payload.turn_id,
+    },
+  };
+}
+
+async function returnPendingOutcome(
+  database: DatabaseSync,
+  hook: TrustedPromptHook,
+  inject: (additionalContext: string) => Promise<void>,
+  now: () => Date,
+): Promise<CodexPromptReturnResult> {
+  let episode: EpisodeRow | undefined;
+  try {
+    episode = parseEpisodeRow(
+      database
+        .prepare(
+          `SELECT * FROM episodes WHERE origin_session_id = ? AND phase = 'FINALIZED'
+           AND return_pending = 1`,
+        )
+        .get(hook.sessionId),
+    );
+  } catch {
+    return failure(
+      "MALFORMED_EPISODE_OUTCOME",
+      "The pending Episode Outcome is malformed and was not returned.",
+    );
+  }
+  if (episode === undefined) return { ok: true, status: "nothing-pending" };
+
+  let additionalContext: string;
+  try {
+    additionalContext = renderReturnedOutcome(episode);
+  } catch {
+    return failure(
+      "MALFORMED_EPISODE_OUTCOME",
+      "The pending Episode Outcome is malformed and was not returned.",
+    );
+  }
+
+  const claim = database
+    .prepare(
+      `UPDATE episodes SET return_claim_turn_id = ?
+       WHERE id = ? AND return_pending = 1 AND return_claim_turn_id IS NULL`,
+    )
+    .run(hook.turnId, episode.id);
+  if (claim.changes !== 1) return { ok: true, status: "nothing-pending" };
+
+  try {
+    await inject(additionalContext);
+  } catch {
+    database
+      .prepare(
+        `UPDATE episodes SET return_claim_turn_id = NULL
+         WHERE id = ? AND return_pending = 1 AND return_claim_turn_id = ?`,
+      )
+      .run(episode.id, hook.turnId);
+    return failure(
+      "CODEX_INJECTION_FAILED",
+      "The Episode Outcome could not be added to the next Codex prompt.",
+    );
+  }
+
+  const returnedAt = now().toISOString();
+  const acknowledgement = database
+    .prepare(
+      `UPDATE episodes SET return_pending = 0, return_claim_turn_id = NULL,
+       returned_at = ?, returned_turn_id = ?, updated_at = ?
+       WHERE id = ? AND return_pending = 1 AND return_claim_turn_id = ?`,
+    )
+    .run(returnedAt, hook.turnId, returnedAt, episode.id, hook.turnId);
+  if (acknowledgement.changes !== 1) {
+    return failure(
+      "RETURN_ACKNOWLEDGEMENT_FAILED",
+      "The Episode Outcome return could not be acknowledged safely.",
+    );
+  }
+  return { ok: true, status: "returned" };
+}
+
+function renderReturnedOutcome(row: EpisodeRow): string {
+  const view = toView(row);
+  if (view.phase !== "FINALIZED") {
+    throw new Error("Only finalized Outcomes can be returned.");
+  }
+  const unresolvedPoints = view.outcome.unresolvedPoints.length === 0
+    ? "None."
+    : view.outcome.unresolvedPoints
+        .map((point, index) => `${index + 1}. ${point}`)
+        .join("\n");
+  return (
+    "# Returned Collaboration Episode Outcome\n\n" +
+    "Present the exact accepted result and ordered unresolved points before continuing with the Owner's newly submitted request.\n\n" +
+    `Episode identity: ${row.id}\n\n` +
+    `## Original question\n\n${row.original_question}\n\n` +
+    `## Accepted result\n\n${view.outcome.resultMarkdown}\n\n` +
+    `## Ordered unresolved points\n\n${unresolvedPoints}\n`
+  );
+}
+
 function isTrustedToolCall(value: unknown, hook: TrustedHook): boolean {
   return (
     isRecord(value) &&
@@ -1754,6 +1937,7 @@ function parseEpisodeRow(value: unknown): EpisodeRow | undefined {
     !isNullableString(value.thread_url) ||
     typeof value.context_reference !== "string" ||
     typeof value.context_digest !== "string" ||
+    typeof value.original_question !== "string" ||
     !isNullableString(value.context_retention_deadline) ||
     !isNullableString(value.cancelled_at) ||
     !isNullableString(value.cancellation_reason) ||
@@ -1766,6 +1950,9 @@ function parseEpisodeRow(value: unknown): EpisodeRow | undefined {
     || !isNullableString(value.outcome_unresolved_points)
     || !isNullableString(value.finalized_at)
     || (value.return_pending !== 0 && value.return_pending !== 1)
+    || !isNullableString(value.return_claim_turn_id)
+    || !isNullableString(value.returned_at)
+    || !isNullableString(value.returned_turn_id)
   ) {
     throw new Error("Stored Episode state is malformed.");
   }
@@ -1780,6 +1967,7 @@ function parseEpisodeRow(value: unknown): EpisodeRow | undefined {
     thread_url: value.thread_url,
     context_reference: value.context_reference,
     context_digest: value.context_digest,
+    original_question: value.original_question,
     context_retention_deadline: value.context_retention_deadline,
     cancelled_at: value.cancelled_at,
     cancellation_reason: value.cancellation_reason,
@@ -1792,6 +1980,9 @@ function parseEpisodeRow(value: unknown): EpisodeRow | undefined {
     outcome_unresolved_points: value.outcome_unresolved_points,
     finalized_at: value.finalized_at,
     return_pending: value.return_pending,
+    return_claim_turn_id: value.return_claim_turn_id,
+    returned_at: value.returned_at,
+    returned_turn_id: value.returned_turn_id,
   };
 }
 
@@ -1888,6 +2079,7 @@ function migrate(database: DatabaseSync): void {
       proposal_message_id TEXT, proposal_revision_id TEXT, proposal_digest TEXT,
       outcome_revision_id TEXT, outcome_result_markdown TEXT,
       outcome_unresolved_points TEXT, finalized_at TEXT, return_pending INTEGER NOT NULL DEFAULT 0,
+      return_claim_turn_id TEXT, returned_at TEXT, returned_turn_id TEXT,
       created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS provider_inbox (
@@ -1938,6 +2130,15 @@ function migrate(database: DatabaseSync): void {
     database.exec(
       "ALTER TABLE episodes ADD COLUMN return_pending INTEGER NOT NULL DEFAULT 0",
     );
+  }
+  if (!episodeColumns.includes("return_claim_turn_id")) {
+    database.exec("ALTER TABLE episodes ADD COLUMN return_claim_turn_id TEXT");
+  }
+  if (!episodeColumns.includes("returned_at")) {
+    database.exec("ALTER TABLE episodes ADD COLUMN returned_at TEXT");
+  }
+  if (!episodeColumns.includes("returned_turn_id")) {
+    database.exec("ALTER TABLE episodes ADD COLUMN returned_turn_id TEXT");
   }
 }
 

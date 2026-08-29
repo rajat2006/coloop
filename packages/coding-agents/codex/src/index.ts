@@ -1,4 +1,4 @@
-export { runCodexHook } from "./hooks.js";
+export { type CodexPromptReturner, runCodexHook } from "./hooks.js";
 export {
   installAndVerifyCodexIntegration,
   type CodexIntegrationDependencies,

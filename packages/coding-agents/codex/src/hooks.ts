@@ -17,11 +17,30 @@ const isNonEmptyString = (value: unknown): value is string =>
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
+export interface CodexPromptReturner {
+  handleCodexPromptSubmit(input: {
+    readonly hook: unknown;
+    readonly inject: (additionalContext: string) => Promise<void>;
+  }): Promise<
+    | { readonly ok: true; readonly status: "returned" | "nothing-pending" }
+    | { readonly ok: false; readonly reason: string; readonly code: string }
+  >;
+}
+
+const writeOutput = async (output: Writable, value: object): Promise<void> =>
+  await new Promise<void>((resolve, reject) => {
+    output.write(`${JSON.stringify(value)}\n`, (writeError) => {
+      if (writeError) reject(writeError);
+      else resolve();
+    });
+  });
+
 export const runCodexHook = async (
   hook: string | undefined,
   input: Readable,
   output: Writable,
   error: Writable,
+  promptReturner?: CodexPromptReturner,
 ): Promise<number> => {
   if (hook !== "pre-tool-use" && hook !== "user-prompt-submit") {
     error.write("Unsupported Coloop Codex hook.\n");
@@ -33,7 +52,6 @@ export const runCodexHook = async (
     if (!isRecord(parsed)) throw new Error("unsupported_hook_shape");
     const event = parsed;
     if (hook === "user-prompt-submit") {
-      // This hook validates the next-prompt context but does not modify it.
       if (
         event.hook_event_name !== "UserPromptSubmit" ||
         !isNonEmptyString(event.session_id) ||
@@ -41,6 +59,23 @@ export const runCodexHook = async (
         typeof event.prompt !== "string"
       ) {
         throw new Error("unsupported_hook_shape");
+      }
+      if (promptReturner !== undefined) {
+        const result = await promptReturner.handleCodexPromptSubmit({
+          hook: {
+            client: { name: "codex-cli", version: "0.150.1" },
+            payload: event,
+          },
+          inject: async (additionalContext) => {
+            await writeOutput(output, {
+              hookSpecificOutput: {
+                additionalContext,
+                hookEventName: "UserPromptSubmit",
+              },
+            });
+          },
+        });
+        if (!result.ok) throw new Error(result.code);
       }
       return 0;
     }

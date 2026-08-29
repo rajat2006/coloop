@@ -17,6 +17,7 @@
   "dependencies": {
     "@coloop/coding-agent-codex": "workspace:*",
     "@coloop/coding-agent-protocol": "workspace:*",
+    "@coloop/runtime": "workspace:*",
     "@coloop/core": "workspace:*",
     "@coloop/discord": "workspace:*",
     "@coloop/local-storage": "workspace:*",

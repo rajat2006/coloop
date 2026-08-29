@@ -1,0 +1,6 @@
+{
+  "hook_event_name": "UserPromptSubmit",
+  "session_id": "origin-1",
+  "turn_id": "next-turn",
+  "prompt": "Continue with the rollout work."
+}

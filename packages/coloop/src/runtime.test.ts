@@ -11,6 +11,7 @@ import {
 } from "./mcp";
 import {
   createOwnerApproval,
+  createCodexPromptReturner,
   createColoopRuntime,
   type DiscordMessageEvent,
   type DiscordEpisodeTransport,
@@ -31,6 +32,272 @@ afterEach(async () => {
 });
 
 describe("Codex Episode operations", () => {
+  it("returns a finalized Outcome on the Origin Session's next prompt", async () => {
+    const fixture = await openProposalFixture({});
+    await fixture.runtime.handleDiscordMessage({
+      ...discordMessage("proposal-event-1", "@Coloop create an Outcome Proposal."),
+      authorDiscordUserId: "1001",
+    });
+    await fixture.runtime.handleDiscordFinalization(
+      finalizationInteraction("proposal-revision-1"),
+    );
+    const pending = new DatabaseSync(fixture.databasePath);
+    expect(
+      pending.prepare("SELECT phase, return_pending FROM episodes").get(),
+    ).toEqual({ phase: "FINALIZED", return_pending: 1 });
+    pending.close();
+    const injected: string[] = [];
+
+    await expect(
+      fixture.runtime.handleCodexPromptSubmit({
+        hook: trustedPromptHook("origin-1", "next-turn"),
+        inject: async (additionalContext) => {
+          injected.push(additionalContext);
+        },
+      }),
+    ).resolves.toEqual({ ok: true, status: "returned" });
+
+    expect(injected).toEqual([
+      "# Returned Collaboration Episode Outcome\n\n" +
+        "Present the exact accepted result and ordered unresolved points before continuing with the Owner's newly submitted request.\n\n" +
+        "Episode identity: episode-1\n\n" +
+        "## Original question\n\nChoose a rollout plan.\n\n" +
+        "## Accepted result\n\nUse a canary rollout.\n\n" +
+        "## Ordered unresolved points\n\nNone.\n",
+    ]);
+    fixture.runtime.close();
+  });
+
+  it("returns only to the bound resumed Origin Session and only once", async () => {
+    const fixture = await openProposalFixture({});
+    await fixture.runtime.handleDiscordMessage({
+      ...discordMessage("proposal-event-1", "@Coloop create an Outcome Proposal."),
+      authorDiscordUserId: "1001",
+    });
+    const finalized = await fixture.runtime.handleDiscordFinalization(
+      finalizationInteraction("proposal-revision-1"),
+    );
+    fixture.runtime.close();
+    const resumed = createColoopRuntime({
+      databasePath: fixture.databasePath,
+      artifactDirectory: join(fixture.directory, "episodes"),
+      ownerDiscordUserId: "1001",
+      guildId: "2002",
+      parentChannelId: "3003",
+      discord: new RecordingDiscordTransport(),
+      now: () => new Date("2026-08-29T13:00:00.000Z"),
+    });
+    const injected: string[] = [];
+
+    await expect(
+      resumed.handleCodexOperation({
+        hook: trustedHook(
+          "replacement-origin",
+          join(fixture.directory, "rollout.jsonl"),
+          "get_episode",
+        ),
+        request: {
+          operation: "get_episode",
+          arguments: { episodeId: "episode-1" },
+        },
+      }),
+    ).resolves.toMatchObject({ ok: false, code: "EPISODE_NOT_FOUND" });
+    await expect(
+      resumed.handleCodexPromptSubmit({
+        hook: trustedPromptHook("replacement-origin", "other-turn"),
+        inject: async (context) => {
+          injected.push(context);
+        },
+      }),
+    ).resolves.toEqual({ ok: true, status: "nothing-pending" });
+    await expect(
+      resumed.handleCodexPromptSubmit({
+        hook: trustedPromptHook("origin-1", "resumed-turn"),
+        inject: async (context) => {
+          injected.push(context);
+        },
+      }),
+    ).resolves.toEqual({ ok: true, status: "returned" });
+    await expect(
+      resumed.handleCodexPromptSubmit({
+        hook: trustedPromptHook("origin-1", "duplicate-hook-turn"),
+        inject: async (context) => {
+          injected.push(context);
+        },
+      }),
+    ).resolves.toEqual({ ok: true, status: "nothing-pending" });
+    expect(injected).toHaveLength(1);
+    await expect(
+      resumed.handleCodexOperation({
+        hook: trustedHook(
+          "origin-1",
+          join(fixture.directory, "rollout.jsonl"),
+          "get_episode",
+        ),
+        request: {
+          operation: "get_episode",
+          arguments: { episodeId: "episode-1" },
+        },
+      }),
+    ).resolves.toEqual(finalized);
+    const database = new DatabaseSync(fixture.databasePath);
+    expect(
+      database
+        .prepare(
+          "SELECT phase, return_pending, returned_turn_id, outcome_result_markdown FROM episodes",
+        )
+        .get(),
+    ).toEqual({
+      phase: "FINALIZED",
+      return_pending: 0,
+      returned_turn_id: "resumed-turn",
+      outcome_result_markdown: "Use a canary rollout.",
+    });
+    database.close();
+    resumed.close();
+  });
+
+  it("keeps an Outcome pending when next-prompt injection fails", async () => {
+    const fixture = await openProposalFixture({});
+    await fixture.runtime.handleDiscordMessage({
+      ...discordMessage("proposal-event-1", "@Coloop create an Outcome Proposal."),
+      authorDiscordUserId: "1001",
+    });
+    await fixture.runtime.handleDiscordFinalization(
+      finalizationInteraction("proposal-revision-1"),
+    );
+
+    await expect(
+      fixture.runtime.handleCodexPromptSubmit({
+        hook: trustedPromptHook("origin-1", "failed-turn"),
+        inject: async () => {
+          throw new Error("Codex hook output closed");
+        },
+      }),
+    ).resolves.toMatchObject({ ok: false, code: "CODEX_INJECTION_FAILED" });
+    const database = new DatabaseSync(fixture.databasePath);
+    expect(
+      database
+        .prepare(
+          "SELECT phase, return_pending, return_claim_turn_id, returned_at FROM episodes",
+        )
+        .get(),
+    ).toEqual({
+      phase: "FINALIZED",
+      return_pending: 1,
+      return_claim_turn_id: null,
+      returned_at: null,
+    });
+    database.close();
+    await expect(
+      fixture.runtime.handleCodexPromptSubmit({
+        hook: trustedPromptHook("origin-1", "retry-turn"),
+        inject: async () => undefined,
+      }),
+    ).resolves.toEqual({ ok: true, status: "returned" });
+    fixture.runtime.close();
+  });
+
+  it("fails closed for unsupported next-prompt identity", async () => {
+    const fixture = await openProposalFixture({});
+    const injected: string[] = [];
+
+    await expect(
+      fixture.runtime.handleCodexPromptSubmit({
+        hook: {
+          ...trustedPromptHook("origin-1", "next-turn"),
+          client: { name: "codex-cli", version: "0.151.0" },
+        },
+        inject: async (context) => {
+          injected.push(context);
+        },
+      }),
+    ).resolves.toMatchObject({ ok: false, code: "UNSUPPORTED_CODEX_CLIENT" });
+    expect(injected).toEqual([]);
+    fixture.runtime.close();
+  });
+
+  it("fails closed without acknowledging malformed terminal data", async () => {
+    const fixture = await openProposalFixture({});
+    await fixture.runtime.handleDiscordMessage({
+      ...discordMessage("proposal-event-1", "@Coloop create an Outcome Proposal."),
+      authorDiscordUserId: "1001",
+    });
+    await fixture.runtime.handleDiscordFinalization(
+      finalizationInteraction("proposal-revision-1"),
+    );
+    fixture.runtime.close();
+    const database = new DatabaseSync(fixture.databasePath);
+    database
+      .prepare("UPDATE episodes SET outcome_unresolved_points = ?")
+      .run('{"not":"an ordered list"}');
+    database.close();
+    const returner = createCodexPromptReturner({
+      databasePath: fixture.databasePath,
+    });
+    const injected: string[] = [];
+
+    await expect(
+      returner.handleCodexPromptSubmit({
+        hook: trustedPromptHook("origin-1", "next-turn"),
+        inject: async (context) => {
+          injected.push(context);
+        },
+      }),
+    ).resolves.toMatchObject({ ok: false, code: "MALFORMED_EPISODE_OUTCOME" });
+    expect(injected).toEqual([]);
+    const retained = new DatabaseSync(fixture.databasePath);
+    expect(
+      retained
+        .prepare("SELECT phase, return_pending, returned_at FROM episodes")
+        .get(),
+    ).toEqual({ phase: "FINALIZED", return_pending: 1, returned_at: null });
+    retained.close();
+  });
+
+  it("preserves unresolved-point order while filtering collaboration bookkeeping", async () => {
+    const agent = new RecordingEpisodeAgent([], [
+      {
+        resultMarkdown: "Use a canary rollout.",
+        unresolvedPoints: ["Choose traffic percentage.", "Choose observation window."],
+        responseId: "proposal-response-1",
+      },
+    ]);
+    const fixture = await openProposalFixture({ agent });
+    await fixture.runtime.handleDiscordMessage({
+      ...discordMessage("proposal-event-1", "@Coloop create an Outcome Proposal."),
+      authorDiscordUserId: "1001",
+    });
+    await fixture.runtime.handleDiscordFinalization({
+      ...finalizationInteraction("proposal-revision-1"),
+      proposal: {
+        resultMarkdown: "Use a canary rollout.",
+        unresolvedPoints: ["Choose traffic percentage.", "Choose observation window."],
+      },
+    });
+    let returnedContext = "";
+
+    await fixture.runtime.handleCodexPromptSubmit({
+      hook: trustedPromptHook("origin-1", "next-turn"),
+      inject: async (context) => {
+        returnedContext = context;
+      },
+    });
+
+    expect(returnedContext).toContain(
+      "## Ordered unresolved points\n\n" +
+        "1. Choose traffic percentage.\n" +
+        "2. Choose observation window.\n",
+    );
+    expect(returnedContext).not.toContain("thread-1");
+    expect(returnedContext).not.toContain("1001");
+    expect(returnedContext).not.toContain("proposal-response-1");
+    expect(returnedContext).not.toContain("proposal-message-1");
+    expect(agent.inputs).toEqual([]);
+    expect(agent.proposalInputs).toHaveLength(1);
+    fixture.runtime.close();
+  });
+
   it("opens an approved Episode from a trusted Codex 0.150.1 session", async () => {
     const directory = await mkdtemp(join(tmpdir(), "coloop-open-"));
     temporaryDirectories.push(directory);
@@ -2454,6 +2721,18 @@ function trustedHook(
       tool_name: `mcp__coloop__${operation}`,
       transcript_path: transcriptPath,
       tool_input: {},
+    },
+  };
+}
+
+function trustedPromptHook(sessionId: string, turnId: string) {
+  return {
+    client: { name: "codex-cli" as const, version: "0.150.1" as const },
+    payload: {
+      hook_event_name: "UserPromptSubmit" as const,
+      session_id: sessionId,
+      turn_id: turnId,
+      prompt: "Continue with the rollout work.",
     },
   };
 }
