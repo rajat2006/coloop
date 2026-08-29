@@ -1,0 +1,25 @@
+{
+  "name": "@coloop/cli",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "coloop": "dist/main.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@coloop/coding-agent-codex": "workspace:*",
+    "@coloop/coding-agent-protocol": "workspace:*",
+    "@coloop/core": "workspace:*",
+    "@coloop/discord": "workspace:*",
+    "@coloop/local-storage": "workspace:*",
+    "@coloop/openai-agents": "workspace:*"
+  }
+}

@@ -7,8 +7,17 @@
     "node": ">=24 <25"
   },
   "scripts": {
-    "ci:product": "pnpm run typecheck && pnpm run test",
-    "test": "pnpm -r test",
-    "typecheck": "pnpm -r typecheck"
+    "build": "pnpm --filter './packages/**' -r --if-present build",
+    "ci:product": "pnpm run build && pnpm run typecheck:packages && pnpm run test:packages && pnpm --dir .sandcastle typecheck && pnpm --dir .sandcastle test",
+    "coloop": "pnpm run build && node packages/cli/dist/main.js",
+    "test": "pnpm run build && pnpm run test:packages && pnpm --dir .sandcastle test",
+    "test:packages": "pnpm --filter './packages/**' -r --if-present test",
+    "typecheck": "pnpm run build && pnpm run typecheck:packages && pnpm --dir .sandcastle typecheck",
+    "typecheck:packages": "pnpm --filter './packages/**' -r --if-present typecheck"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.7.2",
+    "vitest": "^3.0.0"
   }
 }
