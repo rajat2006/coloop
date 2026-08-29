@@ -25,6 +25,14 @@ interface ProposalDeliveryReceipt {
   readonly contentSha256: string;
 }
 
+export interface EpisodeOutcome {
+  readonly episodeId: string;
+  readonly acceptedProposalRevisionId: string;
+  readonly resultMarkdown: string;
+  readonly unresolvedPoints: readonly string[];
+  readonly finalizedAt: string;
+}
+
 export interface DiscordEpisodeTransport {
   provisionEpisode(input: {
     readonly idempotencyKey: string;
@@ -66,6 +74,18 @@ export interface DiscordEpisodeTransport {
     readonly contentSha256: string;
     readonly acknowledgement: string;
   }): Promise<ProposalDeliveryReceipt>;
+  presentFinalization(input: {
+    readonly idempotencyKey: string;
+    readonly guildId: string;
+    readonly threadId: string;
+    readonly episodeId: string;
+  }): Promise<void>;
+  setFinalizationEnabled(input: {
+    readonly guildId: string;
+    readonly threadId: string;
+    readonly revisionId: string;
+    readonly enabled: boolean;
+  }): Promise<void>;
 }
 
 export type EpisodeAgentTransport = EpisodeAgent;
@@ -84,6 +104,16 @@ export interface DiscordMessageEvent {
 export interface DiscordConversationMessage {
   readonly authorKind: "human" | "external-bot" | "webhook";
   readonly content: string;
+}
+
+export interface DiscordFinalizationInteraction {
+  readonly interactionId: string;
+  readonly guildId: string;
+  readonly threadId: string;
+  readonly actorKind: "human" | "bot" | "webhook";
+  readonly actorDiscordUserId?: string;
+  readonly revisionId: string;
+  readonly proposal: OutcomeProposalContent;
 }
 
 export type DiscordMessageResult =
@@ -114,7 +144,11 @@ export type EpisodeView =
         readonly reason?: string;
       };
     }
-  | { readonly id: string; readonly phase: "FINALIZED" };
+  | {
+      readonly id: string;
+      readonly phase: "FINALIZED";
+      readonly outcome: EpisodeOutcome;
+    };
 
 interface RuntimeConfiguration {
   readonly databasePath: string;
@@ -169,6 +203,7 @@ export interface CodexEpisodeRuntime {
     readonly approval?: unknown;
   }): Promise<EpisodeOperationResult>;
   handleDiscordMessage(input: unknown): Promise<DiscordMessageResult>;
+  handleDiscordFinalization(input: unknown): Promise<EpisodeOperationResult>;
   close(): void;
 }
 
@@ -180,6 +215,7 @@ interface EpisodeRow {
   readonly id: string;
   readonly origin_session_id: string;
   readonly owner_discord_user_id: string;
+  readonly guild_id: string;
   readonly phase: EpisodePhase;
   readonly phase_version: number;
   readonly thread_id: string | null;
@@ -193,6 +229,11 @@ interface EpisodeRow {
   readonly proposal_message_id: string | null;
   readonly proposal_revision_id: string | null;
   readonly proposal_digest: string | null;
+  readonly outcome_revision_id: string | null;
+  readonly outcome_result_markdown: string | null;
+  readonly outcome_unresolved_points: string | null;
+  readonly finalized_at: string | null;
+  readonly return_pending: number;
 }
 
 export function createColoopRuntime(configuration: RuntimeConfiguration): CodexEpisodeRuntime {
@@ -328,8 +369,63 @@ export function createColoopRuntime(configuration: RuntimeConfiguration): CodexE
           ),
       );
     },
+    async handleDiscordFinalization(input): Promise<EpisodeOperationResult> {
+      const interaction = parseDiscordFinalizationInteraction(input);
+      if (!interaction.ok) return interaction;
+      return await finalizeEpisode(
+        database,
+        configuration,
+        interaction.value,
+        now,
+      );
+    },
     close(): void {
       database.close();
+    },
+  };
+}
+
+function parseDiscordFinalizationInteraction(
+  value: unknown,
+):
+  | { readonly ok: true; readonly value: DiscordFinalizationInteraction }
+  | { readonly ok: false; readonly reason: string; readonly code: string } {
+  if (
+    !isRecord(value) ||
+    !isNonEmptyString(value.interactionId) ||
+    !isNonEmptyString(value.guildId) ||
+    !isNonEmptyString(value.threadId) ||
+    (value.actorKind !== "human" &&
+      value.actorKind !== "bot" &&
+      value.actorKind !== "webhook") ||
+    (value.actorDiscordUserId !== undefined &&
+      !isNonEmptyString(value.actorDiscordUserId)) ||
+    !isNonEmptyString(value.revisionId)
+  ) {
+    return failure(
+      "INVALID_DISCORD_FINALIZATION",
+      "The Discord finalization interaction is unsupported or malformed.",
+    );
+  }
+  const proposal = parseOutcomeProposalCandidate(value.proposal);
+  if (proposal === undefined) {
+    return failure(
+      "INVALID_DISCORD_FINALIZATION",
+      "The Discord finalization interaction is unsupported or malformed.",
+    );
+  }
+  return {
+    ok: true,
+    value: {
+      interactionId: value.interactionId,
+      guildId: value.guildId,
+      threadId: value.threadId,
+      actorKind: value.actorKind,
+      ...(value.actorDiscordUserId === undefined
+        ? {}
+        : { actorDiscordUserId: value.actorDiscordUserId }),
+      revisionId: value.revisionId,
+      proposal,
     },
   };
 }
@@ -543,6 +639,20 @@ async function processDiscordMessage(
     return failure("DISCORD_DELIVERY_FAILED", "Discord response delivery failed.");
   }
 
+  if (episode.proposal_revision_id !== null) {
+    try {
+      await configuration.discord.setFinalizationEnabled({
+        guildId: input.guildId,
+        threadId: input.threadId,
+        revisionId: episode.proposal_revision_id,
+        enabled: false,
+      });
+    } catch {
+      abandonAgentTurn(database, input.eventId);
+      return failure("DISCORD_DELIVERY_FAILED", "Discord response delivery failed.");
+    }
+  }
+
   const contextPackage = await readFile(episode.context_reference, "utf8");
   const agentResult = await configuration.agent.streamResponse({
     contextPackage,
@@ -570,6 +680,24 @@ async function processDiscordMessage(
   } catch {
     abandonAgentTurn(database, input.eventId);
     return failure("DISCORD_DELIVERY_FAILED", "Discord response delivery failed.");
+  }
+
+  const current = findActiveByDiscord(database, input.guildId, input.threadId);
+  if (
+    episode.proposal_revision_id !== null &&
+    current?.proposal_revision_id === episode.proposal_revision_id
+  ) {
+    try {
+      await configuration.discord.setFinalizationEnabled({
+        guildId: input.guildId,
+        threadId: input.threadId,
+        revisionId: episode.proposal_revision_id,
+        enabled: true,
+      });
+    } catch {
+      abandonAgentTurn(database, input.eventId);
+      return failure("DISCORD_DELIVERY_FAILED", "Discord response delivery failed.");
+    }
   }
 
   const completedAt = now().toISOString();
@@ -1037,6 +1165,159 @@ async function cancelEpisode(
   return { ok: true, episode: toView(cancelled) };
 }
 
+async function finalizeEpisode(
+  database: DatabaseSync,
+  configuration: RuntimeConfiguration,
+  input: DiscordFinalizationInteraction,
+  now: () => Date,
+): Promise<EpisodeOperationResult> {
+  const episode = findByDiscord(database, input.guildId, input.threadId);
+  if (episode === undefined) {
+    return failure(
+      "FINALIZATION_SCOPE_INVALID",
+      "Finalization is unavailable outside the configured Episode thread.",
+    );
+  }
+  const inputDigest = digest(JSON.stringify(input));
+  const replay = findProviderInput(database, input.interactionId);
+  if (replay !== undefined) {
+    if (replay !== inputDigest) {
+      return failure(
+        "DISCORD_FINALIZATION_REUSE",
+        "The Discord interaction identity was reused with different input.",
+      );
+    }
+    if (episode.phase === "FINALIZED") {
+      const delivery = await deliverPendingFinalization(
+        database,
+        configuration,
+        episode,
+        input.interactionId,
+        now,
+      );
+      if (delivery !== undefined) return delivery;
+      return { ok: true, episode: toView(episode) };
+    }
+    return failure(
+      "FINALIZATION_IN_PROGRESS",
+      "This finalization interaction is already being processed.",
+    );
+  }
+  if (
+    input.actorKind !== "human" ||
+    input.actorDiscordUserId !== episode.owner_discord_user_id
+  ) {
+    return failure(
+      "OWNER_REQUIRED",
+      "Only the paired Owner can finalize the Episode Outcome.",
+    );
+  }
+  if (episode.phase !== "ACTIVE") {
+    return failure("FINALIZATION_UNAVAILABLE", "This Episode cannot be finalized.");
+  }
+  if (
+    episode.proposal_revision_id === null ||
+    episode.proposal_digest === null
+  ) {
+    return failure(
+      "OUTCOME_PROPOSAL_REQUIRED",
+      "Finalization requires a current delivered Outcome Proposal.",
+    );
+  }
+  const busy = database
+    .prepare(
+      "SELECT 1 FROM provider_inbox WHERE episode_id = ? AND status = 'PROCESSING' LIMIT 1",
+    )
+    .get(episode.id);
+  if (busy !== undefined) {
+    return failure(
+      "EPISODE_AGENT_BUSY",
+      "Finalization is disabled while the Episode Agent is running.",
+    );
+  }
+  if (
+    input.revisionId !== episode.proposal_revision_id ||
+    digest(JSON.stringify(input.proposal)) !== episode.proposal_digest
+  ) {
+    return failure(
+      "STALE_OUTCOME_PROPOSAL",
+      "Review the current visible Outcome Proposal before finalizing it.",
+    );
+  }
+
+  const finalizedAt = now().toISOString();
+  const retentionDeadline = new Date(
+    new Date(finalizedAt).getTime() + contextPackageRetentionMs,
+  ).toISOString();
+  inTransaction(database, () => {
+    database
+      .prepare(
+        `INSERT INTO provider_inbox (
+          provider_event_id, episode_id, input_digest, effect_kind, status, received_at
+        ) VALUES (?, ?, ?, 'finalization', 'PROCESSING', ?)`,
+      )
+      .run(input.interactionId, episode.id, inputDigest, finalizedAt);
+    const update = database
+      .prepare(
+        `UPDATE episodes SET phase = 'FINALIZED', phase_version = phase_version + 1,
+         outcome_revision_id = ?, outcome_result_markdown = ?, outcome_unresolved_points = ?,
+         finalized_at = ?, return_pending = 1, context_retention_deadline = ?, updated_at = ?
+         WHERE id = ? AND phase = 'ACTIVE' AND proposal_revision_id = ? AND proposal_digest = ?`,
+      )
+      .run(
+        input.revisionId,
+        input.proposal.resultMarkdown,
+        JSON.stringify(input.proposal.unresolvedPoints),
+        finalizedAt,
+        retentionDeadline,
+        finalizedAt,
+        episode.id,
+        input.revisionId,
+        episode.proposal_digest,
+      );
+    if (update.changes !== 1) {
+      throw new Error("The Episode changed during finalization.");
+    }
+    addAudit(
+      database,
+      episode.id,
+      episode.phase_version + 1,
+      "EPISODE_FINALIZED",
+      "owner",
+      finalizedAt,
+    );
+    database
+      .prepare(
+        `INSERT INTO recovery_outbox (
+          action_id, episode_id, sequence, action_kind, idempotency_key,
+          destination_reference, state, payload, created_at
+        ) VALUES (?, ?, (
+          SELECT COALESCE(MAX(sequence), 0) + 1 FROM recovery_outbox WHERE episode_id = ?
+        ), 'DISCORD_EPISODE_FINALIZED', ?, ?, 'PENDING', NULL, ?)`,
+      )
+      .run(
+        randomUUID(),
+        episode.id,
+        episode.id,
+        `episode-finalized:${episode.id}`,
+        input.threadId,
+        finalizedAt,
+      );
+  });
+
+  const delivery = await deliverPendingFinalization(
+    database,
+    configuration,
+    episode,
+    input.interactionId,
+    now,
+  );
+  if (delivery !== undefined) return delivery;
+  const finalized = findById(database, episode.id);
+  if (finalized === undefined) throw new Error("Finalized Episode was not found.");
+  return { ok: true, episode: toView(finalized) };
+}
+
 type CapturedMessage =
   | { readonly author: "owner"; readonly text: string }
   | { readonly author: "codex"; readonly phase: "commentary" | "final_answer"; readonly text: string };
@@ -1409,6 +1690,18 @@ function findActiveByDiscord(
   );
 }
 
+function findByDiscord(
+  database: DatabaseSync,
+  guildId: string,
+  threadId: string,
+): EpisodeRow | undefined {
+  return parseEpisodeRow(
+    database
+      .prepare("SELECT * FROM episodes WHERE guild_id = ? AND thread_id = ?")
+      .get(guildId, threadId),
+  );
+}
+
 function findProviderInput(
   database: DatabaseSync,
   providerEventId: string,
@@ -1430,6 +1723,7 @@ function parseEpisodeRow(value: unknown): EpisodeRow | undefined {
     typeof value.id !== "string" ||
     typeof value.origin_session_id !== "string" ||
     typeof value.owner_discord_user_id !== "string" ||
+    typeof value.guild_id !== "string" ||
     !isEpisodePhase(value.phase) ||
     typeof value.phase_version !== "number" ||
     !isNullableString(value.thread_id) ||
@@ -1443,6 +1737,11 @@ function parseEpisodeRow(value: unknown): EpisodeRow | undefined {
     || !isNullableString(value.proposal_message_id)
     || !isNullableString(value.proposal_revision_id)
     || !isNullableString(value.proposal_digest)
+    || !isNullableString(value.outcome_revision_id)
+    || !isNullableString(value.outcome_result_markdown)
+    || !isNullableString(value.outcome_unresolved_points)
+    || !isNullableString(value.finalized_at)
+    || (value.return_pending !== 0 && value.return_pending !== 1)
   ) {
     throw new Error("Stored Episode state is malformed.");
   }
@@ -1450,6 +1749,7 @@ function parseEpisodeRow(value: unknown): EpisodeRow | undefined {
     id: value.id,
     origin_session_id: value.origin_session_id,
     owner_discord_user_id: value.owner_discord_user_id,
+    guild_id: value.guild_id,
     phase: value.phase,
     phase_version: value.phase_version,
     thread_id: value.thread_id,
@@ -1463,6 +1763,11 @@ function parseEpisodeRow(value: unknown): EpisodeRow | undefined {
     proposal_message_id: value.proposal_message_id,
     proposal_revision_id: value.proposal_revision_id,
     proposal_digest: value.proposal_digest,
+    outcome_revision_id: value.outcome_revision_id,
+    outcome_result_markdown: value.outcome_result_markdown,
+    outcome_unresolved_points: value.outcome_unresolved_points,
+    finalized_at: value.finalized_at,
+    return_pending: value.return_pending,
   };
 }
 
@@ -1491,7 +1796,39 @@ function toView(row: EpisodeRow): EpisodeView {
       },
     };
   }
-  if (row.phase === "FINALIZED") return { id: row.id, phase: "FINALIZED" };
+  if (row.phase === "FINALIZED") {
+    if (
+      row.outcome_revision_id === null ||
+      row.outcome_result_markdown === null ||
+      row.outcome_unresolved_points === null ||
+      row.finalized_at === null
+    ) {
+      throw new Error("Finalized Episode has no Episode Outcome.");
+    }
+    let unresolvedPoints: unknown;
+    try {
+      unresolvedPoints = JSON.parse(row.outcome_unresolved_points) as unknown;
+    } catch {
+      throw new Error("Finalized Episode has malformed unresolved points.");
+    }
+    if (
+      !Array.isArray(unresolvedPoints) ||
+      !unresolvedPoints.every(isNonEmptyString)
+    ) {
+      throw new Error("Finalized Episode has malformed unresolved points.");
+    }
+    return {
+      id: row.id,
+      phase: "FINALIZED",
+      outcome: {
+        episodeId: row.id,
+        acceptedProposalRevisionId: row.outcome_revision_id,
+        resultMarkdown: row.outcome_result_markdown,
+        unresolvedPoints,
+        finalizedAt: row.finalized_at,
+      },
+    };
+  }
   return {
     id: row.id,
     originSessionId: row.origin_session_id,
@@ -1525,6 +1862,8 @@ function migrate(database: DatabaseSync): void {
       context_digest TEXT NOT NULL, context_retention_deadline TEXT,
       cancelled_at TEXT, cancellation_reason TEXT, agent_previous_response_id TEXT,
       proposal_message_id TEXT, proposal_revision_id TEXT, proposal_digest TEXT,
+      outcome_revision_id TEXT, outcome_result_markdown TEXT,
+      outcome_unresolved_points TEXT, finalized_at TEXT, return_pending INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS provider_inbox (
@@ -1558,6 +1897,23 @@ function migrate(database: DatabaseSync): void {
   }
   if (!episodeColumns.includes("proposal_digest")) {
     database.exec("ALTER TABLE episodes ADD COLUMN proposal_digest TEXT");
+  }
+  if (!episodeColumns.includes("outcome_revision_id")) {
+    database.exec("ALTER TABLE episodes ADD COLUMN outcome_revision_id TEXT");
+  }
+  if (!episodeColumns.includes("outcome_result_markdown")) {
+    database.exec("ALTER TABLE episodes ADD COLUMN outcome_result_markdown TEXT");
+  }
+  if (!episodeColumns.includes("outcome_unresolved_points")) {
+    database.exec("ALTER TABLE episodes ADD COLUMN outcome_unresolved_points TEXT");
+  }
+  if (!episodeColumns.includes("finalized_at")) {
+    database.exec("ALTER TABLE episodes ADD COLUMN finalized_at TEXT");
+  }
+  if (!episodeColumns.includes("return_pending")) {
+    database.exec(
+      "ALTER TABLE episodes ADD COLUMN return_pending INTEGER NOT NULL DEFAULT 0",
+    );
   }
 }
 
@@ -1675,6 +2031,59 @@ async function deliverPendingCancellation(
        WHERE action_id = ? AND state = 'PENDING'`,
     )
     .run(acknowledgedAt, value.action_id);
+  return undefined;
+}
+
+async function deliverPendingFinalization(
+  database: DatabaseSync,
+  configuration: RuntimeConfiguration,
+  episode: EpisodeRow,
+  interactionId: string,
+  now: () => Date,
+): Promise<{ readonly ok: false; readonly code: string; readonly reason: string } | undefined> {
+  const value = database
+    .prepare(
+      `SELECT action_id, idempotency_key, destination_reference FROM recovery_outbox
+       WHERE episode_id = ? AND action_kind = 'DISCORD_EPISODE_FINALIZED' AND state = 'PENDING'`,
+    )
+    .get(episode.id);
+  if (value === undefined) return undefined;
+  if (
+    !isRecord(value) ||
+    typeof value.action_id !== "string" ||
+    typeof value.idempotency_key !== "string" ||
+    typeof value.destination_reference !== "string"
+  ) {
+    return failure("DURABLE_STATE_INVALID", "The pending finalization action is malformed.");
+  }
+  try {
+    await configuration.discord.presentFinalization({
+      idempotencyKey: value.idempotency_key,
+      guildId: episode.guild_id,
+      threadId: value.destination_reference,
+      episodeId: episode.id,
+    });
+  } catch {
+    return failure(
+      "DISCORD_PRESENTATION_FAILED",
+      `Episode ${episode.id} is FINALIZED; Discord terminal presentation remains pending.`,
+    );
+  }
+  const acknowledgedAt = now().toISOString();
+  inTransaction(database, () => {
+    database
+      .prepare(
+        `UPDATE provider_inbox SET status = 'COMPLETED', completed_at = ?
+         WHERE provider_event_id = ?`,
+      )
+      .run(acknowledgedAt, interactionId);
+    database
+      .prepare(
+        `UPDATE recovery_outbox SET state = 'ACKNOWLEDGED', payload = NULL,
+         acknowledged_at = ? WHERE action_id = ? AND state = 'PENDING'`,
+      )
+      .run(acknowledgedAt, value.action_id);
+  });
   return undefined;
 }
 

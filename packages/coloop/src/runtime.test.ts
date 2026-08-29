@@ -1841,8 +1841,417 @@ describe("Outcome Proposal collaboration", () => {
   });
 });
 
+describe("Episode Outcome finalization", () => {
+  it("atomically finalizes the exact visible proposal before Discord acknowledgement", async () => {
+    const resultMarkdown =
+      "## Recommendation\n\nUse a canary rollout.\n\n```sh\ndeploy --canary\n```";
+    const unresolvedPoints = [
+      "Choose the initial traffic percentage.",
+      "Confirm the rollback owner.",
+    ];
+    const fixture = await openProposalFixture({
+      agent: new RecordingEpisodeAgent([], [
+        {
+          resultMarkdown,
+          unresolvedPoints,
+          responseId: "proposal-response-1",
+        },
+      ]),
+    });
+    await fixture.runtime.handleDiscordMessage({
+      ...discordMessage("proposal-event-1", "@Coloop create an Outcome Proposal."),
+      authorDiscordUserId: "1001",
+    });
+
+    await expect(
+      fixture.runtime.handleDiscordFinalization({
+        interactionId: "finalize-interaction-1",
+        guildId: "2002",
+        threadId: "thread-1",
+        actorKind: "human",
+        actorDiscordUserId: "1001",
+        revisionId: "proposal-revision-1",
+        proposal: {
+          resultMarkdown,
+          unresolvedPoints,
+        },
+      }),
+    ).resolves.toEqual({
+      ok: true,
+      episode: {
+        id: "episode-1",
+        phase: "FINALIZED",
+        outcome: {
+          episodeId: "episode-1",
+          acceptedProposalRevisionId: "proposal-revision-1",
+          resultMarkdown,
+          unresolvedPoints,
+          finalizedAt: "2026-08-29T12:00:00.000Z",
+        },
+      },
+    });
+    expect(fixture.discord.finalizationEffects).toEqual([
+      {
+        kind: "present_finalization",
+        idempotencyKey: "episode-finalized:episode-1",
+        guildId: "2002",
+        threadId: "thread-1",
+        episodeId: "episode-1",
+        controlsDisabled: true,
+        threadArchived: false,
+        threadLocked: false,
+      },
+    ]);
+
+    const database = new DatabaseSync(fixture.databasePath);
+    expect(
+      database
+        .prepare(
+          `SELECT phase, phase_version, outcome_revision_id, outcome_result_markdown,
+           outcome_unresolved_points, finalized_at, return_pending,
+           context_retention_deadline FROM episodes`,
+        )
+        .get(),
+    ).toMatchObject({
+      phase: "FINALIZED",
+      phase_version: 3,
+      outcome_revision_id: "proposal-revision-1",
+      outcome_result_markdown: resultMarkdown,
+      outcome_unresolved_points: JSON.stringify(unresolvedPoints),
+      finalized_at: "2026-08-29T12:00:00.000Z",
+      return_pending: 1,
+      context_retention_deadline: "2026-09-01T12:00:00.000Z",
+    });
+    database.close();
+    fixture.runtime.close();
+  });
+
+  it("returns one terminal effect for duplicate input and rejects changed reuse", async () => {
+    const fixture = await openProposalFixture({});
+    await fixture.runtime.handleDiscordMessage({
+      ...discordMessage("proposal-event-1", "@Coloop create an Outcome Proposal."),
+      authorDiscordUserId: "1001",
+    });
+    const interaction = {
+      interactionId: "finalize-interaction-1",
+      guildId: "2002",
+      threadId: "thread-1",
+      actorKind: "human",
+      actorDiscordUserId: "1001",
+      revisionId: "proposal-revision-1",
+      proposal: {
+        resultMarkdown: "Use a canary rollout.",
+        unresolvedPoints: [] as string[],
+      },
+    } as const;
+
+    const first = await fixture.runtime.handleDiscordFinalization(interaction);
+    await expect(
+      fixture.runtime.handleDiscordFinalization(interaction),
+    ).resolves.toEqual(first);
+    expect(fixture.discord.finalizationEffects).toHaveLength(1);
+    await expect(
+      fixture.runtime.handleDiscordFinalization({
+        ...interaction,
+        proposal: {
+          resultMarkdown: "Changed after acceptance.",
+          unresolvedPoints: [],
+        },
+      }),
+    ).resolves.toMatchObject({
+      ok: false,
+      code: "DISCORD_FINALIZATION_REUSE",
+    });
+    fixture.runtime.close();
+  });
+
+  it("requires a delivered current proposal from the snapshotted Owner and exact thread", async () => {
+    const noProposal = await openProposalFixture({});
+    await expect(
+      noProposal.runtime.handleDiscordFinalization(
+        finalizationInteraction("proposal-revision-1"),
+      ),
+    ).resolves.toMatchObject({ ok: false, code: "OUTCOME_PROPOSAL_REQUIRED" });
+    noProposal.runtime.close();
+
+    const fixture = await openProposalFixture({});
+    await fixture.runtime.handleDiscordMessage({
+      ...discordMessage("proposal-event-1", "@Coloop create an Outcome Proposal."),
+      authorDiscordUserId: "1001",
+    });
+    await expect(
+      fixture.runtime.handleDiscordFinalization({
+        ...finalizationInteraction("proposal-revision-1"),
+        actorDiscordUserId: "9009",
+      }),
+    ).resolves.toMatchObject({ ok: false, code: "OWNER_REQUIRED" });
+    await expect(
+      fixture.runtime.handleDiscordFinalization({
+        ...finalizationInteraction("proposal-revision-1"),
+        actorKind: "bot",
+        actorDiscordUserId: "1001",
+      }),
+    ).resolves.toMatchObject({ ok: false, code: "OWNER_REQUIRED" });
+    await expect(
+      fixture.runtime.handleDiscordFinalization({
+        ...finalizationInteraction("proposal-revision-1"),
+        guildId: "wrong-guild",
+      }),
+    ).resolves.toMatchObject({ ok: false, code: "FINALIZATION_SCOPE_INVALID" });
+    await expect(
+      fixture.runtime.handleDiscordFinalization({
+        ...finalizationInteraction("proposal-revision-1"),
+        threadId: "wrong-thread",
+      }),
+    ).resolves.toMatchObject({ ok: false, code: "FINALIZATION_SCOPE_INVALID" });
+    expect(fixture.discord.finalizationEffects).toEqual([]);
+    fixture.runtime.close();
+  });
+
+  it("rejects stale revision identity or changed visible content", async () => {
+    const fixture = await openProposalFixture({});
+    await fixture.runtime.handleDiscordMessage({
+      ...discordMessage("proposal-event-1", "@Coloop create an Outcome Proposal."),
+      authorDiscordUserId: "1001",
+    });
+
+    await expect(
+      fixture.runtime.handleDiscordFinalization(
+        finalizationInteraction("stale-revision"),
+      ),
+    ).resolves.toMatchObject({ ok: false, code: "STALE_OUTCOME_PROPOSAL" });
+    await expect(
+      fixture.runtime.handleDiscordFinalization({
+        ...finalizationInteraction("proposal-revision-1"),
+        proposal: {
+          resultMarkdown: "Changed without a delivered revision.",
+          unresolvedPoints: [],
+        },
+      }),
+    ).resolves.toMatchObject({ ok: false, code: "STALE_OUTCOME_PROPOSAL" });
+    expect(fixture.discord.finalizationEffects).toEqual([]);
+    fixture.runtime.close();
+  });
+
+  it("disables finalization while an Episode Agent turn is running", async () => {
+    const fixture = await openProposalFixture({});
+    await fixture.runtime.handleDiscordMessage({
+      ...discordMessage("proposal-event-1", "@Coloop create an Outcome Proposal."),
+      authorDiscordUserId: "1001",
+    });
+    fixture.runtime.close();
+    const discord = new RecordingDiscordTransport();
+    const agent = new DeferredEpisodeAgent();
+    const runtime = createColoopRuntime({
+      databasePath: fixture.databasePath,
+      artifactDirectory: join(fixture.directory, "episodes"),
+      ownerDiscordUserId: "1001",
+      guildId: "2002",
+      parentChannelId: "3003",
+      discord,
+      agent,
+    });
+
+    const turn = runtime.handleDiscordMessage(
+      discordMessage("agent-event", "@Coloop check the rollout risk."),
+    );
+    await agent.firstTurnStarted;
+    expect(discord.finalizationControlEffects).toEqual([
+      {
+        enabled: false,
+        guildId: "2002",
+        threadId: "thread-1",
+        revisionId: "proposal-revision-1",
+      },
+    ]);
+    await expect(
+      runtime.handleDiscordFinalization(
+        finalizationInteraction("proposal-revision-1"),
+      ),
+    ).resolves.toMatchObject({ ok: false, code: "EPISODE_AGENT_BUSY" });
+    agent.finishFirstTurn();
+    await turn;
+    expect(discord.finalizationControlEffects.at(-1)).toEqual({
+      enabled: true,
+      guildId: "2002",
+      threadId: "thread-1",
+      revisionId: "proposal-revision-1",
+    });
+    runtime.close();
+  });
+
+  it("keeps the first terminal result immutable without another model effect", async () => {
+    const fixture = await openProposalFixture({});
+    await fixture.runtime.handleDiscordMessage({
+      ...discordMessage("proposal-event-1", "@Coloop create an Outcome Proposal."),
+      authorDiscordUserId: "1001",
+    });
+    const finalized = await fixture.runtime.handleDiscordFinalization(
+      finalizationInteraction("proposal-revision-1"),
+    );
+    if (!finalized.ok) throw new Error(finalized.reason);
+
+    await expect(
+      fixture.runtime.handleDiscordMessage(
+        discordMessage("late-message", "@Coloop revise the Outcome Proposal."),
+      ),
+    ).resolves.toEqual({ ok: true, status: "ignored" });
+    await expect(
+      fixture.runtime.handleCodexOperation({
+        hook: trustedHook("origin-1", join(fixture.directory, "rollout.jsonl"), "cancel_episode"),
+        approval: createOwnerApproval({
+          toolUseId: "tool-use-1",
+          operation: "cancel_episode",
+          episodeId: "episode-1",
+        }),
+        request: {
+          operation: "cancel_episode",
+          arguments: { episodeId: "episode-1" },
+        },
+      }),
+    ).resolves.toEqual(finalized);
+    await expect(
+      fixture.runtime.handleCodexOperation({
+        hook: trustedHook("origin-1", join(fixture.directory, "rollout.jsonl"), "get_episode"),
+        request: {
+          operation: "get_episode",
+          arguments: { episodeId: "episode-1" },
+        },
+      }),
+    ).resolves.toEqual(finalized);
+    expect(fixture.recordingAgent.proposalInputs).toHaveLength(1);
+    expect(fixture.recordingAgent.inputs).toEqual([]);
+    expect(fixture.discord.finalizationEffects).toHaveLength(1);
+    expect(fixture.discord.effects).not.toContainEqual(
+      expect.objectContaining({ kind: "present_cancellation" }),
+    );
+    fixture.runtime.close();
+  });
+
+  it("commits finalization before acknowledgement so it wins a terminal race", async () => {
+    const fixture = await openProposalFixture({});
+    await fixture.runtime.handleDiscordMessage({
+      ...discordMessage("proposal-event-1", "@Coloop create an Outcome Proposal."),
+      authorDiscordUserId: "1001",
+    });
+    fixture.runtime.close();
+    const discord = new DeferredFinalizationDiscordTransport();
+    const runtime = createColoopRuntime({
+      databasePath: fixture.databasePath,
+      artifactDirectory: join(fixture.directory, "episodes"),
+      ownerDiscordUserId: "1001",
+      guildId: "2002",
+      parentChannelId: "3003",
+      discord,
+    });
+
+    const finalization = runtime.handleDiscordFinalization(
+      finalizationInteraction("proposal-revision-1"),
+    );
+    await discord.presentationStarted;
+    const database = new DatabaseSync(fixture.databasePath);
+    expect(database.prepare("SELECT phase FROM episodes").get()).toEqual({
+      phase: "FINALIZED",
+    });
+    database.close();
+    await expect(
+      runtime.handleCodexOperation({
+        hook: trustedHook("origin-1", join(fixture.directory, "rollout.jsonl"), "cancel_episode"),
+        approval: createOwnerApproval({
+          toolUseId: "tool-use-1",
+          operation: "cancel_episode",
+          episodeId: "episode-1",
+        }),
+        request: {
+          operation: "cancel_episode",
+          arguments: { episodeId: "episode-1" },
+        },
+      }),
+    ).resolves.toMatchObject({
+      ok: true,
+      episode: { phase: "FINALIZED" },
+    });
+    discord.finishPresentation();
+    await expect(finalization).resolves.toMatchObject({
+      ok: true,
+      episode: { phase: "FINALIZED" },
+    });
+    expect(discord.effects).not.toContainEqual(
+      expect.objectContaining({ kind: "present_cancellation" }),
+    );
+    runtime.close();
+  });
+
+  it("cannot finalize after cancellation wins the terminal race", async () => {
+    const fixture = await openProposalFixture({});
+    await fixture.runtime.handleDiscordMessage({
+      ...discordMessage("proposal-event-1", "@Coloop create an Outcome Proposal."),
+      authorDiscordUserId: "1001",
+    });
+    await fixture.runtime.handleCodexOperation({
+      hook: trustedHook("origin-1", join(fixture.directory, "rollout.jsonl"), "cancel_episode"),
+      approval: createOwnerApproval({
+        toolUseId: "tool-use-1",
+        operation: "cancel_episode",
+        episodeId: "episode-1",
+      }),
+      request: {
+        operation: "cancel_episode",
+        arguments: { episodeId: "episode-1" },
+      },
+    });
+
+    await expect(
+      fixture.runtime.handleDiscordFinalization(
+        finalizationInteraction("proposal-revision-1"),
+      ),
+    ).resolves.toMatchObject({ ok: false, code: "FINALIZATION_UNAVAILABLE" });
+    expect(fixture.discord.finalizationEffects).toEqual([]);
+    fixture.runtime.close();
+  });
+
+  it("retries an unacknowledged terminal presentation without another transition", async () => {
+    const fixture = await openProposalFixture({ finalizationFailure: true });
+    await fixture.runtime.handleDiscordMessage({
+      ...discordMessage("proposal-event-1", "@Coloop create an Outcome Proposal."),
+      authorDiscordUserId: "1001",
+    });
+    const interaction = finalizationInteraction("proposal-revision-1");
+
+    await expect(
+      fixture.runtime.handleDiscordFinalization(interaction),
+    ).resolves.toMatchObject({ ok: false, code: "DISCORD_PRESENTATION_FAILED" });
+    await expect(
+      fixture.runtime.handleDiscordFinalization(interaction),
+    ).resolves.toMatchObject({
+      ok: true,
+      episode: { phase: "FINALIZED" },
+    });
+    expect(fixture.discord.finalizationEffects).toHaveLength(1);
+    const database = new DatabaseSync(fixture.databasePath);
+    expect(
+      database
+        .prepare(
+          "SELECT phase, phase_version FROM episodes",
+        )
+        .get(),
+    ).toEqual({ phase: "FINALIZED", phase_version: 3 });
+    expect(
+      database
+        .prepare(
+          `SELECT state FROM recovery_outbox
+           WHERE action_kind = 'DISCORD_EPISODE_FINALIZED'`,
+        )
+        .get(),
+    ).toEqual({ state: "ACKNOWLEDGED" });
+    database.close();
+    fixture.runtime.close();
+  });
+});
+
 async function openProposalFixture(options: {
   readonly agent?: EpisodeAgentTransport;
+  readonly finalizationFailure?: boolean;
   readonly proposalFailure?: "publish" | "revise";
   readonly staleProposalDelivery?: boolean;
 }) {
@@ -1860,6 +2269,7 @@ async function openProposalFixture(options: {
     [],
     options.proposalFailure === undefined ? [] : [options.proposalFailure],
     options.staleProposalDelivery ?? false,
+    options.finalizationFailure ?? false,
   );
   const defaultAgent = new RecordingEpisodeAgent([], [
     {
@@ -1874,6 +2284,7 @@ async function openProposalFixture(options: {
     },
   ]);
   const ids = ["episode-1", "proposal-revision-1", "proposal-revision-2"];
+  const agent = options.agent ?? defaultAgent;
   const runtime = createColoopRuntime({
     databasePath,
     artifactDirectory: join(directory, "episodes"),
@@ -1881,7 +2292,8 @@ async function openProposalFixture(options: {
     guildId: "2002",
     parentChannelId: "3003",
     discord,
-    agent: options.agent ?? defaultAgent,
+    agent,
+    now: () => new Date("2026-08-29T12:00:00.000Z"),
     createId: () => ids.shift() ?? "unexpected-id",
   });
   const opened = await runtime.handleCodexOperation({
@@ -1900,7 +2312,14 @@ async function openProposalFixture(options: {
     },
   });
   if (!opened.ok) throw new Error(opened.reason);
-  return { databasePath, directory, discord, runtime };
+  return {
+    agent,
+    databasePath,
+    directory,
+    discord,
+    recordingAgent: defaultAgent,
+    runtime,
+  };
 }
 
 function proposalState(databasePath: string): unknown {
@@ -1968,6 +2387,21 @@ function discordMessage(eventId: string, content: string): DiscordMessageEvent {
   };
 }
 
+function finalizationInteraction(revisionId: string) {
+  return {
+    interactionId: `finalize-${revisionId}`,
+    guildId: "2002",
+    threadId: "thread-1",
+    actorKind: "human" as const,
+    actorDiscordUserId: "1001",
+    revisionId,
+    proposal: {
+      resultMarkdown: "Use a canary rollout.",
+      unresolvedPoints: [] as string[],
+    },
+  };
+}
+
 function isTextDeltaEffect(
   value: object,
 ): value is { readonly kind: "delta"; readonly text: string } {
@@ -1993,6 +2427,8 @@ class RecordingDiscordTransport implements DiscordEpisodeTransport {
   readonly effects: object[] = [];
   readonly agentResponseEffects: object[] = [];
   readonly proposalEffects: object[] = [];
+  readonly finalizationEffects: object[] = [];
+  readonly finalizationControlEffects: object[] = [];
 
   constructor(
     private readonly failProvisioning = false,
@@ -2002,6 +2438,7 @@ class RecordingDiscordTransport implements DiscordEpisodeTransport {
     > = [],
     private readonly proposalDeliveryFailures: Array<"publish" | "revise"> = [],
     private staleProposalDelivery = false,
+    private failFinalizationOnce = false,
   ) {}
 
   async provisionEpisode(
@@ -2121,6 +2558,57 @@ class RecordingDiscordTransport implements DiscordEpisodeTransport {
       revisionId,
       contentSha256: input.contentSha256,
     };
+  }
+
+  async presentFinalization(
+    input: Parameters<DiscordEpisodeTransport["presentFinalization"]>[0],
+  ): Promise<void> {
+    if (this.failFinalizationOnce) {
+      this.failFinalizationOnce = false;
+      throw new Error("Discord unavailable");
+    }
+    this.finalizationEffects.push({
+      kind: "present_finalization",
+      ...input,
+      controlsDisabled: true,
+      threadArchived: false,
+      threadLocked: false,
+    });
+  }
+
+  async setFinalizationEnabled(
+    input: Parameters<DiscordEpisodeTransport["setFinalizationEnabled"]>[0],
+  ): Promise<void> {
+    this.finalizationControlEffects.push(input);
+  }
+}
+
+class DeferredFinalizationDiscordTransport extends RecordingDiscordTransport {
+  readonly presentationStarted: Promise<void>;
+  private resolvePresentationStarted!: () => void;
+  private readonly presentationFinished: Promise<void>;
+  private resolvePresentationFinished!: () => void;
+
+  constructor() {
+    super();
+    this.presentationStarted = new Promise((resolve) => {
+      this.resolvePresentationStarted = resolve;
+    });
+    this.presentationFinished = new Promise((resolve) => {
+      this.resolvePresentationFinished = resolve;
+    });
+  }
+
+  override async presentFinalization(
+    input: Parameters<DiscordEpisodeTransport["presentFinalization"]>[0],
+  ): Promise<void> {
+    this.resolvePresentationStarted();
+    await this.presentationFinished;
+    await super.presentFinalization(input);
+  }
+
+  finishPresentation(): void {
+    this.resolvePresentationFinished();
   }
 }
 
@@ -2338,6 +2826,14 @@ class DeferredDiscordTransport implements DiscordEpisodeTransport {
     DiscordEpisodeTransport["reviseOutcomeProposal"]
   > {
     throw new Error("Outcome Proposals are not used by this fixture.");
+  }
+
+  async presentFinalization(): Promise<void> {
+    throw new Error("Finalization is not used by this fixture.");
+  }
+
+  async setFinalizationEnabled(): Promise<void> {
+    throw new Error("Finalization controls are not used by this fixture.");
   }
 }
 
