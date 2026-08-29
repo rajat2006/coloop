@@ -1,0 +1,13 @@
+{
+  "session_id": "origin-1",
+  "turn_id": "turn-1",
+  "transcript_path": "<fixture-path>",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "mcp__coloop__open_episode",
+  "tool_use_id": "tool-use-1",
+  "tool_input": {
+    "openingBrief": "# Migration decision\n\nCompare the two safe rollout options.",
+    "originalRequest": "Help me choose a migration plan.",
+    "originSessionId": "model-authored-session"
+  }
+}

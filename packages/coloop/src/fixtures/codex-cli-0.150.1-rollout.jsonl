@@ -1,0 +1,7 @@
+{"type":"session_meta","payload":{"id":"origin-1","source":"cli"}}
+{"type":"turn_context","payload":{"turn_id":"turn-1"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"Help me choose a migration plan."}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"I’ll prepare a collaboration brief."}]}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"Please approve opening the Episode."}]}}
+{"type":"response_item","payload":{"type":"function_call","call_id":"tool-use-1","name":"mcp__coloop__open_episode","arguments":"{\"openingBrief\":\"# Migration decision\\n\\nCompare the two safe rollout options.\",\"originalRequest\":\"Help me choose a migration plan.\",\"originSessionId\":\"model-authored-session\"}"}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"This later text must not enter the approved Context Package."}]}}
