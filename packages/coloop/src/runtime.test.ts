@@ -1340,6 +1340,580 @@ describe("Discord Episode Agent conversation", () => {
   });
 });
 
+describe("Outcome Proposal collaboration", () => {
+  it("publishes and revises one structured proposal in its exact Episode thread", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "coloop-proposal-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "coloop.sqlite");
+    const transcriptPath = join(directory, "rollout.jsonl");
+    await writeFile(
+      transcriptPath,
+      fixtureTranscript("origin-1", [ownerMessage("Choose a rollout plan.")]),
+    );
+    const discord = new RecordingDiscordTransport();
+    const agent = new RecordingEpisodeAgent([], [
+      {
+        resultMarkdown: "## Recommendation\n\nUse a canary rollout.\n\n```sh\ndeploy --canary\n```",
+        unresolvedPoints: ["Choose the initial traffic percentage."],
+        responseId: "proposal-response-1",
+      },
+      {
+        resultMarkdown: "## Recommendation\n\nUse a 5% canary rollout.",
+        unresolvedPoints: [],
+        responseId: "proposal-response-2",
+      },
+      {
+        resultMarkdown: "## Recommendation\n\nUse a canary rollout.\n\n```sh\ndeploy --canary\n```",
+        unresolvedPoints: ["Choose the initial traffic percentage."],
+        responseId: "proposal-response-3",
+      },
+    ]);
+    const ids = [
+      "episode-1",
+      "proposal-revision-1",
+      "proposal-revision-2",
+      "proposal-revision-3",
+    ];
+    const runtime = createColoopRuntime({
+      databasePath,
+      artifactDirectory: join(directory, "episodes"),
+      ownerDiscordUserId: "1001",
+      guildId: "2002",
+      parentChannelId: "3003",
+      discord,
+      agent,
+      createId: () => ids.shift() ?? "unexpected-id",
+    });
+    const opened = await runtime.handleCodexOperation({
+      hook: trustedHook("origin-1", transcriptPath),
+      approval: approveOwnerOnlyOpen(
+        "tool-use-1",
+        "# Rollout",
+        "Choose a rollout plan.",
+      ),
+      request: {
+        operation: "open_episode",
+        arguments: {
+          openingBrief: "# Rollout",
+          originalRequest: "Choose a rollout plan.",
+        },
+      },
+    });
+    if (!opened.ok) throw new Error(opened.reason);
+
+    await expect(
+      runtime.handleDiscordMessage({
+        ...discordMessage(
+          "unauthorized-proposal",
+          "@Coloop synthesize an Outcome Proposal.",
+        ),
+        authorDiscordUserId: "9009",
+      }),
+    ).resolves.toMatchObject({ ok: false, code: "OWNER_REQUIRED" });
+    expect(agent.proposalInputs).toEqual([]);
+
+    await expect(
+      runtime.handleDiscordMessage({
+        ...discordMessage(
+          "proposal-event-1",
+          "@Coloop turn this discussion into our recommendation.",
+        ),
+        authorDiscordUserId: "1001",
+        relevantConversation: [
+          { authorKind: "human", content: "A canary limits exposure." },
+          {
+            authorKind: "human",
+            content: "@Coloop turn this discussion into our recommendation.",
+          },
+        ],
+      }),
+    ).resolves.toEqual({ ok: true, status: "completed" });
+    await expect(
+      runtime.handleDiscordMessage({
+        ...discordMessage(
+          "proposal-event-2",
+          "@Coloop make the rollout a 5% canary.",
+        ),
+        authorDiscordUserId: "9009",
+      }),
+    ).resolves.toEqual({ ok: true, status: "completed" });
+    await expect(
+      runtime.handleDiscordMessage({
+        ...discordMessage(
+          "proposal-event-2",
+          "@Coloop make the rollout a 5% canary.",
+        ),
+        authorDiscordUserId: "9009",
+      }),
+    ).resolves.toEqual({ ok: true, status: "duplicate" });
+    await expect(
+      runtime.handleDiscordMessage({
+        ...discordMessage(
+          "proposal-event-2",
+          "@Coloop change the Outcome Proposal to use a 10% canary.",
+        ),
+        authorDiscordUserId: "9009",
+      }),
+    ).resolves.toMatchObject({ ok: false, code: "DISCORD_EVENT_REUSE" });
+    await expect(
+      runtime.handleDiscordMessage(
+        discordMessage(
+          "proposal-event-3",
+          "@Coloop restore the original Outcome Proposal content.",
+        ),
+      ),
+    ).resolves.toEqual({ ok: true, status: "completed" });
+
+    expect(agent.proposalInputs).toEqual([
+      {
+        contextPackage:
+          "# Collaboration Episode Context\n\n" +
+          "## Owner\n\nChoose a rollout plan.\n",
+        message:
+          "# Relevant Discord conversation\n\n" +
+          "human: A canary limits exposure.\n\n" +
+          "human: @Coloop turn this discussion into our recommendation.",
+      },
+      {
+        contextPackage:
+          "# Collaboration Episode Context\n\n" +
+          "## Owner\n\nChoose a rollout plan.\n",
+        message: "@Coloop make the rollout a 5% canary.",
+        previousResponseId: "proposal-response-1",
+      },
+      {
+        contextPackage:
+          "# Collaboration Episode Context\n\n" +
+          "## Owner\n\nChoose a rollout plan.\n",
+        message: "@Coloop restore the original Outcome Proposal content.",
+        previousResponseId: "proposal-response-2",
+      },
+    ]);
+    expect(discord.proposalEffects).toEqual([
+      {
+        kind: "publish",
+        eventId: "proposal-event-1",
+        threadId: "thread-1",
+        revisionId: "proposal-revision-1",
+        resultMarkdown:
+          "## Recommendation\n\nUse a canary rollout.\n\n```sh\ndeploy --canary\n```",
+        unresolvedPoints: ["Choose the initial traffic percentage."],
+        finalizationEnabled: true,
+      },
+      {
+        kind: "revise",
+        eventId: "proposal-event-2",
+        guildId: "2002",
+        threadId: "thread-1",
+        messageId: "proposal-message-1",
+        revisionId: "proposal-revision-2",
+        resultMarkdown: "## Recommendation\n\nUse a 5% canary rollout.",
+        unresolvedPoints: [],
+        acknowledgement: "Outcome Proposal revised to proposal-revision-2.",
+      },
+      {
+        kind: "revise",
+        eventId: "proposal-event-3",
+        guildId: "2002",
+        threadId: "thread-1",
+        messageId: "proposal-message-1",
+        revisionId: "proposal-revision-3",
+        resultMarkdown:
+          "## Recommendation\n\nUse a canary rollout.\n\n```sh\ndeploy --canary\n```",
+        unresolvedPoints: ["Choose the initial traffic percentage."],
+        acknowledgement: "Outcome Proposal revised to proposal-revision-3.",
+      },
+    ]);
+    await expect(
+      runtime.handleCodexOperation({
+        hook: trustedHook("origin-1", transcriptPath, "get_episode"),
+        request: {
+          operation: "get_episode",
+          arguments: { episodeId: opened.episode.id },
+        },
+      }),
+    ).resolves.toMatchObject({
+      ok: true,
+      episode: {
+        id: "episode-1",
+        phase: "ACTIVE",
+        outcomeProposal: {
+          messageId: "proposal-message-1",
+          revisionId: "proposal-revision-3",
+        },
+      },
+    });
+
+    const database = new DatabaseSync(databasePath);
+    const localState = JSON.stringify({
+      episodes: database.prepare("SELECT * FROM episodes").all(),
+      inbox: database.prepare("SELECT * FROM provider_inbox").all(),
+      outbox: database.prepare("SELECT * FROM recovery_outbox").all(),
+    });
+    expect(localState).not.toContain("Use a canary rollout");
+    expect(localState).not.toContain("Choose the initial traffic percentage");
+    expect(localState).not.toContain("Use a 5% canary rollout");
+    database.close();
+    runtime.close();
+  });
+
+  it("rejects schema-invalid Agent output without publishing or advancing state", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "coloop-invalid-proposal-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "coloop.sqlite");
+    const transcriptPath = join(directory, "rollout.jsonl");
+    await writeFile(
+      transcriptPath,
+      fixtureTranscript("origin-1", [ownerMessage("Choose a rollout plan.")]),
+    );
+    const discord = new RecordingDiscordTransport();
+    const runtime = createColoopRuntime({
+      databasePath,
+      artifactDirectory: join(directory, "episodes"),
+      ownerDiscordUserId: "1001",
+      guildId: "2002",
+      parentChannelId: "3003",
+      discord,
+      agent: new CandidateEpisodeAgent({
+        resultMarkdown: "Use a canary rollout.",
+        unresolvedPoints: [],
+        attemptedControl: "finalize",
+      }),
+      createId: (() => {
+        const ids = ["episode-1", "proposal-revision-1"];
+        return () => ids.shift() ?? "unexpected-id";
+      })(),
+    });
+    const opened = await runtime.handleCodexOperation({
+      hook: trustedHook("origin-1", transcriptPath),
+      approval: approveOwnerOnlyOpen(
+        "tool-use-1",
+        "# Rollout",
+        "Choose a rollout plan.",
+      ),
+      request: {
+        operation: "open_episode",
+        arguments: {
+          openingBrief: "# Rollout",
+          originalRequest: "Choose a rollout plan.",
+        },
+      },
+    });
+    if (!opened.ok) throw new Error(opened.reason);
+
+    await expect(
+      runtime.handleDiscordMessage({
+        ...discordMessage(
+          "invalid-proposal",
+          "@Coloop synthesize an Outcome Proposal.",
+        ),
+        authorDiscordUserId: "1001",
+      }),
+    ).resolves.toMatchObject({ ok: false, code: "INVALID_PROPOSAL_OUTPUT" });
+    expect(discord.proposalEffects).toEqual([]);
+
+    const database = new DatabaseSync(databasePath);
+    expect(
+      database
+        .prepare(
+          "SELECT proposal_message_id, proposal_revision_id, proposal_digest, agent_previous_response_id FROM episodes",
+        )
+        .get(),
+    ).toEqual({
+      proposal_message_id: null,
+      proposal_revision_id: null,
+      proposal_digest: null,
+      agent_previous_response_id: null,
+    });
+    database.close();
+    runtime.close();
+  });
+
+  it("does not advance the current revision when its Discord edit fails", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "coloop-proposal-delivery-"));
+    temporaryDirectories.push(directory);
+    const databasePath = join(directory, "coloop.sqlite");
+    const transcriptPath = join(directory, "rollout.jsonl");
+    await writeFile(
+      transcriptPath,
+      fixtureTranscript("origin-1", [ownerMessage("Choose a rollout plan.")]),
+    );
+    const discord = new RecordingDiscordTransport(false, false, [], ["revise"]);
+    const agent = new RecordingEpisodeAgent([], [
+      {
+        resultMarkdown: "Use a canary rollout.",
+        unresolvedPoints: [],
+        responseId: "proposal-response-1",
+      },
+      {
+        resultMarkdown: "Use a 5% canary rollout.",
+        unresolvedPoints: [],
+        responseId: "proposal-response-2",
+      },
+    ]);
+    const ids = ["episode-1", "proposal-revision-1", "proposal-revision-2"];
+    const runtime = createColoopRuntime({
+      databasePath,
+      artifactDirectory: join(directory, "episodes"),
+      ownerDiscordUserId: "1001",
+      guildId: "2002",
+      parentChannelId: "3003",
+      discord,
+      agent,
+      createId: () => ids.shift() ?? "unexpected-id",
+    });
+    const opened = await runtime.handleCodexOperation({
+      hook: trustedHook("origin-1", transcriptPath),
+      approval: approveOwnerOnlyOpen(
+        "tool-use-1",
+        "# Rollout",
+        "Choose a rollout plan.",
+      ),
+      request: {
+        operation: "open_episode",
+        arguments: {
+          openingBrief: "# Rollout",
+          originalRequest: "Choose a rollout plan.",
+        },
+      },
+    });
+    if (!opened.ok) throw new Error(opened.reason);
+    await runtime.handleDiscordMessage({
+      ...discordMessage("proposal-event-1", "@Coloop create an Outcome Proposal."),
+      authorDiscordUserId: "1001",
+    });
+
+    await expect(
+      runtime.handleDiscordMessage(
+        discordMessage(
+          "proposal-event-2",
+          "@Coloop revise the Outcome Proposal to use a 5% canary.",
+        ),
+      ),
+    ).resolves.toMatchObject({ ok: false, code: "DISCORD_DELIVERY_FAILED" });
+
+    const database = new DatabaseSync(databasePath);
+    expect(
+      database
+        .prepare(
+          "SELECT proposal_message_id, proposal_revision_id, agent_previous_response_id FROM episodes",
+        )
+        .get(),
+    ).toEqual({
+      proposal_message_id: "proposal-message-1",
+      proposal_revision_id: "proposal-revision-1",
+      agent_previous_response_id: "proposal-response-1",
+    });
+    expect(
+      database
+        .prepare(
+          "SELECT status FROM provider_inbox WHERE provider_event_id = 'proposal-event-2'",
+        )
+        .get(),
+    ).toEqual({ status: "FAILED" });
+    database.close();
+    runtime.close();
+  });
+
+  it("does not advance a revision from a stale Discord acknowledgement", async () => {
+    const fixture = await openProposalFixture({ staleProposalDelivery: true });
+    await fixture.runtime.handleDiscordMessage({
+      ...discordMessage("proposal-event-1", "@Coloop create an Outcome Proposal."),
+      authorDiscordUserId: "1001",
+    });
+
+    await expect(
+      fixture.runtime.handleDiscordMessage(
+        discordMessage(
+          "proposal-event-2",
+          "@Coloop change the Outcome Proposal to a 5% canary.",
+        ),
+      ),
+    ).resolves.toMatchObject({ ok: false, code: "STALE_PROPOSAL_DELIVERY" });
+
+    const database = new DatabaseSync(fixture.databasePath);
+    expect(
+      database
+        .prepare(
+          "SELECT proposal_revision_id, agent_previous_response_id FROM episodes",
+        )
+        .get(),
+    ).toEqual({
+      proposal_revision_id: "proposal-revision-1",
+      agent_previous_response_id: "proposal-response-1",
+    });
+    database.close();
+    fixture.runtime.close();
+  });
+
+  it("does not advance proposal state after an Agent provider failure", async () => {
+    const fixture = await openProposalFixture({ agent: new FailingEpisodeAgent() });
+
+    await expect(
+      fixture.runtime.handleDiscordMessage({
+        ...discordMessage(
+          "proposal-event-1",
+          "@Coloop turn this discussion into our recommendation.",
+        ),
+        authorDiscordUserId: "1001",
+      }),
+    ).resolves.toMatchObject({ ok: false, code: "AGENT_PROVIDER_FAILED" });
+    expect(proposalState(fixture.databasePath)).toEqual({
+      proposal_message_id: null,
+      proposal_revision_id: null,
+      agent_previous_response_id: null,
+    });
+    fixture.runtime.close();
+  });
+
+  it("does not advance proposal state after initial Discord publication fails", async () => {
+    const fixture = await openProposalFixture({ proposalFailure: "publish" });
+
+    await expect(
+      fixture.runtime.handleDiscordMessage({
+        ...discordMessage("proposal-event-1", "@Coloop create an Outcome Proposal."),
+        authorDiscordUserId: "1001",
+      }),
+    ).resolves.toMatchObject({ ok: false, code: "DISCORD_DELIVERY_FAILED" });
+    expect(proposalState(fixture.databasePath)).toEqual({
+      proposal_message_id: null,
+      proposal_revision_id: null,
+      agent_previous_response_id: null,
+    });
+    fixture.runtime.close();
+  });
+
+  it("does not create an implicit proposal during ordinary Agent conversation", async () => {
+    const fixture = await openProposalFixture({
+      agent: new RecordingEpisodeAgent([
+        { deltas: ["A canary limits exposure."], responseId: "response-1" },
+      ]),
+    });
+
+    await expect(
+      fixture.runtime.handleDiscordMessage(
+        discordMessage("ordinary-event", "@Coloop which rollout is safer?"),
+      ),
+    ).resolves.toEqual({ ok: true, status: "completed" });
+    expect(fixture.discord.proposalEffects).toEqual([]);
+    expect(proposalState(fixture.databasePath)).toEqual({
+      proposal_message_id: null,
+      proposal_revision_id: null,
+      agent_previous_response_id: "response-1",
+    });
+    fixture.runtime.close();
+  });
+
+  it("authorizes synthesis with the Episode's snapshotted Owner after reconfiguration", async () => {
+    const fixture = await openProposalFixture({});
+    fixture.runtime.close();
+    const discord = new RecordingDiscordTransport();
+    const runtime = createColoopRuntime({
+      databasePath: fixture.databasePath,
+      artifactDirectory: join(fixture.directory, "episodes"),
+      ownerDiscordUserId: "9999",
+      guildId: "2002",
+      parentChannelId: "3003",
+      discord,
+      agent: new RecordingEpisodeAgent([], [
+        {
+          resultMarkdown: "Use a canary rollout.",
+          unresolvedPoints: [],
+          responseId: "proposal-response-1",
+        },
+      ]),
+      createId: () => "proposal-revision-after-restart",
+    });
+
+    await expect(
+      runtime.handleDiscordMessage({
+        ...discordMessage("new-owner", "@Coloop create an Outcome Proposal."),
+        authorDiscordUserId: "9999",
+      }),
+    ).resolves.toMatchObject({ ok: false, code: "OWNER_REQUIRED" });
+    await expect(
+      runtime.handleDiscordMessage({
+        ...discordMessage("original-owner", "@Coloop create an Outcome Proposal."),
+        authorDiscordUserId: "1001",
+      }),
+    ).resolves.toEqual({ ok: true, status: "completed" });
+    runtime.close();
+  });
+});
+
+async function openProposalFixture(options: {
+  readonly agent?: EpisodeAgentTransport;
+  readonly proposalFailure?: "publish" | "revise";
+  readonly staleProposalDelivery?: boolean;
+}) {
+  const directory = await mkdtemp(join(tmpdir(), "coloop-proposal-fixture-"));
+  temporaryDirectories.push(directory);
+  const databasePath = join(directory, "coloop.sqlite");
+  const transcriptPath = join(directory, "rollout.jsonl");
+  await writeFile(
+    transcriptPath,
+    fixtureTranscript("origin-1", [ownerMessage("Choose a rollout plan.")]),
+  );
+  const discord = new RecordingDiscordTransport(
+    false,
+    false,
+    [],
+    options.proposalFailure === undefined ? [] : [options.proposalFailure],
+    options.staleProposalDelivery ?? false,
+  );
+  const defaultAgent = new RecordingEpisodeAgent([], [
+    {
+      resultMarkdown: "Use a canary rollout.",
+      unresolvedPoints: [],
+      responseId: "proposal-response-1",
+    },
+    {
+      resultMarkdown: "Use a 5% canary rollout.",
+      unresolvedPoints: [],
+      responseId: "proposal-response-2",
+    },
+  ]);
+  const ids = ["episode-1", "proposal-revision-1", "proposal-revision-2"];
+  const runtime = createColoopRuntime({
+    databasePath,
+    artifactDirectory: join(directory, "episodes"),
+    ownerDiscordUserId: "1001",
+    guildId: "2002",
+    parentChannelId: "3003",
+    discord,
+    agent: options.agent ?? defaultAgent,
+    createId: () => ids.shift() ?? "unexpected-id",
+  });
+  const opened = await runtime.handleCodexOperation({
+    hook: trustedHook("origin-1", transcriptPath),
+    approval: approveOwnerOnlyOpen(
+      "tool-use-1",
+      "# Rollout",
+      "Choose a rollout plan.",
+    ),
+    request: {
+      operation: "open_episode",
+      arguments: {
+        openingBrief: "# Rollout",
+        originalRequest: "Choose a rollout plan.",
+      },
+    },
+  });
+  if (!opened.ok) throw new Error(opened.reason);
+  return { databasePath, directory, discord, runtime };
+}
+
+function proposalState(databasePath: string): unknown {
+  const database = new DatabaseSync(databasePath);
+  const state = database
+    .prepare(
+      "SELECT proposal_message_id, proposal_revision_id, agent_previous_response_id FROM episodes",
+    )
+    .get();
+  database.close();
+  return state;
+}
+
 function trustedHook(
   sessionId: string,
   transcriptPath: string,
@@ -1418,6 +1992,7 @@ function approveOwnerOnlyOpen(
 class RecordingDiscordTransport implements DiscordEpisodeTransport {
   readonly effects: object[] = [];
   readonly agentResponseEffects: object[] = [];
+  readonly proposalEffects: object[] = [];
 
   constructor(
     private readonly failProvisioning = false,
@@ -1425,6 +2000,8 @@ class RecordingDiscordTransport implements DiscordEpisodeTransport {
     private readonly agentDeliveryFailures: Array<
       "begin" | "append" | "complete"
     > = [],
+    private readonly proposalDeliveryFailures: Array<"publish" | "revise"> = [],
+    private staleProposalDelivery = false,
   ) {}
 
   async provisionEpisode(
@@ -1493,10 +2070,67 @@ class RecordingDiscordTransport implements DiscordEpisodeTransport {
       },
     };
   }
+
+  async publishOutcomeProposal(
+    input: Parameters<DiscordEpisodeTransport["publishOutcomeProposal"]>[0],
+  ): ReturnType<DiscordEpisodeTransport["publishOutcomeProposal"]> {
+    if (this.proposalDeliveryFailures[0] === "publish") {
+      this.proposalDeliveryFailures.shift();
+      throw new Error("Discord unavailable");
+    }
+    this.proposalEffects.push({
+      kind: "publish",
+      eventId: input.eventId,
+      threadId: input.threadId,
+      revisionId: input.revisionId,
+      resultMarkdown: input.resultMarkdown,
+      unresolvedPoints: input.unresolvedPoints,
+      finalizationEnabled: input.finalizationEnabled,
+    });
+    return {
+      messageId: "proposal-message-1",
+      revisionId: input.revisionId,
+      contentSha256: input.contentSha256,
+    };
+  }
+
+  async reviseOutcomeProposal(
+    input: Parameters<DiscordEpisodeTransport["reviseOutcomeProposal"]>[0],
+  ): ReturnType<DiscordEpisodeTransport["reviseOutcomeProposal"]> {
+    if (this.proposalDeliveryFailures[0] === "revise") {
+      this.proposalDeliveryFailures.shift();
+      throw new Error("Discord unavailable");
+    }
+    this.proposalEffects.push({
+      kind: "revise",
+      eventId: input.eventId,
+      guildId: input.guildId,
+      threadId: input.threadId,
+      messageId: input.messageId,
+      revisionId: input.revisionId,
+      resultMarkdown: input.resultMarkdown,
+      unresolvedPoints: input.unresolvedPoints,
+      acknowledgement: input.acknowledgement,
+    });
+    const revisionId = this.staleProposalDelivery
+      ? "stale-revision"
+      : input.revisionId;
+    this.staleProposalDelivery = false;
+    return {
+      messageId: input.messageId,
+      revisionId,
+      contentSha256: input.contentSha256,
+    };
+  }
 }
 
 class RecordingEpisodeAgent implements EpisodeAgentTransport {
   readonly inputs: Array<{
+    readonly contextPackage: string;
+    readonly message: string;
+    readonly previousResponseId?: string;
+  }> = [];
+  readonly proposalInputs: Array<{
     readonly contextPackage: string;
     readonly message: string;
     readonly previousResponseId?: string;
@@ -1507,6 +2141,11 @@ class RecordingEpisodeAgent implements EpisodeAgentTransport {
       readonly deltas: readonly string[];
       readonly responseId: string;
     }>,
+    private readonly proposals: Array<{
+      readonly resultMarkdown: string;
+      readonly unresolvedPoints: readonly string[];
+      readonly responseId: string;
+    }> = [],
   ) {}
 
   async streamResponse(
@@ -1526,6 +2165,22 @@ class RecordingEpisodeAgent implements EpisodeAgentTransport {
       if (!delivery.ok) return delivery;
     }
     return { ok: true, responseId: response.responseId };
+  }
+
+  async synthesizeOutcomeProposal(
+    input: Parameters<EpisodeAgentTransport["synthesizeOutcomeProposal"]>[0],
+  ): ReturnType<EpisodeAgentTransport["synthesizeOutcomeProposal"]> {
+    this.proposalInputs.push(input);
+    const proposal = this.proposals.shift();
+    if (proposal === undefined) throw new Error("No proposal configured.");
+    return {
+      ok: true,
+      responseId: proposal.responseId,
+      candidate: {
+        resultMarkdown: proposal.resultMarkdown,
+        unresolvedPoints: proposal.unresolvedPoints,
+      },
+    };
   }
 }
 
@@ -1570,11 +2225,37 @@ class DeferredEpisodeAgent implements EpisodeAgentTransport {
   finishFirstTurn(): void {
     this.resolveFirstTurnFinished();
   }
+
+  async synthesizeOutcomeProposal(): ReturnType<
+    EpisodeAgentTransport["synthesizeOutcomeProposal"]
+  > {
+    return { ok: false, reason: "provider-failed" };
+  }
 }
 
 class FailingEpisodeAgent implements EpisodeAgentTransport {
   async streamResponse(): ReturnType<EpisodeAgentTransport["streamResponse"]> {
     return { ok: false, reason: "provider-failed" };
+  }
+
+  async synthesizeOutcomeProposal(): ReturnType<
+    EpisodeAgentTransport["synthesizeOutcomeProposal"]
+  > {
+    return { ok: false, reason: "provider-failed" };
+  }
+}
+
+class CandidateEpisodeAgent implements EpisodeAgentTransport {
+  constructor(private readonly candidate: unknown) {}
+
+  async streamResponse(): ReturnType<EpisodeAgentTransport["streamResponse"]> {
+    return { ok: false, reason: "provider-failed" };
+  }
+
+  async synthesizeOutcomeProposal(): ReturnType<
+    EpisodeAgentTransport["synthesizeOutcomeProposal"]
+  > {
+    return { ok: true, responseId: "response-1", candidate: this.candidate };
   }
 }
 
@@ -1594,6 +2275,12 @@ class ContextAwareEpisodeAgent implements EpisodeAgentTransport {
     return delivery.ok
       ? { ok: true, responseId: `response-${this.turn}` }
       : delivery;
+  }
+
+  async synthesizeOutcomeProposal(): ReturnType<
+    EpisodeAgentTransport["synthesizeOutcomeProposal"]
+  > {
+    return { ok: false, reason: "provider-failed" };
   }
 }
 
@@ -1639,6 +2326,18 @@ class DeferredDiscordTransport implements DiscordEpisodeTransport {
     DiscordEpisodeTransport["beginAgentResponse"]
   > {
     throw new Error("Agent responses are not used by this fixture.");
+  }
+
+  async publishOutcomeProposal(): ReturnType<
+    DiscordEpisodeTransport["publishOutcomeProposal"]
+  > {
+    throw new Error("Outcome Proposals are not used by this fixture.");
+  }
+
+  async reviseOutcomeProposal(): ReturnType<
+    DiscordEpisodeTransport["reviseOutcomeProposal"]
+  > {
+    throw new Error("Outcome Proposals are not used by this fixture.");
   }
 }
 

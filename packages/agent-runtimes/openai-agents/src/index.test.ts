@@ -141,4 +141,56 @@ describe("Episode Agent contract", () => {
       }),
     ).resolves.toEqual({ ok: false, reason: "delivery-failed" });
   });
+
+  test("synthesizes a structured tool-free Outcome Proposal", async () => {
+    const model = new ScriptedModel([
+      [
+        assistantMessage(
+          JSON.stringify({
+            resultMarkdown:
+              "## Recommendation\n\nUse a canary.\n\n```sh\ndeploy --canary\n```",
+            unresolvedPoints: [],
+          }),
+        ),
+      ],
+    ]);
+    const agent = createEpisodeAgent({ model });
+
+    await expect(
+      agent.synthesizeOutcomeProposal({
+        contextPackage: "The rollout must preserve rollback.",
+        message: "@Coloop synthesize an Outcome Proposal.",
+        previousResponseId: "response-1",
+      }),
+    ).resolves.toMatchObject({
+      ok: true,
+      candidate: {
+        resultMarkdown:
+          "## Recommendation\n\nUse a canary.\n\n```sh\ndeploy --canary\n```",
+        unresolvedPoints: [],
+      },
+    });
+    expect(model.firstCall?.request).toMatchObject({
+      handoffs: [],
+      previousResponseId: "response-1",
+      tools: [],
+      outputType: {
+        name: "outcome_proposal",
+        strict: true,
+      },
+    });
+  });
+
+  test("maps Outcome Proposal provider failures without exposing details", async () => {
+    const model = new ScriptedModel([
+      modelError(new Error("raw proposal provider details must not escape")),
+    ]);
+
+    await expect(
+      createEpisodeAgent({ model }).synthesizeOutcomeProposal({
+        contextPackage: "Private context.",
+        message: "Turn this discussion into our recommendation.",
+      }),
+    ).resolves.toEqual({ ok: false, reason: "provider-failed" });
+  });
 });

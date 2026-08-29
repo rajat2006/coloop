@@ -1,5 +1,10 @@
 import type { EmptyResult, EpisodeAgent } from "@coloop/core";
-import { Agent, Runner, type Model } from "@openai/agents";
+import {
+  Agent,
+  Runner,
+  type JsonSchemaDefinition,
+  type Model,
+} from "@openai/agents";
 
 const openaiApi = "https://api.openai.com/v1";
 
@@ -26,16 +31,51 @@ Private Context Package:
 
 ${contextPackage}`;
 
+const outcomeProposalOutput = {
+  type: "json_schema",
+  name: "outcome_proposal",
+  strict: true,
+  schema: {
+    type: "object",
+    properties: {
+      resultMarkdown: {
+        type: "string",
+        description: "A standalone conclusion in Markdown.",
+      },
+      unresolvedPoints: {
+        type: "array",
+        items: { type: "string" },
+        description: "Unresolved points in review order; empty when none remain.",
+      },
+    },
+    required: ["resultMarkdown", "unresolvedPoints"],
+    additionalProperties: false,
+  },
+} satisfies JsonSchemaDefinition;
+
 export const createEpisodeAgent = (configuration: {
   readonly model?: Model | string;
 } = {}): EpisodeAgent => {
-  const manager = new Agent<EpisodeAgentContext>({
+  const manager = new Agent<
+    EpisodeAgentContext,
+    "text" | JsonSchemaDefinition
+  >({
     name: "Coloop Episode Agent",
     instructions: (runContext) =>
       episodeAgentInstructions(runContext.context.contextPackage),
     handoffs: [],
     tools: [],
+    outputType: "text",
     ...(configuration.model === undefined ? {} : { model: configuration.model }),
+  });
+  const proposalManager = manager.clone({
+    instructions: (runContext) =>
+      `${episodeAgentInstructions(runContext.context.contextPackage)}
+
+Synthesize the requested public Outcome Proposal from the authorized context and Discord conversation. The result Markdown must stand alone. Preserve unresolved points as an ordered list. Return only the required structured output.`,
+    handoffs: [],
+    tools: [],
+    outputType: outcomeProposalOutput,
   });
   const runner = new Runner({
     traceIncludeSensitiveData: false,
@@ -62,6 +102,27 @@ export const createEpisodeAgent = (configuration: {
           return { ok: false, reason: "provider-failed" };
         }
         return { ok: true, responseId: stream.lastResponseId };
+      } catch {
+        return { ok: false, reason: "provider-failed" };
+      }
+    },
+    async synthesizeOutcomeProposal(input) {
+      try {
+        const result = await runner.run(proposalManager, input.message, {
+          context: { contextPackage: input.contextPackage },
+          maxTurns: 1,
+          ...(input.previousResponseId === undefined
+            ? {}
+            : { previousResponseId: input.previousResponseId }),
+        });
+        if (result.lastResponseId === undefined || result.finalOutput === undefined) {
+          return { ok: false, reason: "provider-failed" };
+        }
+        return {
+          ok: true,
+          responseId: result.lastResponseId,
+          candidate: result.finalOutput,
+        };
       } catch {
         return { ok: false, reason: "provider-failed" };
       }

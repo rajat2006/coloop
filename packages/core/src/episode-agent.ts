@@ -17,4 +17,16 @@ export interface EpisodeAgent {
         readonly reason: "delivery-failed" | "provider-failed";
       }
   >;
+  synthesizeOutcomeProposal(input: {
+    readonly contextPackage: string;
+    readonly message: string;
+    readonly previousResponseId?: string;
+  }): Promise<
+    | {
+        readonly ok: true;
+        readonly responseId: string;
+        readonly candidate: unknown;
+      }
+    | { readonly ok: false; readonly reason: "provider-failed" }
+  >;
 }

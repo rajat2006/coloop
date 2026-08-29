@@ -14,6 +14,17 @@ const contextPackageRetentionMs = 72 * 60 * 60 * 1_000;
 
 export type EpisodePhase = "OPENING" | "ACTIVE" | "FINALIZED" | "CANCELLED";
 
+export interface OutcomeProposalContent {
+  readonly resultMarkdown: string;
+  readonly unresolvedPoints: readonly string[];
+}
+
+interface ProposalDeliveryReceipt {
+  readonly messageId: string;
+  readonly revisionId: string;
+  readonly contentSha256: string;
+}
+
 export interface DiscordEpisodeTransport {
   provisionEpisode(input: {
     readonly idempotencyKey: string;
@@ -38,6 +49,23 @@ export interface DiscordEpisodeTransport {
     appendText(delta: string): Promise<void>;
     complete(): Promise<void>;
   }>;
+  publishOutcomeProposal(input: OutcomeProposalContent & {
+    readonly eventId: string;
+    readonly guildId: string;
+    readonly threadId: string;
+    readonly revisionId: string;
+    readonly contentSha256: string;
+    readonly finalizationEnabled: true;
+  }): Promise<ProposalDeliveryReceipt>;
+  reviseOutcomeProposal(input: OutcomeProposalContent & {
+    readonly eventId: string;
+    readonly guildId: string;
+    readonly threadId: string;
+    readonly messageId: string;
+    readonly revisionId: string;
+    readonly contentSha256: string;
+    readonly acknowledgement: string;
+  }): Promise<ProposalDeliveryReceipt>;
 }
 
 export type EpisodeAgentTransport = EpisodeAgent;
@@ -47,6 +75,7 @@ export interface DiscordMessageEvent {
   readonly guildId: string;
   readonly threadId: string;
   readonly authorKind: "human" | "external-bot" | "webhook" | "coloop";
+  readonly authorDiscordUserId?: string;
   readonly content: string;
   readonly mentionsApplication: boolean;
   readonly relevantConversation?: readonly DiscordConversationMessage[];
@@ -69,6 +98,11 @@ export type EpisodeView =
       readonly collaborationUrl?: string;
       readonly contextPackage: {
         readonly reference: string;
+        readonly sha256: string;
+      };
+      readonly outcomeProposal?: {
+        readonly messageId: string;
+        readonly revisionId: string;
         readonly sha256: string;
       };
     }
@@ -145,6 +179,7 @@ interface InternalEpisodeModule extends EpisodeModule {
 interface EpisodeRow {
   readonly id: string;
   readonly origin_session_id: string;
+  readonly owner_discord_user_id: string;
   readonly phase: EpisodePhase;
   readonly phase_version: number;
   readonly thread_id: string | null;
@@ -155,6 +190,9 @@ interface EpisodeRow {
   readonly cancelled_at: string | null;
   readonly cancellation_reason: string | null;
   readonly agent_previous_response_id: string | null;
+  readonly proposal_message_id: string | null;
+  readonly proposal_revision_id: string | null;
+  readonly proposal_digest: string | null;
 }
 
 export function createColoopRuntime(configuration: RuntimeConfiguration): CodexEpisodeRuntime {
@@ -281,7 +319,13 @@ export function createColoopRuntime(configuration: RuntimeConfiguration): CodexE
         discordTurnQueues,
         `${event.value.guildId}:${event.value.threadId}`,
         async () =>
-          await processDiscordMessage(database, configuration, event.value, now),
+          await processDiscordMessage(
+            database,
+            configuration,
+            event.value,
+            now,
+            createId,
+          ),
       );
     },
     close(): void {
@@ -301,6 +345,8 @@ function parseDiscordMessageEvent(
     !isNonEmptyString(value.guildId) ||
     !isNonEmptyString(value.threadId) ||
     !isDiscordMessageAuthor(value.authorKind) ||
+    (value.authorDiscordUserId !== undefined &&
+      !isNonEmptyString(value.authorDiscordUserId)) ||
     !isNonEmptyString(value.content) ||
     typeof value.mentionsApplication !== "boolean"
   ) {
@@ -339,6 +385,9 @@ function parseDiscordMessageEvent(
       guildId: value.guildId,
       threadId: value.threadId,
       authorKind: value.authorKind,
+      ...(value.authorDiscordUserId === undefined
+        ? {}
+        : { authorDiscordUserId: value.authorDiscordUserId }),
       content: value.content,
       mentionsApplication: value.mentionsApplication,
       ...(relevantConversation === undefined ? {} : { relevantConversation }),
@@ -399,6 +448,7 @@ async function processDiscordMessage(
   configuration: RuntimeConfiguration,
   input: DiscordMessageEvent,
   now: () => Date,
+  createId: () => string,
 ): Promise<DiscordMessageResult> {
   if (!input.mentionsApplication || input.authorKind === "coloop") {
     return { ok: true, status: "ignored" };
@@ -406,10 +456,10 @@ async function processDiscordMessage(
   const episode = findActiveByDiscord(database, input.guildId, input.threadId);
   if (episode === undefined) return { ok: true, status: "ignored" };
 
-  const inputDigest = digest(JSON.stringify(input));
-  const existing = findProviderInput(database, input.eventId);
-  if (existing !== undefined) {
-    if (existing !== inputDigest) {
+  const replayDigest = digest(JSON.stringify(input));
+  const replay = findProviderInput(database, input.eventId);
+  if (replay !== undefined) {
+    if (replay !== replayDigest) {
       return failure(
         "DISCORD_EVENT_REUSE",
         "The Discord event identity was reused with different input.",
@@ -417,6 +467,37 @@ async function processDiscordMessage(
     }
     return { ok: true, status: "duplicate" };
   }
+
+  const requestsSynthesis = requestsOutcomeProposal(input.content);
+  const requestsRevision = requestsProposalRevision(input.content);
+  if (requestsSynthesis && episode.proposal_revision_id === null) {
+    if (input.authorDiscordUserId !== episode.owner_discord_user_id) {
+      return failure(
+        "OWNER_REQUIRED",
+        "Only the paired Owner can request the first Outcome Proposal.",
+      );
+    }
+    return await synthesizeOutcomeProposal(
+      database,
+      configuration,
+      episode,
+      input,
+      now,
+      createId,
+    );
+  }
+  if (requestsRevision && episode.proposal_revision_id !== null) {
+    return await synthesizeOutcomeProposal(
+      database,
+      configuration,
+      episode,
+      input,
+      now,
+      createId,
+    );
+  }
+
+  const inputDigest = replayDigest;
   const receivedAt = now().toISOString();
   inTransaction(database, () => {
     database
@@ -514,6 +595,237 @@ async function processDiscordMessage(
   return { ok: true, status: "completed" };
 }
 
+function requestsOutcomeProposal(content: string): boolean {
+  return (
+    (/\boutcome\s+proposal\b/i.test(content) &&
+      /\b(synthesize|create|draft|prepare|publish|make)\b/i.test(content)) ||
+    (/\b(synthesize|summarize|turn|convert)\b/i.test(content) &&
+      /\b(discussion|conversation|this)\b/i.test(content) &&
+      /\b(recommendation|conclusion|result)\b/i.test(content))
+  );
+}
+
+function requestsProposalRevision(content: string): boolean {
+  return (
+    /\b(revise|update|correct|change|amend|restore|fix|replace|make)\b/i.test(
+      content,
+    ) &&
+    (/\boutcome\s+proposal\b/i.test(content) ||
+      /\b(recommendation|conclusion|result|rollout|proposal)\b/i.test(content))
+  );
+}
+
+type OutcomeProposalCandidate = OutcomeProposalContent;
+
+async function synthesizeOutcomeProposal(
+  database: DatabaseSync,
+  configuration: RuntimeConfiguration,
+  episode: EpisodeRow,
+  input: DiscordMessageEvent,
+  now: () => Date,
+  createId: () => string,
+): Promise<DiscordMessageResult> {
+  const inputDigest = digest(JSON.stringify(input));
+  if (configuration.agent === undefined) {
+    return failure("AGENT_UNAVAILABLE", "The Episode Agent is not configured.");
+  }
+
+  const receivedAt = now().toISOString();
+  const revisionId = createId();
+  const isRevision = episode.proposal_revision_id !== null;
+  const effectKind = isRevision ? "proposal_revision" : "proposal_synthesis";
+  const actionKind = isRevision
+    ? "DISCORD_PROPOSAL_REVISION"
+    : "DISCORD_PROPOSAL_PUBLISH";
+  inTransaction(database, () => {
+    database
+      .prepare(
+        `INSERT INTO provider_inbox (
+          provider_event_id, episode_id, input_digest, effect_kind, status, received_at
+        ) VALUES (?, ?, ?, ?, 'PROCESSING', ?)`,
+      )
+      .run(input.eventId, episode.id, inputDigest, effectKind, receivedAt);
+    database
+      .prepare(
+        `INSERT INTO recovery_outbox (
+          action_id, episode_id, sequence, action_kind, idempotency_key,
+          destination_reference, state, payload, created_at
+        ) VALUES (?, ?, (
+          SELECT COALESCE(MAX(sequence), 0) + 1 FROM recovery_outbox WHERE episode_id = ?
+        ), ?, ?, ?, 'PENDING', NULL, ?)`,
+      )
+      .run(
+        randomUUID(),
+        episode.id,
+        episode.id,
+        actionKind,
+        `proposal:${input.eventId}`,
+        input.threadId,
+        receivedAt,
+      );
+  });
+
+  const candidateResult = await configuration.agent.synthesizeOutcomeProposal({
+    contextPackage: await readFile(episode.context_reference, "utf8"),
+    message: renderDiscordConversation(input),
+    ...(episode.agent_previous_response_id === null
+      ? {}
+      : { previousResponseId: episode.agent_previous_response_id }),
+  });
+  if (!candidateResult.ok) {
+    abandonProposal(database, input.eventId);
+    return failure("AGENT_PROVIDER_FAILED", "The Episode Agent provider call failed.");
+  }
+  const candidate = parseOutcomeProposalCandidate(candidateResult.candidate);
+  if (candidate === undefined) {
+    abandonProposal(database, input.eventId);
+    return failure(
+      "INVALID_PROPOSAL_OUTPUT",
+      "The Episode Agent did not return a valid Outcome Proposal.",
+    );
+  }
+
+  const proposalDigest = digest(JSON.stringify(candidate));
+  let delivery: ProposalDeliveryReceipt;
+  try {
+    if (episode.proposal_message_id === null) {
+      delivery = await configuration.discord.publishOutcomeProposal({
+        eventId: input.eventId,
+        guildId: input.guildId,
+        threadId: input.threadId,
+        revisionId,
+        resultMarkdown: candidate.resultMarkdown,
+        unresolvedPoints: candidate.unresolvedPoints,
+        contentSha256: proposalDigest,
+        finalizationEnabled: true,
+      });
+    } else {
+      delivery = await configuration.discord.reviseOutcomeProposal({
+        eventId: input.eventId,
+        guildId: input.guildId,
+        threadId: input.threadId,
+        messageId: episode.proposal_message_id,
+        revisionId,
+        resultMarkdown: candidate.resultMarkdown,
+        unresolvedPoints: candidate.unresolvedPoints,
+        contentSha256: proposalDigest,
+        acknowledgement: `Outcome Proposal revised to ${revisionId}.`,
+      });
+    }
+  } catch {
+    abandonProposal(database, input.eventId);
+    return failure("DISCORD_DELIVERY_FAILED", "Discord proposal delivery failed.");
+  }
+  const expectedMessageId = episode.proposal_message_id ?? delivery.messageId;
+  if (
+    delivery.messageId !== expectedMessageId ||
+    delivery.revisionId !== revisionId ||
+    delivery.contentSha256 !== proposalDigest
+  ) {
+    abandonProposal(database, input.eventId);
+    return failure(
+      "STALE_PROPOSAL_DELIVERY",
+      "Discord did not acknowledge the current Outcome Proposal revision.",
+    );
+  }
+
+  const completedAt = now().toISOString();
+  // Discord must acknowledge the exact content before it becomes current locally.
+  // A failed compare-and-set leaves the connected-only Episode unsafe to continue;
+  // later interruption handling owns that fail-closed boundary.
+  inTransaction(database, () => {
+    const proposalUpdate =
+      episode.proposal_revision_id === null
+        ? database
+            .prepare(
+              `UPDATE episodes SET proposal_message_id = ?, proposal_revision_id = ?,
+               proposal_digest = ?, agent_previous_response_id = ?, updated_at = ?
+               WHERE id = ? AND phase = 'ACTIVE' AND proposal_revision_id IS NULL`,
+            )
+            .run(
+              delivery.messageId,
+              revisionId,
+              proposalDigest,
+              candidateResult.responseId,
+              completedAt,
+              episode.id,
+            )
+        : database
+            .prepare(
+              `UPDATE episodes SET proposal_revision_id = ?, proposal_digest = ?,
+               agent_previous_response_id = ?, updated_at = ?
+               WHERE id = ? AND phase = 'ACTIVE' AND proposal_revision_id = ?`,
+            )
+            .run(
+              revisionId,
+              proposalDigest,
+              candidateResult.responseId,
+              completedAt,
+              episode.id,
+              episode.proposal_revision_id,
+            );
+    if (proposalUpdate.changes !== 1) {
+      throw new Error("The current Outcome Proposal changed during delivery.");
+    }
+    database
+      .prepare(
+        `UPDATE provider_inbox SET status = 'COMPLETED', completed_at = ?
+         WHERE provider_event_id = ?`,
+      )
+      .run(completedAt, input.eventId);
+    database
+      .prepare(
+        `UPDATE recovery_outbox SET state = 'ACKNOWLEDGED', acknowledged_at = ?
+         WHERE idempotency_key = ?`,
+      )
+      .run(completedAt, `proposal:${input.eventId}`);
+  });
+  return { ok: true, status: "completed" };
+}
+
+function parseOutcomeProposalCandidate(value: unknown): OutcomeProposalCandidate | undefined {
+  if (
+    !isRecord(value) ||
+    Object.keys(value).length !== 2 ||
+    !isNonBlankString(value.resultMarkdown) ||
+    !Array.isArray(value.unresolvedPoints) ||
+    !value.unresolvedPoints.every(isNonBlankString)
+  ) {
+    return undefined;
+  }
+  return {
+    resultMarkdown: value.resultMarkdown,
+    unresolvedPoints: value.unresolvedPoints,
+  };
+}
+
+function isNonBlankString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function abandonProposal(database: DatabaseSync, eventId: string): void {
+  abandonProviderEffect(database, eventId, `proposal:${eventId}`);
+}
+
+function abandonAgentTurn(database: DatabaseSync, eventId: string): void {
+  abandonProviderEffect(database, eventId, `agent-response:${eventId}`);
+}
+
+function abandonProviderEffect(
+  database: DatabaseSync,
+  eventId: string,
+  idempotencyKey: string,
+): void {
+  inTransaction(database, () => {
+    database
+      .prepare("UPDATE provider_inbox SET status = 'FAILED' WHERE provider_event_id = ?")
+      .run(eventId);
+    database
+      .prepare("UPDATE recovery_outbox SET state = 'ABANDONED' WHERE idempotency_key = ?")
+      .run(idempotencyKey);
+  });
+}
+
 function renderDiscordConversation(input: DiscordMessageEvent): string {
   if (input.relevantConversation === undefined) return input.content;
   return (
@@ -522,19 +834,6 @@ function renderDiscordConversation(input: DiscordMessageEvent): string {
       .map((message) => `${message.authorKind}: ${message.content}`)
       .join("\n\n")
   );
-}
-
-function abandonAgentTurn(database: DatabaseSync, eventId: string): void {
-  inTransaction(database, () => {
-    database
-      .prepare("UPDATE provider_inbox SET status = 'FAILED' WHERE provider_event_id = ?")
-      .run(eventId);
-    database
-      .prepare(
-        "UPDATE recovery_outbox SET state = 'ABANDONED' WHERE idempotency_key = ?",
-      )
-      .run(`agent-response:${eventId}`);
-  });
 }
 
 function createEpisodeModule(
@@ -1130,6 +1429,7 @@ function parseEpisodeRow(value: unknown): EpisodeRow | undefined {
     !isRecord(value) ||
     typeof value.id !== "string" ||
     typeof value.origin_session_id !== "string" ||
+    typeof value.owner_discord_user_id !== "string" ||
     !isEpisodePhase(value.phase) ||
     typeof value.phase_version !== "number" ||
     !isNullableString(value.thread_id) ||
@@ -1140,12 +1440,16 @@ function parseEpisodeRow(value: unknown): EpisodeRow | undefined {
     !isNullableString(value.cancelled_at) ||
     !isNullableString(value.cancellation_reason) ||
     !isNullableString(value.agent_previous_response_id)
+    || !isNullableString(value.proposal_message_id)
+    || !isNullableString(value.proposal_revision_id)
+    || !isNullableString(value.proposal_digest)
   ) {
     throw new Error("Stored Episode state is malformed.");
   }
   return {
     id: value.id,
     origin_session_id: value.origin_session_id,
+    owner_discord_user_id: value.owner_discord_user_id,
     phase: value.phase,
     phase_version: value.phase_version,
     thread_id: value.thread_id,
@@ -1156,6 +1460,9 @@ function parseEpisodeRow(value: unknown): EpisodeRow | undefined {
     cancelled_at: value.cancelled_at,
     cancellation_reason: value.cancellation_reason,
     agent_previous_response_id: value.agent_previous_response_id,
+    proposal_message_id: value.proposal_message_id,
+    proposal_revision_id: value.proposal_revision_id,
+    proposal_digest: value.proposal_digest,
   };
 }
 
@@ -1194,6 +1501,17 @@ function toView(row: EpisodeRow): EpisodeView {
       reference: row.context_reference,
       sha256: row.context_digest,
     },
+    ...(row.proposal_message_id === null ||
+    row.proposal_revision_id === null ||
+    row.proposal_digest === null
+      ? {}
+      : {
+          outcomeProposal: {
+            messageId: row.proposal_message_id,
+            revisionId: row.proposal_revision_id,
+            sha256: row.proposal_digest,
+          },
+        }),
   };
 }
 
@@ -1206,6 +1524,7 @@ function migrate(database: DatabaseSync): void {
       original_question TEXT NOT NULL, opening_brief TEXT NOT NULL, context_reference TEXT NOT NULL,
       context_digest TEXT NOT NULL, context_retention_deadline TEXT,
       cancelled_at TEXT, cancellation_reason TEXT, agent_previous_response_id TEXT,
+      proposal_message_id TEXT, proposal_revision_id TEXT, proposal_digest TEXT,
       created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS provider_inbox (
@@ -1230,6 +1549,15 @@ function migrate(database: DatabaseSync): void {
     .map((column) => column.name);
   if (!episodeColumns.includes("agent_previous_response_id")) {
     database.exec("ALTER TABLE episodes ADD COLUMN agent_previous_response_id TEXT");
+  }
+  if (!episodeColumns.includes("proposal_message_id")) {
+    database.exec("ALTER TABLE episodes ADD COLUMN proposal_message_id TEXT");
+  }
+  if (!episodeColumns.includes("proposal_revision_id")) {
+    database.exec("ALTER TABLE episodes ADD COLUMN proposal_revision_id TEXT");
+  }
+  if (!episodeColumns.includes("proposal_digest")) {
+    database.exec("ALTER TABLE episodes ADD COLUMN proposal_digest TEXT");
   }
 }
 
