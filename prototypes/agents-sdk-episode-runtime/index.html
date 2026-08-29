@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Coloop Episode runtime — throwaway walkthrough</title>
+  <style>
+    :root{color-scheme:dark;--bg:#111827;--panel:#1f2937;--ink:#f9fafb;--muted:#9ca3af;--accent:#7dd3fc;--owner:#a78bfa;--bad:#fca5a5;--good:#86efac}*{box-sizing:border-box}body{margin:0;background:linear-gradient(135deg,#0f172a,#111827 55%,#172554);color:var(--ink);font:15px/1.5 system-ui,sans-serif}main{max-width:1100px;margin:auto;padding:32px 20px 80px}h1{font-size:clamp(28px,4vw,48px);line-height:1.05;margin:.2em 0}h2{font-size:18px}.kicker,.muted{color:var(--muted)}.warning{border-left:4px solid #f59e0b;padding:10px 14px;background:#42200666}.tabs,.actions{display:flex;gap:8px;flex-wrap:wrap;margin:20px 0}button{border:1px solid #475569;border-radius:999px;background:#1e293b;color:var(--ink);padding:9px 14px;cursor:pointer}button.active,button:hover{border-color:var(--accent);color:var(--accent)}.grid{display:grid;grid-template-columns:1.25fr .75fr;gap:18px}.panel{background:#111827dd;border:1px solid #334155;border-radius:16px;padding:18px;box-shadow:0 16px 50px #0005}.thread{min-height:420px}.msg{max-width:88%;padding:12px 14px;border-radius:14px;margin:12px 0;background:#243244}.msg.owner{border:1px solid var(--owner);margin-left:auto}.msg.agent{border:1px solid var(--accent)}.msg.system{border:1px dashed #64748b;color:var(--muted);max-width:100%;font-size:13px}.name{font-size:12px;font-weight:700;color:var(--accent);margin-bottom:4px}.owner .name{color:var(--owner)}pre{white-space:pre-wrap;word-break:break-word;color:#cbd5e1;font-size:12px}.pass{color:var(--good)}.fail{color:var(--bad)}@media(max-width:760px){.grid{grid-template-columns:1fr}}
+  </style>
+</head>
+<body><main>
+  <div class="kicker">THROWAWAY LOGIC PROTOTYPE · NOT PRODUCTION</div>
+  <h1>Can one manager carry the Episode?</h1>
+  <p class="warning">This walkthrough simulates the state model. The TypeScript probe and <code>evidence.json</code> are the authoritative SDK evidence.</p>
+  <div class="tabs" id="tabs"></div>
+  <div class="grid">
+    <section class="panel thread"><h2 id="title"></h2><div id="messages"></div><div class="actions"><button id="back">Back</button><button id="next">Next event</button><button id="reset">Reset</button></div></section>
+    <aside class="panel"><h2>Visible local state</h2><pre id="state"></pre><h2>What to notice</h2><p id="notice" class="muted"></p></aside>
+  </div>
+</main><script>
+const cases={
+  "Conversation":[
+    {m:["system","Opening Brief","Decide whether restart recovery should be visible."],s:{phase:"ACTIVE",previous_response_id:null,local_transcript:false}},
+    {m:["collab","Maya","Should recovery be visible?"],s:{discord_event:"100 · pending",content_stored:false}},
+    {m:["agent","Coloop","Make recovery visible, but keep it brief."],s:{discord_event:"100 · completed",previous_response_id:"resp-opening",streamed:true},n:"Only the response ID—not the turn text—is durable."},
+    {m:["owner","Rajat · Owner","Yes, but never replay old messages."],s:{discord_event:"101 · pending"}},
+    {m:["agent","Coloop","A one-line marker avoids confusion."],s:{discord_event:"101 · completed",previous_response_id:"resp-followup",local_transcript:false}}
+  ],
+  "Restart + missed input":[
+    {m:["system","Runtime","Process stopped between completed turns."],s:{process:"offline",previous_response_id:"resp-retry"}},
+    {m:["collab","Maya","This arrived while Coloop was offline."],s:{discord:"source of message content",sqlite:"event ID + hash only"}},
+    {m:["system","Runtime","SQLite reopened; Discord event re-fetched."],s:{process:"online",reconciliation:"automatic"}},
+    {m:["agent","Coloop","Restarted cleanly and incorporated the missed input."],s:{previous_response_id:"resp-missed",local_transcript:false},n:"This is the supported restart seam: a new turn after the last completed response."}
+  ],
+  "Failure + duplicate":[
+    {m:["collab","Maya","What should the marker say?"],s:{event:"102 · pending",previous_response_id:"resp-followup"}},
+    {m:["system","Provider","Synthetic outage. No Discord reply posted."],s:{event:"102 · pending",previous_response_id:"resp-followup",retry:"allowed"}},
+    {m:["agent","Coloop","Recovered: do not repeat prior messages."],s:{event:"102 · completed",previous_response_id:"resp-retry"}},
+    {m:["system","Discord","Event 102 delivered again; suppressed."],s:{event:"102 · completed",model_called:false},n:"Idempotency is application state, not Agent memory."}
+  ],
+  "Interrupted run":[
+    {m:["collab","Maya","Preserve this exact in-flight input."],s:{event:"104 · pending"}},
+    {m:["system","Runtime","Stream cancelled; RunState serialized."],s:{run_state_in_sqlite:true,contains_in_flight_text:true,contains_prior_transcript:false}},
+    {m:["system","Runtime","Process restarted; RunState resumed."],s:{sdk_resume_new_input_items:1,previous_response_id:"resp-missed",acceptance_check:"PASSED"},n:"The TypeScript SDK forwarded the original accepted input after reconstructing RunState."},
+    {m:["agent","Coloop","RunState resume forwarded the accepted in-flight input."],s:{verdict:"TypeScript supports the tested in-flight recovery seam"}}
+  ],
+  "Finalize + retain":[
+    {m:["owner","Rajat · Owner","/finalize"],s:{phase:"ACTIVE",episode_control:"Owner"}},
+    {m:["agent","Coloop","Conclusion: show a marker only after actual missed input.\nUnresolved: exact wording."],s:{phase:"FINALIZED",structured_outcome:true,previous_response_id:"resp-final"}},
+    {m:["system","Cleanup","Context Package marked for deletion in 72 hours."],s:{context_mode:"0400",retention_hours:72,active_deletion:false},n:"The marker is durable metadata; the Context Package body stays in its private file."}
+  ]
+};
+let active=Object.keys(cases)[0],step=0;const tabs=document.querySelector('#tabs'),messages=document.querySelector('#messages'),state=document.querySelector('#state'),notice=document.querySelector('#notice'),title=document.querySelector('#title');
+function renderTabs(){tabs.innerHTML='';Object.keys(cases).forEach(k=>{const b=document.createElement('button');b.textContent=k;b.className=k===active?'active':'';b.onclick=()=>{active=k;step=0;render()};tabs.append(b)})}
+function render(){renderTabs();title.textContent=active;messages.innerHTML='';let merged={episode_id:'episode-primary-runtime-probe'};cases[active].slice(0,step+1).forEach(x=>{Object.assign(merged,x.s);const d=document.createElement('div');d.className=`msg ${x.m[0]==='collab'?'':x.m[0]}`;d.innerHTML=`<div class="name">${x.m[1]}</div>${x.m[2].replaceAll('\n','<br>')}`;messages.append(d)});state.textContent=JSON.stringify(merged,null,2);const item=cases[active][step];notice.textContent=item.n||'Advance to inspect the next transition.';document.querySelector('#back').disabled=step===0;document.querySelector('#next').disabled=step===cases[active].length-1}
+document.querySelector('#back').onclick=()=>{step=Math.max(0,step-1);render()};document.querySelector('#next').onclick=()=>{step=Math.min(cases[active].length-1,step+1);render()};document.querySelector('#reset').onclick=()=>{step=0;render()};render();
+</script></body></html>

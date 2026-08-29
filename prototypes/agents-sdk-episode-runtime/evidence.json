@@ -1,0 +1,267 @@
+{
+  "environment": {
+    "mode": "deterministic-offline",
+    "date": "2026-08-29",
+    "openai_agents_js": "0.17.0",
+    "node": "v24.20.0",
+    "model_for_live_mode": "gpt-5.6-luna",
+    "api_model_calls": 0,
+    "tracing_disabled": true,
+    "authoritative_runtime": "TypeScript"
+  },
+  "opening_brief": "Decide whether restart recovery should be visible in the Collaboration Episode, and identify any unresolved UX risk.",
+  "turns": [
+    {
+      "event_id": "discord-100",
+      "disposition": "new",
+      "reply": "Make recovery visible, but keep it brief.",
+      "stream_event_count": 4,
+      "response_id": "resp-opening"
+    },
+    {
+      "event_id": "discord-101",
+      "disposition": "new",
+      "reply": "I agree; a one-line marker avoids confusion.",
+      "stream_event_count": 4,
+      "response_id": "resp-followup"
+    }
+  ],
+  "provider_failure": {
+    "event_id": "discord-102",
+    "disposition": "provider_failed",
+    "error_type": "Error",
+    "previous_response_id_unchanged": true
+  },
+  "same_event_retry": {
+    "event_id": "discord-102",
+    "disposition": "retry",
+    "reply": "Recovered: the marker should not repeat prior messages.",
+    "stream_event_count": 4,
+    "response_id": "resp-retry"
+  },
+  "duplicate_delivery": {
+    "event_id": "discord-102",
+    "disposition": "duplicate_suppressed"
+  },
+  "restart_between_turns": {
+    "episode_id": "episode-primary-runtime-probe",
+    "phase": "ACTIVE",
+    "previous_response_id": "resp-retry",
+    "context_path": "/tmp/coloop-ts-probe-final/episode-primary-runtime-probe/context-package.md",
+    "context_retention_due_at": null,
+    "interrupted_run_state": false,
+    "outcome_json": null,
+    "last_provider_error": null,
+    "events": [
+      {
+        "event_id": "discord-100",
+        "content_sha256": "bf4e8c7288b18b97fea09c1e92cd9844716c52ccda730dc80bf1741e86e08aee",
+        "status": "completed"
+      },
+      {
+        "event_id": "discord-101",
+        "content_sha256": "552369003b901666163253197296525f7f45c23fb9d6760649f8075ea672558d",
+        "status": "completed"
+      },
+      {
+        "event_id": "discord-102",
+        "content_sha256": "7626c668bd32148e305baba4905d871158f023b0e4ed7312de719b2ce3827919",
+        "status": "completed"
+      }
+    ]
+  },
+  "missed_input_after_restart": {
+    "event_id": "discord-missed-103",
+    "disposition": "new",
+    "reply": "Restarted cleanly and incorporated the missed input.",
+    "stream_event_count": 4,
+    "response_id": "resp-missed"
+  },
+  "interruption": {
+    "event_id": "discord-104",
+    "serialized_bytes": 1007,
+    "contains_in_flight_collaborator_text": true,
+    "contains_prior_turn_text": false,
+    "contains_context_package": false,
+    "previous_response_id": "resp-missed",
+    "cancelled": true
+  },
+  "restart_snapshot": {
+    "episode_id": "episode-primary-runtime-probe",
+    "phase": "ACTIVE",
+    "previous_response_id": "resp-missed",
+    "context_path": "/tmp/coloop-ts-probe-final/episode-primary-runtime-probe/context-package.md",
+    "context_retention_due_at": null,
+    "interrupted_run_state": true,
+    "outcome_json": null,
+    "last_provider_error": null,
+    "events": [
+      {
+        "event_id": "discord-100",
+        "content_sha256": "bf4e8c7288b18b97fea09c1e92cd9844716c52ccda730dc80bf1741e86e08aee",
+        "status": "completed"
+      },
+      {
+        "event_id": "discord-101",
+        "content_sha256": "552369003b901666163253197296525f7f45c23fb9d6760649f8075ea672558d",
+        "status": "completed"
+      },
+      {
+        "event_id": "discord-102",
+        "content_sha256": "7626c668bd32148e305baba4905d871158f023b0e4ed7312de719b2ce3827919",
+        "status": "completed"
+      },
+      {
+        "event_id": "discord-missed-103",
+        "content_sha256": "a9a01482993f2a29a4ff9973f875b17f09016e377d21ca577f944ba9d8043fc3",
+        "status": "completed"
+      },
+      {
+        "event_id": "discord-104",
+        "content_sha256": "24154979517a97c5fe2659be3978c6b15921cbdc7b26014d6f9fcd200e86267b",
+        "status": "pending"
+      }
+    ]
+  },
+  "restart_resume": {
+    "event_id": "discord-104",
+    "reply": "RunState resume forwarded the accepted in-flight input.",
+    "stream_event_count": 4,
+    "response_id": "resp-resumed",
+    "serialized_state_cleared": true
+  },
+  "finalization": {
+    "outcome": {
+      "conclusion": "Show a short recovery marker only when Coloop actually missed input.",
+      "unresolved_points": [
+        "Exact Discord wording needs Owner feedback."
+      ]
+    },
+    "stream_event_count": 4,
+    "response_id": "resp-final"
+  },
+  "retention": {
+    "deadline": "2026-09-01T04:31:47.621Z",
+    "hours": 72,
+    "context_exists": true,
+    "context_mode": "0400"
+  },
+  "after_finalization": {
+    "episode_id": "episode-primary-runtime-probe",
+    "phase": "FINALIZED",
+    "previous_response_id": "resp-final",
+    "context_path": "/tmp/coloop-ts-probe-final/episode-primary-runtime-probe/context-package.md",
+    "context_retention_due_at": "2026-09-01T04:31:47.621Z",
+    "interrupted_run_state": false,
+    "outcome_json": {
+      "conclusion": "Show a short recovery marker only when Coloop actually missed input.",
+      "unresolved_points": [
+        "Exact Discord wording needs Owner feedback."
+      ]
+    },
+    "last_provider_error": null,
+    "events": [
+      {
+        "event_id": "discord-100",
+        "content_sha256": "bf4e8c7288b18b97fea09c1e92cd9844716c52ccda730dc80bf1741e86e08aee",
+        "status": "completed"
+      },
+      {
+        "event_id": "discord-101",
+        "content_sha256": "552369003b901666163253197296525f7f45c23fb9d6760649f8075ea672558d",
+        "status": "completed"
+      },
+      {
+        "event_id": "discord-102",
+        "content_sha256": "7626c668bd32148e305baba4905d871158f023b0e4ed7312de719b2ce3827919",
+        "status": "completed"
+      },
+      {
+        "event_id": "discord-missed-103",
+        "content_sha256": "a9a01482993f2a29a4ff9973f875b17f09016e377d21ca577f944ba9d8043fc3",
+        "status": "completed"
+      },
+      {
+        "event_id": "discord-104",
+        "content_sha256": "24154979517a97c5fe2659be3978c6b15921cbdc7b26014d6f9fcd200e86267b",
+        "status": "completed"
+      }
+    ]
+  },
+  "sdk_calls": [
+    {
+      "index": 1,
+      "previous_response_id": null,
+      "input_item_count": 1,
+      "tool_count": 0,
+      "structured_output": false,
+      "streamed": true
+    },
+    {
+      "index": 2,
+      "previous_response_id": "resp-opening",
+      "input_item_count": 1,
+      "tool_count": 0,
+      "structured_output": false,
+      "streamed": true
+    },
+    {
+      "index": 3,
+      "previous_response_id": "resp-followup",
+      "input_item_count": 1,
+      "tool_count": 0,
+      "structured_output": false,
+      "streamed": true
+    },
+    {
+      "index": 4,
+      "previous_response_id": "resp-followup",
+      "input_item_count": 1,
+      "tool_count": 0,
+      "structured_output": false,
+      "streamed": true
+    },
+    {
+      "index": 5,
+      "previous_response_id": "resp-retry",
+      "input_item_count": 1,
+      "tool_count": 0,
+      "structured_output": false,
+      "streamed": true
+    },
+    {
+      "index": 6,
+      "previous_response_id": "resp-missed",
+      "input_item_count": 1,
+      "tool_count": 0,
+      "structured_output": false,
+      "streamed": true
+    },
+    {
+      "index": 7,
+      "previous_response_id": "resp-resumed",
+      "input_item_count": 1,
+      "tool_count": 0,
+      "structured_output": true,
+      "streamed": true
+    }
+  ],
+  "local_content_audit": {
+    "sqlite_contains_context_package": false,
+    "sqlite_contains_completed_turn": false,
+    "sqlite_contains_interrupted_turn_after_resume": false,
+    "sqlite_stores_discord_content_hashes": true,
+    "context_package_sha256": "6384a06bb87c717d3b2a2a4a4210578fce1bdd46a61c5250257b05fa2ff93d60"
+  },
+  "acceptance_checks": {
+    "ordinary_turns_use_openai_managed_continuation": true,
+    "restart_between_turns_recovered_missed_input": true,
+    "provider_failure_kept_continuation_stable": true,
+    "duplicate_delivery_suppressed": true,
+    "cancelled_run_state_contains_only_in_flight_turn": true,
+    "cancelled_run_resume_forwarded_original_input": true,
+    "structured_episode_outcome": true,
+    "no_completed_transcript_in_sqlite": true,
+    "terminal_context_retention_marked_72_hours": true
+  }
+}
